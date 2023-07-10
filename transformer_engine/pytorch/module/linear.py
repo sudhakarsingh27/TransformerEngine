@@ -141,8 +141,8 @@ class _Linear(torch.autograd.Function):
                         fp8_meta["scaling_fwd"],
                         tex.FP8FwdTensors.GEMM1_WEIGHT,
                         fp8_dtype_forward,
-                        cast_out=weight_fp8,
-                        transpose_out=weight_t_fp8,
+                        cast_out=weight_fp8._data,
+                        transpose_out=weight_t_fp8._data,
                     )
                 else:
                     weight_t_fp8 = None
@@ -166,7 +166,7 @@ class _Linear(torch.autograd.Function):
                 out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
 
             _ = fp8_gemm(
-                weight_fp8,
+                weight_fp8._data,
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
                 fp8_dtype_forward,
@@ -323,7 +323,7 @@ class _Linear(torch.autograd.Function):
             if ctx.requires_dgrad:
                 if ctx.fp8:
                     dgrad = fp8_gemm(
-                        weight_t_fp8,
+                        weight_t_fp8._data,
                         fwd_scale_inverses,
                         tex.FP8FwdTensors.GEMM1_WEIGHT,
                         fp8_dtype_forward,
