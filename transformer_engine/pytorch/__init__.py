@@ -25,3 +25,6 @@ from .te_onnx_extensions import (
     onnx_rmsnorm_fwd,
     onnx_rmsnorm_fwd_fp8
 )
+
+from .float8_tensor import Float8Tensor
+from .float8_aten_api import *

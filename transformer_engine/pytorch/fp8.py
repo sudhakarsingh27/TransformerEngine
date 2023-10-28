@@ -372,6 +372,11 @@ class FP8GlobalStateManager:
         fp8_group: Optional[dist_group_type] = None,
     ) -> None:
         """Set state and tracking variables for entry into FP8 region."""
+        if cls.FP8_AUTOCAST_DEPTH == 0:
+            if callable(cls.amax_forward_global_reduce_func):
+                cls.amax_reduce_handle_fwd = cls.amax_forward_global_reduce_func() # pylint: disable=not-callable
+            cls.delete_key_from_amax_buffer(forward=True)
+
         cls.FP8_ENABLED = enabled
         cls.FP8_CALIBRATION = calibrating
         cls.FP8_RECIPE = get_default_fp8_recipe() if fp8_recipe is None else fp8_recipe
@@ -390,11 +395,6 @@ class FP8GlobalStateManager:
     def fp8_autocast_exit(cls):
         """Set state and tracking variables for exit from FP8 region."""
         cls.FP8_AUTOCAST_DEPTH -= 1
-
-        if cls.FP8_AUTOCAST_DEPTH == 0:
-            if callable(cls.amax_forward_global_reduce_func):
-                cls.amax_reduce_handle_fwd = cls.amax_forward_global_reduce_func() # pylint: disable=not-callable
-            cls.delete_key_from_amax_buffer(forward=True)
 
     @classmethod
     def copy_forward_fp8_meta_tensors_for_recompute(cls, fp8_meta: Dict[str, Any]) -> None:
@@ -510,7 +510,7 @@ def _update_amax_history(amax_history: torch.Tensor) -> torch.Tensor:
     return amax_history
 
 
-@jit_fuser
+# @jit_fuser
 def _default_get_amax(
     amax_history: torch.Tensor,
     amax_compute_algo: str,
@@ -525,7 +525,7 @@ def _default_get_amax(
     return amax_history, amax
 
 
-@jit_fuser
+# @jit_fuser
 def _default_sf_compute(
     amax: torch.Tensor,
     scale: torch.Tensor,
@@ -542,7 +542,7 @@ def _default_sf_compute(
     return sf
 
 
-@jit_fuser
+# @jit_fuser
 def _compute_scaling_factor_inverse(
     scale: torch.Tensor,
     scale_inv: torch.Tensor,
@@ -555,7 +555,7 @@ def _compute_scaling_factor_inverse(
     return torch.where(non_weight_mask, 1.0 / scale, scale_inv)
 
 
-@jit_fuser
+# @jit_fuser
 def _fused_amax_and_scale_update(
     amax_history: torch.Tensor,
     scale: torch.Tensor,
@@ -573,6 +573,7 @@ def _fused_amax_and_scale_update(
         amax_history,
         amax_compute_algo,
     )
+    # print("fp8.py: ", amax)
 
     # Calculate new scaling factor.
     scale = _default_sf_compute(

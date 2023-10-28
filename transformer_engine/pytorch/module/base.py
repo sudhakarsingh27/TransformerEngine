@@ -35,6 +35,7 @@ from ..cpp_extensions import (
     cast_to_fp8,
 )
 from ..constants import dist_group_type
+from ..float8_tensor import Float8Tensor
 
 _2X_ACC_FPROP = False
 _2X_ACC_DGRAD = True
@@ -78,7 +79,7 @@ def _prepare_backward(
 
         # Update amax and scale; Skip all setup for global amax reduction
         if not fp8_meta["recipe"].reduce_amax:
-            FP8GlobalStateManager.amax_and_scale_update(fp8_meta, False)
+            amax_and_scale_update(fp8_meta, False)
         else:
             # From previous iteration
             FP8GlobalStateManager.copy_amax_from_global_buffer(fp8_meta, forward=False)
@@ -489,21 +490,27 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             setattr(
                 self,
                 weight_cast_attr,
-                torch.empty(
-                    shape,
-                    device=torch.cuda.current_device(),
-                    dtype=torch.uint8,
-                ),
+                Float8Tensor(
+                    torch.empty(
+                        shape,
+                        device=torch.cuda.current_device(),
+                        dtype=torch.uint8,
+                    ),
+                    scale=None, flavor=None
+                )
             )
             setattr(
                 self,
                 weight_transpose_attr,
-                torch.empty(
-                    shape[1],
-                    shape[0],
-                    device=torch.cuda.current_device(),
-                    dtype=torch.uint8,
-                ),
+                Float8Tensor(
+                    torch.empty(
+                        shape[1],
+                        shape[0],
+                        device=torch.cuda.current_device(),
+                        dtype=torch.uint8,
+                    ),
+                    scale=None, flavor=None
+                )
             )
 
     def set_tensor_parallel_group(self, tp_group: Union[dist_group_type, None]) -> None:
@@ -780,7 +787,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
     def get_fp8_weights_empty_tensors(
         self,
         is_first_microbatch: Union[bool, None],
-    ) -> List[torch.Tensor]:
+    ) -> List[Float8Tensor]:
         """
         Returns empty tensors to be later used to store fp8 version of weights
         and their transposes (for the bwd pass) for this batch (or microbatch).
@@ -796,19 +803,23 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         fp8_weight_tensors = []
         for shape in self.fp8_weight_shapes:
             fp8_weight_tensors.append(
-                torch.empty(
-                    shape,
-                    device=torch.cuda.current_device(),
-                    dtype=torch.uint8,
+                Float8Tensor(
+                    torch.empty(
+                        shape,
+                        device=torch.cuda.current_device(),
+                        dtype=torch.uint8,
+                    )
                 )
             )
 
             fp8_weight_tensors.append(
-                torch.empty(
-                    shape[1],
-                    shape[0],
-                    device=torch.cuda.current_device(),
-                    dtype=torch.uint8,
+                Float8Tensor(
+                    torch.empty(
+                        shape[1],
+                        shape[0],
+                        device=torch.cuda.current_device(),
+                        dtype=torch.uint8,
+                    )
                 )
             )
         return fp8_weight_tensors
