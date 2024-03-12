@@ -19,6 +19,7 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalL
 from transformers.modeling_utils import _add_variant, load_state_dict, _load_state_dict_into_model
 from transformers.utils import WEIGHTS_INDEX_NAME
 from transformers.utils.hub import get_checkpoint_shard_files
+from transformer_engine.pytorch.fp8 import fp8_model_init
 
 @contextmanager
 def replace_decoder(te_decodder_cls):
@@ -94,6 +95,7 @@ class TELlamaForCausalLM:
         Custom method adapted from `from_pretrained` method in HuggingFace
         Transformers repo: https://github.com/huggingface/transformers/blob/f497f564bb76697edab09184a252fc1b1a326d1e/src/transformers/modeling_utils.py#L2579
         """
+        # with fp8_model_init(enabled=False):
         vanilla_model = cls(config).to(kwargs['torch_dtype'])
         is_local = os.path.isdir(pretrained_model_name_or_path)
         subfolder = ""
@@ -123,7 +125,7 @@ class TELlamaForCausalLM:
         error_msgs = []
         for shard_file in resolved_archive_file:
             state_dict = load_state_dict(shard_file)
-            replaced_layers = replace_params(state_dict, vanilla_model.state_dict())
+            replaced_layers = replace_params(state_dict, vanilla_model.state_dict(), params_in_fp8=True)
 
             error_msgs += _load_state_dict_into_model(vanilla_model, state_dict, start_prefix="")
 
@@ -133,7 +135,9 @@ class TELlamaForCausalLM:
 
         return vanilla_model
 
-def replace_params(hf_state_dict, te_state_dict):
+def replace_params(hf_state_dict, te_state_dict, params_in_fp8=False):
+    params_in_fp8 = False
+
     # collect all layer prefixes to update
     all_layer_prefixes = set()
     for param_key in hf_state_dict.keys():
@@ -146,27 +150,52 @@ def replace_params(hf_state_dict, te_state_dict):
         # When loading weights into models with less number of layers, skip the
         # copy if the corresponding layer doesn't exist in TE model
         if layer_prefix + 'self_attention.layernorm_qkv.layer_norm_weight' in te_state_dict:
-            te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.layer_norm_weight'].data[:] = hf_state_dict[layer_prefix + 'input_layernorm.weight'].data[:]
+            if params_in_fp8:
+                te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.layer_norm_weight']._copy(hf_state_dict[layer_prefix + 'input_layernorm.weight'].data[:])
+            else:
+                te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.layer_norm_weight'].data[:] = hf_state_dict[layer_prefix + 'input_layernorm.weight'].data[:]
+
 
         if layer_prefix + 'self_attention.layernorm_qkv.query_weight' in te_state_dict:
-            te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.query_weight'].data[:] = hf_state_dict[layer_prefix + 'self_attn.q_proj.weight'].data[:]
+            if params_in_fp8:
+                te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.query_weight']._copy(hf_state_dict[layer_prefix + 'self_attn.q_proj.weight'].data[:])
+            else:
+                te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.query_weight'].data[:] = hf_state_dict[layer_prefix + 'self_attn.q_proj.weight'].data[:]
 
         if layer_prefix + 'self_attention.layernorm_qkv.key_weight' in te_state_dict:
-            te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.key_weight'].data[:] = hf_state_dict[layer_prefix + 'self_attn.k_proj.weight'].data[:]
+            if params_in_fp8:
+                te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.key_weight']._copy(hf_state_dict[layer_prefix + 'self_attn.k_proj.weight'].data[:])
+            else:
+                te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.key_weight'].data[:] = hf_state_dict[layer_prefix + 'self_attn.k_proj.weight'].data[:]
 
         if layer_prefix + 'self_attention.layernorm_qkv.value_weight' in te_state_dict:
-            te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.value_weight'].data[:] = hf_state_dict[layer_prefix + 'self_attn.v_proj.weight'].data[:]
+            if params_in_fp8:
+                te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.value_weight']._copy(hf_state_dict[layer_prefix + 'self_attn.v_proj.weight'].data[:])
+            else:
+                te_state_dict[layer_prefix + 'self_attention.layernorm_qkv.value_weight'].data[:] = hf_state_dict[layer_prefix + 'self_attn.v_proj.weight'].data[:]
 
         if layer_prefix + 'self_attention.proj.weight' in te_state_dict:
-            te_state_dict[layer_prefix + 'self_attention.proj.weight'].data[:] = hf_state_dict[layer_prefix + 'self_attn.o_proj.weight'].data[:]
+            if params_in_fp8:
+                te_state_dict[layer_prefix + 'self_attention.proj.weight']._copy(hf_state_dict[layer_prefix + 'self_attn.o_proj.weight'].data[:])
+            else:
+                te_state_dict[layer_prefix + 'self_attention.proj.weight'].data[:] = hf_state_dict[layer_prefix + 'self_attn.o_proj.weight'].data[:]
 
         if layer_prefix + 'layernorm_mlp.layer_norm_weight' in te_state_dict:
-            te_state_dict[layer_prefix + 'layernorm_mlp.layer_norm_weight'].data[:] = hf_state_dict[layer_prefix + 'post_attention_layernorm.weight'].data[:]
+            if params_in_fp8:
+                te_state_dict[layer_prefix + 'layernorm_mlp.layer_norm_weight']._copy(hf_state_dict[layer_prefix + 'post_attention_layernorm.weight'].data[:])
+            else:
+                te_state_dict[layer_prefix + 'layernorm_mlp.layer_norm_weight'].data[:] = hf_state_dict[layer_prefix + 'post_attention_layernorm.weight'].data[:]
 
         if layer_prefix + 'layernorm_mlp.fc1_weight' in te_state_dict:
-            te_state_dict[layer_prefix + 'layernorm_mlp.fc1_weight'].data[:] = torch.cat((hf_state_dict[layer_prefix + 'mlp.gate_proj.weight'].data[:], hf_state_dict[layer_prefix + 'mlp.up_proj.weight'].data[:]), dim=0)
+            if params_in_fp8:
+                te_state_dict[layer_prefix + 'layernorm_mlp.fc1_weight']._copy(torch.cat((hf_state_dict[layer_prefix + 'mlp.gate_proj.weight'].data[:], hf_state_dict[layer_prefix + 'mlp.up_proj.weight'].data[:]), dim=0))
+            else:
+                te_state_dict[layer_prefix + 'layernorm_mlp.fc1_weight'].data[:] = torch.cat((hf_state_dict[layer_prefix + 'mlp.gate_proj.weight'].data[:], hf_state_dict[layer_prefix + 'mlp.up_proj.weight'].data[:]), dim=0)
 
         if layer_prefix + 'layernorm_mlp.fc2_weight' in te_state_dict:
-            te_state_dict[layer_prefix + 'layernorm_mlp.fc2_weight'].data[:] = hf_state_dict[layer_prefix + 'mlp.down_proj.weight'].data[:]
+            if params_in_fp8:
+                te_state_dict[layer_prefix + 'layernorm_mlp.fc2_weight']._copy(hf_state_dict[layer_prefix + 'mlp.down_proj.weight'].data[:])
+            else:
+                te_state_dict[layer_prefix + 'layernorm_mlp.fc2_weight'].data[:] = hf_state_dict[layer_prefix + 'mlp.down_proj.weight'].data[:]
 
     return all_layer_prefixes
