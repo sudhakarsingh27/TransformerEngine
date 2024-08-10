@@ -53,3 +53,4 @@ Transformer Engine documentation
    :caption: Advanced
 
    api/c/index
+   examples/attention/attention.ipynb
