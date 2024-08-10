@@ -633,6 +633,8 @@ class TransformerLayer(torch.nn.Module):
         ), f"enc_dec_attn_mask_type {enc_dec_attn_mask_type} not supported"
 
         hidden_states = hidden_states.contiguous()
+        if self.layer_number < 3:
+            torch.save(hidden_states, f"inp_te_{self.layer_number}.pth")
 
         if self.sequence_parallel and self.seq_length is not None:
             assert (
@@ -681,6 +683,10 @@ class TransformerLayer(torch.nn.Module):
                 attention_output, attention_bias, hidden_states, self.drop_path
             )
 
+
+        if self.layer_number < 3:
+            torch.save(hidden_states, f"attn_out_te_{self.layer_number}.pth")
+
         # Cross attention.
         if self.layer_type == "decoder":
             inter_attention_outputs = self.inter_attention(
@@ -721,6 +727,9 @@ class TransformerLayer(torch.nn.Module):
         # For BERT like architectures.
         if self.output_layernorm:
             output = self.layernorm(output)
+
+        if self.layer_number < 3:
+            torch.save(output, f"mlp_out_te_{self.layer_number}.pth")
 
         # output: [s, b, h]
         return output

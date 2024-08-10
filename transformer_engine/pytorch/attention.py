@@ -920,6 +920,18 @@ class InferenceParams:  # pylint: disable=too-few-public-methods
                 device=torch.cuda.current_device(),
             )
 
+        # def _allocate_memory(
+        # self, inference_max_sequence_len: int, batch_size: int, dtype: torch.dtype
+        # ) -> torch.Tensor:
+        #     return torch.empty(
+        #         inference_max_sequence_len,
+        #         batch_size,
+        #         self.num_gqa_groups_per_partition,
+        #         self.hidden_size_per_attention_head,
+        #         dtype=dtype,
+        #         device=torch.cuda.current_device(),
+        #     )
+
         if self.qkv_format == "thd":
             inference_key_memory = _allocate_memory((b * s,))
             inference_value_memory = _allocate_memory((b * s,))
@@ -975,6 +987,7 @@ class InferenceParams:  # pylint: disable=too-few-public-methods
         seq_offsets_o.copy_(seq_offsets_q)
 
         return max_seqlen_q, max_seqlen_kv, buffers
+
 @torch.no_grad()
 def get_swa_mask(
     window_size: Tuple[int, int],
@@ -5373,7 +5386,6 @@ class DotProductAttention(TransformerEngineBaseModule):
         self.cp_global_ranks = cp_global_ranks
         self.cp_stream = cp_stream
         self.channels = kv_channels * num_attention_heads
-
         self.hidden_size_per_attention_head = kv_channels
 
         self.num_gqa_groups = num_attention_heads if num_gqa_groups is None else num_gqa_groups
@@ -5676,6 +5688,21 @@ class DotProductAttention(TransformerEngineBaseModule):
                                produced)
         """
         batch_size = key_layer.shape[0]
+        with self.prepare_forward(
+            query_layer,
+            is_first_microbatch,
+            num_gemms=3,
+            allow_non_contiguous=True,
+        ) as query_layer:
+
+            if self.fp8:
+                if self.fp8_meta["recipe"].fp8_mha:
+                    if not self.fp8_meta["recipe"].fp8_dpa:
+                        self.fp8_meta["recipe"].fp8_dpa = True
+                        self.logger.WARNING(
+                            """Forcing fp8_meta["recipe"].fp8_dpa=True due to """
+                            """fp8_meta["recipe"].fp8_mha=True"""
+                        )
 
             if self.fp8 and self.fp8_meta["recipe"].fp8_dpa:
                 forward_dtype = get_fp8_te_dtype(self.fp8_meta["recipe"], fprop_tensor=True)
@@ -5732,26 +5759,26 @@ class DotProductAttention(TransformerEngineBaseModule):
                     key_layer = key_layer.transpose(0, 1)
                     value_layer = value_layer.transpose(0, 1)
 
-            key_layer, value_layer = inference_params.save_to_kv_cache(
-                self.layer_number, key_layer, value_layer
-            )
+                key_layer, value_layer = inference_params.save_to_kv_cache(
+                    self.layer_number, key_layer, value_layer
+                )
 
-            if qkv_format == "thd":
-                # Allocation of buffers, it works correctly with CUDA Graphs.
-                NR_BUFFERS = 6
-                buffers = [
-                    self.alloc(batch_size + 1, dtype=torch.int32, device="cuda")
-                    for _ in range(NR_BUFFERS)
-                ]
+                if qkv_format == "thd":
+                    # Allocation of buffers, it works correctly with CUDA Graphs.
+                    NR_BUFFERS = 6
+                    buffers = [
+                        self.alloc(batch_size + 1, dtype=torch.int32, device="cuda")
+                        for _ in range(NR_BUFFERS)
+                    ]
 
-                max_seqlen_q, max_seqlen_kv, buffers = \
-                    inference_params.set_params_to_thd_attention(buffers, self.channels)
-                cu_seqlens_q, cu_seqlens_kv, seq_offsets_q, \
-                    seq_offsets_k, seq_offsets_v, seq_offsets_o = buffers
+                    max_seqlen_q, max_seqlen_kv, buffers = \
+                        inference_params.set_params_to_thd_attention(buffers, self.channels)
+                    cu_seqlens_q, cu_seqlens_kv, seq_offsets_q, \
+                        seq_offsets_k, seq_offsets_v, seq_offsets_o = buffers
 
-                # query_layer is reshaped to the format [t, h, d]
-                # and make contiguous - needed by the THD attention
-                query_layer = query_layer.view(-1, *query_layer.shape[2:]).contiguous()
+                    # query_layer is reshaped to the format [t, h, d]
+                    # and make contiguous - needed by the THD attention
+                    query_layer = query_layer.view(-1, *query_layer.shape[2:]).contiguous()
 
                 if qkv_format == "bshd":
                     key_layer = key_layer.transpose(0, 1)
@@ -5864,55 +5891,18 @@ class DotProductAttention(TransformerEngineBaseModule):
                 assert (
                     core_attention_bias is None
                 ), "core_attention_bias must be None when core_attention_bias_type is alibi!"
-            if (_alibi_cache["_num_heads"] != query_layer.shape[-2]
-                or _alibi_cache["_max_seqlen_q"] != max_seqlen_q
-                or _alibi_cache["_max_seqlen_kv"] != max_seqlen_kv
-                or _alibi_cache["_alibi_slopes"] is None):
-                _alibi_cache["_alibi_slopes_require_update"] = True
-                _alibi_cache["_alibi_bias_require_update"] = True
+                if (
+                    _alibi_cache["_num_heads"] != query_layer.shape[-2]
+                    or _alibi_cache["_max_seqlen_q"] != max_seqlen_q
+                    or _alibi_cache["_max_seqlen_kv"] != max_seqlen_kv
+                    or _alibi_cache["_bottom_right_alignment"] != bottom_right_alignment
+                    or _alibi_cache["_alibi_slopes"] is None
+                ):
+                    _alibi_cache["_alibi_slopes_require_update"] = True
+                    _alibi_cache["_alibi_bias_require_update"] = True
 
-        if core_attention_bias_type not in ["no_bias", "alibi"] or core_attention_bias is not None:
-            use_flash_attention = False
-
-        fu_core_attention_bias_type = core_attention_bias_type
-        fu_core_attention_bias = core_attention_bias
-        if core_attention_bias_type == "alibi" and use_fused_attention and alibi_slopes is not None:
-            fu_core_attention_bias_type = "post_scale_bias"
-            _, fu_core_attention_bias = get_alibi(
-                query_layer.shape[-2], max_seqlen_q, max_seqlen_kv, alibi_slopes=alibi_slopes,
-                bias_dtype=query_layer.dtype)
-        if (use_fused_attention
-            and fu_core_attention_bias_type == "post_scale_bias"
-            and (fu_core_attention_bias.shape[0] != 1
-            or fu_core_attention_bias.shape[1] != query_layer.shape[-2])):
-            if fu_core_attention_bias.requires_grad:
-                # remove this line when cuDNN adds bwd support for
-                # [1, 1, s, s], [b, 1, s, s] and [b, h, s, s]
-                use_fused_attention = False
-            else:
-                # max512 backend will only support [1, h, s, s]
-                os.environ["NVTE_FUSED_ATTN_BACKEND"] = "1"
-
-        if query_layer.shape[-1] == 256 and query_layer.requires_grad:
-            # Fused attention is not supported for backward with head_dim = 256.
-            # to do (cyang): move it to the tex.get_fused_attn_backend
-            use_fused_attention = False
-
-        if use_fused_attention:
-            fused_attention_backend = tex.get_fused_attn_backend(
-                TE_DType[query_layer.dtype]
-                if not isinstance(query_layer, Float8Tensor) else query_layer._fp8_dtype,
-                TE_DType[key_layer.dtype]
-                if not isinstance(key_layer, Float8Tensor) else key_layer._fp8_dtype,
-                QKVLayout[qkv_layout],
-                AttnBiasType[fu_core_attention_bias_type],
-                AttnMaskType[attn_mask_type],
-                self.attention_dropout,
-                query_layer.shape[-2], # num_attn_heads
-                key_layer.shape[-2], # num_gqa_groups
-                max_seqlen_q,
-                max_seqlen_kv,
-                query_layer.shape[-1], # head_dim
+            context_parallel = (
+                self.cp_group is not None and get_distributed_world_size(self.cp_group) != 1
             )
 
             core_attention_bias_shape = None
@@ -5946,33 +5936,94 @@ class DotProductAttention(TransformerEngineBaseModule):
                 and not torch.equal(cu_seqlens_kv_padded, cu_seqlens_kv)
             )
 
-        if self.attention_type == "self":
-            if self.qkv_format == "bshd" and query_layer.shape[1] != value_layer.shape[1] or \
-            self.qkv_format == "sbhd" and query_layer.shape[0] != value_layer.shape[0]:
-                # Flash attention does not self-support max_seqlen_q != max_seqlen_kv
-                use_flash_attention = False
+            # Check whether this is needed (@sudhakars27)
+            if self.attention_type == "self":
+                if self.qkv_format == "bshd" and query_layer.shape[1] != value_layer.shape[1] or \
+                self.qkv_format == "sbhd" and query_layer.shape[0] != value_layer.shape[0]:
+                    # Flash attention does not self-support max_seqlen_q != max_seqlen_kv
+                    use_flash_attention = False
 
-        if use_flash_attention:
-            if _NVTE_DEBUG:
-                print("[DotProductAttention]: using flash-attn",_flash_attn_version)
-            if core_attention_bias_type == "alibi":
-                alibi_slopes, _ = get_alibi(
-                    query_layer.shape[-2], max_seqlen_q, max_seqlen_kv, alibi_slopes=alibi_slopes)
-            return self.flash_attention(query_layer,
-                                        key_layer,
-                                        value_layer,
-                                        attention_mask=attention_mask,
-                                        qkv_layout=qkv_layout,
-                                        cu_seqlens_q=cu_seqlens_q,
-                                        cu_seqlens_kv=cu_seqlens_kv,
-                                        attn_mask_type=attn_mask_type,
-                                        window_size=window_size,
-                                        alibi_slopes=alibi_slopes,
-                                        cp_group=self.cp_group,
-                                        cp_global_ranks=self.cp_global_ranks,
-                                        cp_stream=self.cp_stream,
-                                        max_seqlen_q=max_seqlen_q,
-                                        max_seqlen_kv=max_seqlen_kv)
+            attention_params = AttentionParams(
+                qkv_type=type(query_layer),
+                qkv_dtype=query_layer.dtype,
+                qkv_layout=qkv_layout,
+                batch_size=batch_size,
+                num_heads=query_layer.shape[-2],
+                num_gqa_groups=key_layer.shape[-2],
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                head_dim=query_layer.shape[-1],
+                attn_mask_type=attn_mask_type,
+                window_size=window_size,
+                alibi_slopes_shape=alibi_slopes.shape if alibi_slopes is not None else None,
+                core_attention_bias_type=core_attention_bias_type,
+                core_attention_bias_shape=core_attention_bias_shape,
+                core_attention_bias_requires_grad=(
+                    core_attention_bias.requires_grad if core_attention_bias is not None else False
+                ),
+                pad_between_seqs=pad_between_seqs,
+                attention_dropout=self.attention_dropout,
+                context_parallel=context_parallel,
+                deterministic=self.deterministic,
+                is_training=self.training,
+                fp8=self.fp8,
+                fp8_meta=self.fp8_meta,
+            )
+            global _attention_backends
+            if (
+                _attention_backends["attention_params"] is None
+                or attention_params != _attention_backends["attention_params"]
+            ):
+                _attention_backends["attention_params"] = attention_params
+                _attention_backends["backend_selection_requires_update"] = True
+            if _attention_backends["backend_selection_requires_update"]:
+                (
+                    use_flash_attention,
+                    use_fused_attention,
+                    fused_attention_backend,
+                    use_unfused_attention,
+                    _,
+                ) = get_attention_backend(attention_params)
+                if use_flash_attention:
+                    self.logger.info("Running with FlashAttention backend")
+                elif use_fused_attention:
+                    self.logger.info(
+                        "Running with FusedAttention backend (sub-backend %s)",
+                        int(fused_attention_backend),
+                    )
+                elif use_unfused_attention:
+                    self.logger.info("Running with UnfusedDotProductAttention backend")
+            else:
+                use_flash_attention = _attention_backends["use_flash_attention"]
+                use_fused_attention = _attention_backends["use_fused_attention"]
+                fused_attention_backend = _attention_backends["fused_attention_backend"]
+                use_unfused_attention = _attention_backends["use_unfused_attention"]
+
+            if use_flash_attention:
+                if core_attention_bias_type == "alibi":
+                    alibi_slopes, _ = get_alibi(
+                        query_layer.shape[-2],
+                        max_seqlen_q,
+                        max_seqlen_kv,
+                        alibi_slopes=alibi_slopes,
+                    )
+                return self.flash_attention(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    attention_mask=attention_mask,
+                    qkv_layout=qkv_layout,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_kv,
+                    attn_mask_type=attn_mask_type,
+                    window_size=window_size,
+                    alibi_slopes=alibi_slopes,
+                    cp_group=self.cp_group,
+                    cp_global_ranks=self.cp_global_ranks,
+                    cp_stream=self.cp_stream,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_kv,
+                )
 
             if use_fused_attention:
                 fu_core_attention_bias_type = core_attention_bias_type
@@ -6074,26 +6125,15 @@ class DotProductAttention(TransformerEngineBaseModule):
                     query_layer,
                     key_layer,
                     value_layer,
-                    qkv_layout = qkv_layout,
-                    cu_seqlens_q = cu_seqlens_q,
-                    cu_seqlens_kv = cu_seqlens_kv,
-                    attn_mask_type = attn_mask_type,
-                    attention_mask = attention_mask,
-                    core_attention_bias_type = core_attention_bias_type,
-                    core_attention_bias = core_attention_bias,
-                    alibi_slopes = alibi_slopes)
-
-            return self.unfused_attention(query_layer,
-                    key_layer,
-                    value_layer,
-                    qkv_layout = qkv_layout,
-                    cu_seqlens_q = cu_seqlens_q,
-                    cu_seqlens_kv = cu_seqlens_kv,
-                    attn_mask_type = attn_mask_type,
-                    attention_mask = attention_mask,
-                    core_attention_bias_type = core_attention_bias_type,
-                    core_attention_bias = core_attention_bias,
-                    alibi_slopes = alibi_slopes)
+                    qkv_layout=qkv_layout,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_kv,
+                    attn_mask_type=attn_mask_type,
+                    attention_mask=attention_mask,
+                    core_attention_bias_type=core_attention_bias_type,
+                    core_attention_bias=core_attention_bias,
+                    alibi_slopes=alibi_slopes,
+                )
 
             raise Exception("No dot product attention support for the provided inputs!")
 
