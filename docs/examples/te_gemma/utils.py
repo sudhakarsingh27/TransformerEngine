@@ -254,7 +254,8 @@ def run_forward_pass(model, hyperparams, num_iters):
 def print_sample_of_generated_texts(model):
     tokenizer = AutoTokenizer.from_pretrained(hyperparams.model_name)
     prompts = ["Here are the two facts about GPUs:", "Some facts about NVIDIA:"]
-    inputs = tokenizer(prompts * 32, return_tensors="pt", padding=True)
+    prompts *= 32
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True)
 
     max_length = inputs["input_ids"].size(1)
     new_length = ((max_length + 63) // 64) * 128
@@ -271,17 +272,15 @@ def print_sample_of_generated_texts(model):
     outputs = model.generate(**inputs, max_new_tokens=50)
     generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-    print("=" * 30 + " Generation example 1 " + "=" * 30)
-    print("Prompt:")
-    print(generated_texts[0][: len(prompts[0])])
-    print("Generated text:")
-    print(generated_texts[0][len(prompts[0]) :])
-    print("=" * 30 + " Generation example 2 " + "=" * 30)
-    print("Prompt:")
-    print(generated_texts[1][: len(prompts[1])])
-    print("")
-    print("Generated text:")
-    print(generated_texts[1][len(prompts[1]) :])
+    def print_output(prompts, generated_texts, idx):
+        print("=" * 30 + f" Generation example {idx+1} " + "=" * 30)
+        print("Prompt:")
+        print(generated_texts[idx][: len(prompts[idx])])
+        print("Generated text:")
+        print(generated_texts[idx][len(prompts[idx]) :])
+
+    for i in range(5):
+        print_output(prompts, generated_texts, i)
 
 
 def _generate_random_words(num_words, max_word_length):
