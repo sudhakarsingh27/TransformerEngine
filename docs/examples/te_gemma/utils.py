@@ -64,7 +64,7 @@ class HyperParameters:
 hyperparams = HyperParameters()
 
 assert (
-    torch.backends.cudnn.version() >= 9100
+    torch.backends.cudnn.version() >= 90100
 ), "cuDNN version >= 9.1.0 is needed to run this tutorial."
 
 
@@ -237,13 +237,16 @@ def run_forward_pass(model, hyperparams, num_iters):
     )
     train_dataloader = get_dataloaders(accelerator, hyperparams)
 
+    # @sudhakars: what's the point of calling `model.train` inside `no_grad`
+    # context?
     model.train()
     train_dataloader = enumerate(train_dataloader)
-
+    
     for _ in range(num_iters):
         _, batch = next(train_dataloader)
         batch["input_ids"] = batch["input_ids"].cuda()
-        model(batch["input_ids"])
+        batch['attention_mask'] = batch["attention_mask"].cuda()
+        model(input_ids = batch["input_ids"], attention_mask = batch['attention_mask'])
 
 
 """
@@ -259,9 +262,14 @@ def print_sample_of_generated_texts(model):
 
     max_length = inputs["input_ids"].size(1)
     new_length = ((max_length + 63) // 64) * 128
+
+    # Add padding to the left
     inputs["input_ids"] = torch.nn.functional.pad(
         inputs["input_ids"], (new_length - max_length, 0), value=tokenizer.pad_token_id
     )
+
+    # Add padding to the left (only intended for baseline generation with HF
+    # which expects padding to the left)
     inputs["attention_mask"] = torch.nn.functional.pad(
         inputs["attention_mask"], (new_length - max_length, 0), value=0
     )

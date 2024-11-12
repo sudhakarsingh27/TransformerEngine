@@ -5,6 +5,7 @@
 from contextlib import contextmanager
 
 from typing import Optional
+from functools import partial
 
 import torch
 import transformer_engine as te
@@ -18,6 +19,33 @@ from transformers.models.gemma.modeling_gemma import GemmaForCausalLM, GemmaConf
 import torch.nn.functional as F
 
 
+# This class has been modified from
+# https://github.com/huggingface/transformers/blob/98adf24883b007c2a7fb17bab1c01b1614673433/src/transformers/models/gemma/modeling_gemma.py
+class GemmaRotaryEmbedding(torch.nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+        self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, x, position_ids, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        self.inv_freq.to(x.device)
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 since bfloat16 loses precision on long contexts
+        # See https://github.com/huggingface/transformers/pull/29285
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.unsqueeze(2) # should return in [b, s, 1, d] format
+
 class TEGemmaDecoderLayer(te.pytorch.TransformerLayer):
     """
     Wrapper class over TE's `TransformerLayer`. This makes the wrapper very
@@ -30,6 +58,9 @@ class TEGemmaDecoderLayer(te.pytorch.TransformerLayer):
     """
 
     def __init__(self, config: GemmaConfig, layer_idx: int, *args, **kwargs):
+
+        self.gemma_config = config
+
         super().__init__(
             hidden_size=config.hidden_size,
             ffn_hidden_size=config.intermediate_size,
@@ -49,11 +80,62 @@ class TEGemmaDecoderLayer(te.pytorch.TransformerLayer):
             ),  # Layer numbers in TE starts from 1, not 0 like in the HF.
             zero_centered_gamma=True,
         )
-        self.te_rope_emb = RotaryPositionEmbedding(256)(
-            max_seq_len=config.max_position_embeddings
-        ).cuda()
 
     def forward(self, *args, **kwargs):  # We need to additionally pass positional encoding.
+
+        if "self_attn_mask_type" in kwargs:
+            attn_mask_type = kwargs['self_attn_mask_type']
+        else:
+            attn_mask_type = "whatever_default_is"
+
+        if attn_mask_type == "arbitrary":
+            # @sudhakars: following logic doesn't work for `thd`
+            attn_mask = kwargs['attention_mask']
+            attention_mask_inv = ~attn_mask
+            generation_case = torch.tensor(torch.tensor(attn_mask.shape).shape).item() > 2
+
+            if generation_case:
+                # @sudhakars: for some reason, `attention_mask` for generation is of the
+                # form [b, 1, 1, s].
+                attention_mask_inv = attention_mask_inv.squeeze(1).squeeze(1)
+                assert torch.tensor(torch.tensor(attention_mask_inv.shape).shape).item() == 2
+
+            # Create `position_ids` on the fly using `attention_mask` since HF
+            # does the same in generation logic.
+            position_ids = attention_mask_inv.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask_inv == 0, 1)
+
+            if "position_ids" in kwargs and kwargs['position_ids'] is not None:
+                assert torch.all(torch.eq(position_ids, kwargs["position_ids"])), "position ids don't match match exactly!"
+
+            # convert [b, s] to [b, 1, s, s] since `arbitrary` is only set for
+            # context phase and context phase gets [b, s] sized attn mask
+            seq_len = 1 if torch.tensor(torch.tensor(attn_mask.shape).shape).item() > 2 else attention_mask_inv.shape[1]
+            arbitrary_attn_mask = torch.zeros(attention_mask_inv.shape[0], 1, seq_len, attention_mask_inv.shape[1]).bool()
+            for sample_idx in range(attn_mask.shape[0]):
+                pad_len = attn_mask[sample_idx].sum().int().item()
+                # set the columns to padded
+                arbitrary_attn_mask[sample_idx, :, :, :pad_len] = True
+                # set the rows to padded
+                if not generation_case:
+                    arbitrary_attn_mask[sample_idx, :, :pad_len, :] = True
+                    arbitrary_attn_mask[sample_idx] = torch.tril(arbitrary_attn_mask[sample_idx].logical_not()).logical_not()
+
+            # Update the attention mask to arbitrary
+            kwargs['attention_mask'] = arbitrary_attn_mask.cuda()
+
+            # @sudhakars: `max_position_embeddings` is not even used inside GemmaRotaryEmbedding
+            te_rope_emb = GemmaRotaryEmbedding(dim=256, max_position_embeddings=self.gemma_config.max_position_embeddings).cuda()
+            te_rope_emb = te_rope_emb(args[0], position_ids.cuda())
+        else:
+            # When the `attention_mask` is not `arbitrary`, then for the purpose
+            # of this tutorial, we're using `padding_causal` (for context) and 
+            # `padding` (for generation)
+            # @sudhakars: find a better way to provide the `tensor_format`
+            te_rope_emb = RotaryPositionEmbedding(256)(
+                max_seq_len=self.gemma_config.max_position_embeddings
+            ).cuda()
+
         # this args cannot be passed to TransformerLayer
         keys_to_remove = [
             "position_ids",
@@ -64,8 +146,9 @@ class TEGemmaDecoderLayer(te.pytorch.TransformerLayer):
         ]
         for key in keys_to_remove:
             kwargs.pop(key, None)
+
         # We need to return tuple to be compatible with HF.
-        return (super().forward(*args, rotary_pos_emb=self.te_rope_emb, **kwargs),)
+        return (super().forward(*args, rotary_pos_emb=te_rope_emb, **kwargs),)
 
 
 class StaticGemmaModel(torch.nn.Module):
@@ -90,15 +173,17 @@ class StaticGemmaModel(torch.nn.Module):
     def set_inference_params(self, inference_params):
         self.inference_params = inference_params
 
-    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor = None):
+    # @sudhakars: is `arbitrary` fine being the default here?
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor = None, attn_mask_type: str = "arbitrary"):
         with torch.no_grad():
             # static operation - for CUDA graphs
             hidden_states.data[:] = hidden_states.data[:] * self.normalizer
-            for decoder_layer in self.model.layers:
+
+            for i, decoder_layer in enumerate(self.model.layers):
                 hidden_states.data[:] = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
-                    self_attn_mask_type=self.mask,
+                    self_attn_mask_type=self.mask if attn_mask_type is None else attn_mask_type,
                     inference_params=self.inference_params,
                 )[
                     0
@@ -121,15 +206,16 @@ class GemmaGenerator(torch.nn.Module):
     ):
         super().__init__()
         self.model = model
-        self.gemma_layers = StaticGemmaModel(model, dtype, "padding", lm_head)
+        self.gemma_layers = StaticGemmaModel(model, dtype, "arbitrary", lm_head)
         self.qkv_format = qkv_format
 
     def set_inference_params(self, inference_params):
         self.inference_params = inference_params
         self.gemma_layers.set_inference_params(inference_params)
 
-    def forward(self, hidden_states: torch.Tensor, mask: torch.Tensor = None):
-        logits = self.gemma_layers(hidden_states, attention_mask=mask)
+    # @sudhakars: is `arbitrary` a good default value here?
+    def forward(self, hidden_states: torch.Tensor, mask: torch.Tensor = None, mask_type: str = "arbitrary"):
+        logits = self.gemma_layers(hidden_states, attention_mask=mask, attn_mask_type = mask_type)
 
         assert logits.shape[0] == hidden_states.shape[0]  # b
         assert logits.shape[1] == hidden_states.shape[1]  # seq_len
@@ -154,6 +240,27 @@ class GemmaGenerator(torch.nn.Module):
             self.inference_params.setup_before_new_input(length=1)
 
         return next_tokens
+
+
+class PartialForwardWrapper(torch.nn.Module):
+    """
+    This class wraps a `torch.nn.Module` while partially modifying its `forward`
+
+    CUDAGraphs' `make_graphed_callables` method takes in a module but if only
+    `functools.partial` is used to wrap the module, it changes the modules' 
+    type and that interferes with the `make_graphed_callables` intrinsics. 
+    """
+    def __init__(self, module, **kwargs):
+        super().__init__()
+        self.module = module
+        self.partial_forward = partial(self.module.forward, **kwargs)
+    
+    def __call__(self, *args, **kwargs):
+        return self.partial_forward(*args, **kwargs)
+
+    # @sudhakars: should we use better abstraction?
+    def set_inference_params(self, *args, **kwargs):
+        return self.module.set_inference_params(*args, **kwargs)
 
 
 @contextmanager
@@ -191,7 +298,7 @@ class TEGemmaForCausalLM(GemmaForCausalLM):
             qkv_format=config.qkv_format,
         )
         self._model_context_phase = StaticGemmaModel(
-            self.model, torch.bfloat16, "padding_causal", self.lm_head
+            self.model, torch.bfloat16, "arbitrary", self.lm_head
         )
 
         if self.config.fp8:
@@ -271,10 +378,10 @@ class TEGemmaForCausalLM(GemmaForCausalLM):
         else:
             inference_params.setup_before_new_input(length=input_ids.shape[1])
 
-        hidden_states.data[:] = self.model.embed_tokens(input_ids)
         logits = self._model_context_phase(
             hidden_states,
             attention_mask=((input_ids == 0) if self.config.qkv_format != "thd" else None),
+            attn_mask_type="padding_causal" if inference_params.qkv_format == "thd" else "arbitrary"
         )
 
         # We choose logits coresponding with last token in each sequence,
@@ -360,16 +467,28 @@ class TEGemmaForCausalLM(GemmaForCausalLM):
             for _ in range(max_new_tokens):
                 if self.config.qkv_format != "thd":
                     # It will not work with cuda graphs, but it is not used for thd qkv_format.
+                    # Attention mask in bshd needs attn_mask increased by 1 to
+                    # include the next token to be generated
                     mask = self._make_mask_one_token_longer(mask)
 
-                next_tokens = self._model_generation_phase(hidden_states, mask)
+                # @sudhakars: could create position_ids from mask here
+                next_tokens = self._model_generation_phase(hidden_states, mask, mask_type="padding" if self.config.qkv_format=="thd" else "arbitrary")
                 # next_tokens is static output tensor, so we need to clone it
                 # - it gets changed every iteration.
                 output_tokens.append(next_tokens.clone())
 
             result = torch.cat((input_ids, torch.stack(output_tokens).permute([1, 0])), dim=1)
             return result
-
+    
+    def forward(self, *args, **kwargs):
+        self._model_context_phase.set_inference_params(None)
+        hidden_states = self.model.embed_tokens(kwargs["input_ids"])
+        logits = self._model_context_phase(
+            hidden_states,
+            attention_mask=((kwargs["input_ids"] == 0) if self.config.qkv_format != "thd" else None),
+            attn_mask_type="arbitrary"
+        )
+        return logits
 
 class TEGemmaForCausalLMCudaGraphs(TEGemmaForCausalLM):
     """
@@ -424,7 +543,10 @@ class TEGemmaForCausalLMCudaGraphs(TEGemmaForCausalLM):
             max_input_length=input_shape[1],
         )
         self._model_context_phase = self.record_graph(
-            self._model_context_phase, self.hidden_states_buffer
+            PartialForwardWrapper(self._model_context_phase, attn_mask_type="padding_causal" 
+                    if self.inference_params.qkv_format == "thd" 
+                    else "arbitrary"), 
+            self.hidden_states_buffer
         )  # CUDA Graphs recording
 
         input_shape = (self.config.cuda_graphs_static_batch_size, 1)
@@ -434,7 +556,10 @@ class TEGemmaForCausalLMCudaGraphs(TEGemmaForCausalLM):
             max_input_length=input_shape[1],
         )
         self._model_generation_phase = self.record_graph(
-            self._model_generation_phase, self.generation_buffer
+            PartialForwardWrapper(self._model_generation_phase, mask_type="padding" 
+                    if self.inference_params.qkv_format=="thd" 
+                    else "arbitrary"), 
+            self.generation_buffer
         )  # CUDA Graphs recording
 
     """
