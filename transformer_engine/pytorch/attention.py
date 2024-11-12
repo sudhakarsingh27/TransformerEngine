@@ -2969,14 +2969,25 @@ def apply_rotary_pos_emb(
         assert (
             tensor_format != "thd" or cu_seqlens is not None
         ), "cu_seqlens must not be None when tensor_format is 'thd'."
-        return FusedRoPEFunc.apply(t, freqs, tensor_format, cu_seqlens, start_positions)
 
+        # Fused RoPE expects the RoPE embedding tensor to be of shape "s 1 1 d"
+        if freqs.shape[1] == 1:
+            return FusedRoPEFunc.apply(t, freqs, tensor_format, cu_seqlens, start_positions)
+    
     assert tensor_format in ("sbhd", "bshd"), (
         "Only formats `sbhd` or `bshd` are supported for input tensor `t` "
         f"when fused is False, got {tensor_format}."
     )
 
-    max_seq_len = freqs.shape[0]
+    # RoPE embeddings provided are of the form `s 1 1 d`. This is also the
+    # default tensor shape in `RotaryPositionEmbedding` above.
+    if freqs.shape[1] == 1:
+        max_seq_len = freqs.shape[0]
+    # RoPE embeddings are of the form `b s 1 d` and for now correspond to 
+    # `arbitrary` attention mask.
+    else:
+        max_seq_len = freqs.shape[1]
+
     cur_seq_len = t.shape[1] if tensor_format == "bshd" else t.shape[0]
 
     # Only apply the rotary embeddings up to the sequence length of the running
@@ -2984,9 +2995,23 @@ def apply_rotary_pos_emb(
     assert (
         cur_seq_len <= max_seq_len
     ), f"Rotary Embeddings only supported up to {max_seq_len} sequence length!"
-    freqs = freqs[:cur_seq_len]
-    if tensor_format == "bshd":
-        freqs = freqs.transpose(0, 1)  # [seq, 1, 1, dim] -> [1, seq, 1, dim]
+
+    # Slice the RoPE embeddings in case they aren't already and transpose
+    # if `bshd` format is being used.
+    if freqs.shape[1] == 1:
+        freqs = freqs[:cur_seq_len, ...] if tensor_format == "sbhd" else freqs[:cur_seq_len, ...].transpose(0, 1)
+    else:
+        # This is the case when the `freqs` embedding has the shape `bs1d` which 
+        # means that every sequence in the batch could have a different sequence
+        # length and has padding to ensure the overall sequence length dimension
+        # in both the embedding `freqs` and the target tensor `t` are the same.
+        assert (
+            cur_seq_len == max_seq_len
+        ), f"Rope embeddings are of shape {freqs.shape} while target tensor is \
+        of shape {t.shape}. Since each sequence could potentially have different \
+        lengths (albeit padded), make sure the provided rope embeddings \
+        sequence dimension matches the target tensor sequence dimension."
+    
     # cos/sin first then dtype conversion for better precision
     cos_ = torch.cos(freqs).to(t.dtype)
     sin_ = torch.sin(freqs).to(t.dtype)
@@ -5958,6 +5983,9 @@ class DotProductAttention(TransformerEngineBaseModule):
                     cu_seqlens_q, cu_seqlens_kv, seq_offsets_q, \
                         seq_offsets_k, seq_offsets_v, seq_offsets_o = buffers
 
+                    # @sudhakars: remove this hardcoded value
+                    cu_seqlens_q_padded, cu_seqlens_kv_padded = seq_offsets_q//4096, seq_offsets_k//4096
+
                     # query_layer is reshaped to the format [t, h, d]
                     # and make contiguous - needed by the THD attention
                     query_layer = query_layer.view(-1, *query_layer.shape[2:]).contiguous()
@@ -6117,13 +6145,15 @@ class DotProductAttention(TransformerEngineBaseModule):
                         False
                     ), "core_attention_bias must be in one of {bhss, 1hss, b1ss, 11ss} shapes"
 
-            pad_between_seqs = (
-                cu_seqlens_q_padded is not None
-                and not torch.equal(cu_seqlens_q_padded, cu_seqlens_q)
-            ) or (
-                cu_seqlens_kv_padded is not None
-                and not torch.equal(cu_seqlens_kv_padded, cu_seqlens_kv)
-            )
+            pad_between_seqs = True
+            # @sudhakars: this condition isn't compatible with CUDA Graphs capture.
+            # pad_between_seqs = (
+            #     cu_seqlens_q_padded is not None
+            #     and not torch.equal(cu_seqlens_q_padded, cu_seqlens_q)
+            # ) or (
+            #     cu_seqlens_kv_padded is not None
+            #     and not torch.equal(cu_seqlens_kv_padded, cu_seqlens_kv)
+            # )
 
             # Check whether this is needed (@sudhakars27)
             if self.attention_type == "self":
@@ -7013,19 +7043,26 @@ class MultiheadAttention(torch.nn.Module):
                 if inference_params is not None:
                     if self.qkv_format == "sbhd":
                         sequence_length = key_layer.size(0)
+                        sequence_start = inference_params.sequence_len_offset
+                        sequence_end = sequence_start + sequence_length
+
+                        q_pos_emb = q_pos_emb[sequence_start:sequence_end, ...]
+                        k_pos_emb = k_pos_emb[sequence_start:sequence_end, ...]
+
                     elif self.qkv_format == "bshd":
                         sequence_length = key_layer.size(1)
+                        sequence_start = inference_params.sequence_len_offset
+                        sequence_end = sequence_start + sequence_length
 
-                    sequence_start = inference_params.sequence_len_offset
-                    sequence_end = sequence_start + sequence_length
-
-                    q_pos_emb = q_pos_emb[sequence_start:sequence_end, ...]
-                    k_pos_emb = k_pos_emb[sequence_start:sequence_end, ...]
+                        q_pos_emb = q_pos_emb[:, sequence_start:sequence_end, ...]
+                        k_pos_emb = k_pos_emb[:, sequence_start:sequence_end, ...]
 
                 query_layer = apply_rotary_pos_emb(
-                    query_layer, q_pos_emb, self.qkv_format, fused=True)
+                    query_layer, q_pos_emb, self.qkv_format, 
+                    fused = False if q_pos_emb.shape[1] > 1 else True)
                 key_layer = apply_rotary_pos_emb(
-                    key_layer, k_pos_emb, self.qkv_format, fused=True)
+                    key_layer, k_pos_emb, self.qkv_format, 
+                    fused = False if k_pos_emb.shape[1] > 1 else True)
 
 
         # ===========================
