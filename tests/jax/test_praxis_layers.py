@@ -4,7 +4,7 @@
 
 import os
 from functools import partial
-from typing import Dict
+from typing import Dict, Tuple
 
 import flax
 import jax
@@ -15,7 +15,6 @@ import pytest
 
 from utils import assert_allclose
 
-from transformer_engine.transformer_engine_jax import get_device_compute_capability
 from transformer_engine.common.recipe import DelayedScaling, Format
 from transformer_engine.jax import fp8_autocast, update_collections
 from transformer_engine.jax.flax import DenseGeneral, LayerNormDenseGeneral
@@ -41,19 +40,6 @@ DATA_SHAPE = [(32, 128, 512), (32, 512, 512)]  # (B, S, H)
 DTYPE = [jnp.float32, jnp.bfloat16]
 ENABLE_FP8 = [False, True]
 FP8_FORMATS = [Format.E4M3, Format.HYBRID]
-
-
-@pytest.fixture(autouse=True, scope="module")
-def enable_fused_attn():
-    """
-    Enable fused attn for hopper+ arch.
-    Fused attn kernels on pre-hopper arch are not deterministic.
-    """
-    if get_device_compute_capability(0) >= 90:
-        os.environ["NVTE_FUSED_ATTN"] = "1"
-    yield
-    if "NVTE_FUSED_ATTN" in os.environ:
-        del os.environ["NVTE_FUSED_ATTN"]
 
 
 def compare_dict(ref_fd, test_fd, rtol=1e-05, atol=1e-08):
@@ -659,6 +645,7 @@ class DotProductAttnAttr:
     NUM_GQA_GROUPS = "num_gqa_groups"
     TRANSPOSE_BS = "transpose_batch_sequence"
     SCALE_FACTOR = "scale_factor"
+    WINDOW_SIZE = "window_size"
     ATTRS = [
         {
             ATTN_MASK_TYPE: "padding",
@@ -695,6 +682,12 @@ class DotProductAttnAttr:
             TRANSPOSE_BS: False,
             SCALE_FACTOR: 1.0,
         },
+        {
+            ATTN_MASK_TYPE: "causal",
+            TRANSPOSE_BS: False,
+            SCALE_FACTOR: 1.0,
+            WINDOW_SIZE: (64, 0),  # Left size must <= S in DATA_SHAPE
+        },
     ]
 
 
@@ -721,6 +714,7 @@ class TestDotProductAttn(TestLayer):
         num_gqa_groups = num_attention_heads
         attn_mask_type = attrs[DotProductAttnAttr.ATTN_MASK_TYPE]
         transpose_batch_sequence = attrs[DotProductAttnAttr.TRANSPOSE_BS]
+        window_size = attrs.get(DotProductAttnAttr.WINDOW_SIZE, None)
 
         praxis_p = pax_fiddle.Config(
             DotProductAttention,
@@ -731,6 +725,7 @@ class TestDotProductAttn(TestLayer):
             num_gqa_groups=num_gqa_groups,
             attn_mask_type=attn_mask_type,
             transpose_batch_sequence=transpose_batch_sequence,
+            window_size=window_size,
         )
         flax_cls = partial(
             flax_DotProductAttention,
@@ -740,6 +735,7 @@ class TestDotProductAttn(TestLayer):
             num_gqa_groups=num_gqa_groups,
             attn_mask_type=attn_mask_type,
             transpose_batch_sequence=transpose_batch_sequence,
+            window_size=window_size,
         )
 
         return praxis_p, flax_cls
@@ -764,6 +760,7 @@ class MultiHeadAttnAttr:
     ENABLE_ROPE = "enable_rotary_pos_emb"
     ROPE_GROUP_METHOD = "rotary_pos_emb_group_method"
     LORA_SCOPE = "low_rank_adaptation_scope"
+    WINDOW_SIZE = "window_size"
     ATTRS = [
         {
             USE_BIAS: True,
@@ -871,6 +868,17 @@ class MultiHeadAttnAttr:
             ATTN_MASK_TYPE: "causal",
             LORA_SCOPE: "all",
             TRANSPOSE_BS: True,
+        },
+        {
+            USE_BIAS: True,
+            LN_TYPE: "layernorm",
+            ZERO_CEN: False,
+            ENABLE_ROPE: False,
+            ROPE_GROUP_METHOD: "consecutive",
+            ATTN_MASK_TYPE: "causal",
+            LORA_SCOPE: "all",
+            TRANSPOSE_BS: True,
+            WINDOW_SIZE: (64, 0),  # Left size must <= S in DATA_SHAPE
         },
     ]
 
@@ -913,6 +921,7 @@ class TestMultiHeadAttn(TestLayer):
         scale_attn_logits = False
         scaled_query_init = True
         float32_logits = False
+        window_size = attrs.get(MultiHeadAttnAttr.WINDOW_SIZE, None)
 
         praxis_p = pax_fiddle.Config(
             MultiHeadAttention,
@@ -937,6 +946,7 @@ class TestMultiHeadAttn(TestLayer):
             scale_attn_logits=scale_attn_logits,
             scaled_query_init=scaled_query_init,
             float32_logits=float32_logits,
+            window_size=window_size,
         )
         flax_cls = partial(
             flax_MultiHeadAttention,
@@ -960,6 +970,7 @@ class TestMultiHeadAttn(TestLayer):
             scale_attn_logits=scale_attn_logits,
             scaled_query_init=scaled_query_init,
             float32_logits=float32_logits,
+            window_size=window_size,
         )
 
         return praxis_p, flax_cls
@@ -997,6 +1008,7 @@ class TransformerLayerAttr:
     ENABLE_ROPE = "enable_rotary_pos_emb"
     ROPE_GROUP_METHOD = "rotary_pos_emb_group_method"
     LORA_SCOPE = "low_rank_adaptation_scope"
+    WINDOW_SIZE = "window_size"
     ATTRS = [
         {
             USE_BIAS: True,
@@ -1259,6 +1271,28 @@ class TransformerLayerAttr:
             ROPE_GROUP_METHOD: "consecutive",
             TRANSPOSE_BS: False,
             LORA_SCOPE: "all",
+        },
+        {
+            USE_BIAS: True,
+            LN_TYPE: "layernorm",
+            ZERO_CEN: False,
+            ACTIVATION: ("relu",),
+            LYR_TYPE: TransformerLayerType.ENCODER,
+            ENABLE_ROPE: False,
+            ROPE_GROUP_METHOD: "consecutive",
+            TRANSPOSE_BS: False,
+            WINDOW_SIZE: (64, 0),  # Left size must <= S in DATA_SHAPE
+        },
+        {
+            USE_BIAS: True,
+            LN_TYPE: "layernorm",
+            ZERO_CEN: False,
+            ACTIVATION: ("relu",),
+            LYR_TYPE: TransformerLayerType.DECODER,
+            ENABLE_ROPE: False,
+            ROPE_GROUP_METHOD: "consecutive",
+            TRANSPOSE_BS: False,
+            WINDOW_SIZE: (64, 0),  # Left size must <= S in DATA_SHAPE
         },
     ]
 
@@ -1303,6 +1337,7 @@ class TestTransformer(TestLayer):
         )
         drop_path = 0.0
         transpose_batch_sequence = attrs[TransformerLayerAttr.TRANSPOSE_BS]
+        window_size = attrs.get(TransformerLayerAttr.WINDOW_SIZE, None)
 
         rel_embedding_init = RelativePositionBiases.generate_embedding_init(
             relative_embedding.embedding_init,
@@ -1344,6 +1379,7 @@ class TestTransformer(TestLayer):
             relative_embedding=relative_embedding,
             drop_path=drop_path,
             transpose_batch_sequence=transpose_batch_sequence,
+            window_size=window_size,
         )
         flax_cls = partial(
             flax_TransformerLayer,
@@ -1372,6 +1408,7 @@ class TestTransformer(TestLayer):
             low_rank_adaptation_scope=low_rank_adaptation_scope,
             drop_path=drop_path,
             transpose_batch_sequence=transpose_batch_sequence,
+            window_size=window_size,
         )
 
         return praxis_p, flax_cls

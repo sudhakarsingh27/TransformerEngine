@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 """JAX/TE custom ops for normalization"""
-from functools import partial, reduce
+from functools import partial, reduce, cache
 import operator
 import os
 import warnings
@@ -13,6 +13,7 @@ from jax import core, dtypes
 from jax.interpreters import mlir
 from jax.interpreters.mlir import ir
 from jax.sharding import PartitionSpec, NamedSharding
+from jax.extend import ffi
 
 from transformer_engine import transformer_engine_jax
 from transformer_engine.transformer_engine_jax import DType as TEDType
@@ -25,6 +26,7 @@ from .misc import (
     jax_dtype_to_te_dtype,
     jax_dtype_to_ir_dtype,
     te_dtype_to_jax_dtype,
+    is_ffi_enabled,
 )
 from .quantization import _jax_cast_fp8
 from ..sharding import all_reduce_max_along_all_axes_except_PP, all_reduce_sum_along_dp_fsdp
@@ -38,6 +40,18 @@ __all__ = [
     "layernorm_fwd_fp8",
     "rmsnorm_fwd_fp8",
 ]
+
+
+@cache
+def get_forward_sm_margin():
+    """Retrieves the number of stream multiprocessors (SM) reserved for other kernels"""
+    return int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
+
+
+@cache
+def get_backward_sm_margin():
+    """Retrieves the number of stream multiprocessors (SM) reserved for other kernels"""
+    return int(os.getenv("NVTE_BWD_LAYERNORM_SM_MARGIN", "0"))
 
 
 class LayerNormFwdPrimitive(BasePrimitive):
@@ -77,6 +91,7 @@ class LayerNormFwdPrimitive(BasePrimitive):
             True,
             kwargs["zero_centered_gamma"],
             kwargs["epsilon"],
+            get_forward_sm_margin(),
         )
         wkspace_aval = out_aval.update(
             shape=wkspace_info[0], dtype=te_dtype_to_jax_dtype(wkspace_info[1])
@@ -112,51 +127,68 @@ class LayerNormFwdPrimitive(BasePrimitive):
         assert g_type == b_type
         assert g_shape == b_shape
 
-        # Output shape is same as the input shape, but the output type is same as the weight type.
-        # See ln_api.cpp
-        output_type = g_type.element_type
-        ir_mu_dtype = ir.F32Type.get()
-        ir_rsigma_dtype = ir.F32Type.get()
+        if is_ffi_enabled():
+            name = "te_layernorm_forward_ffi"
+            sm_margin = get_forward_sm_margin()
+            out = ffi.ffi_lowering(name)(
+                ctx,
+                x,
+                gamma,
+                beta,
+                zero_centered_gamma=zero_centered_gamma,
+                eps=epsilon,
+                sm_margin=sm_margin,
+            )
+        else:
+            # Output shape is same as the input shape, but the output type is same as the weight type.
+            # See ln_api.cpp
+            output_type = g_type.element_type
+            ir_mu_dtype = ir.F32Type.get()
+            ir_rsigma_dtype = ir.F32Type.get()
 
-        out_shape = x_shape
-        hidden_size = reduce(operator.mul, g_shape)
-        batch_shape = out_shape[:-1]
-        batch_size = reduce(operator.mul, x_shape) // hidden_size
+            out_shape = x_shape
+            hidden_size = reduce(operator.mul, g_shape)
+            batch_shape = out_shape[:-1]
+            batch_size = reduce(operator.mul, x_shape) // hidden_size
 
-        wkspace_aval, barrier_aval = ctx.avals_out[-2:]
+            wkspace_aval, barrier_aval = ctx.avals_out[-2:]
 
-        out_types = [
-            ir.RankedTensorType.get(out_shape, output_type),
-            ir.RankedTensorType.get(batch_shape, ir_mu_dtype),
-            ir.RankedTensorType.get(batch_shape, ir_rsigma_dtype),
-            ir.RankedTensorType.get(wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)),
-            ir.RankedTensorType.get(barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)),
-        ]
-        operands = [x, gamma, beta]
-        operand_shapes = [x_shape, g_shape, b_shape]
-        args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
+            out_types = [
+                ir.RankedTensorType.get(out_shape, output_type),
+                ir.RankedTensorType.get(batch_shape, ir_mu_dtype),
+                ir.RankedTensorType.get(batch_shape, ir_rsigma_dtype),
+                ir.RankedTensorType.get(
+                    wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)
+                ),
+                ir.RankedTensorType.get(
+                    barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)
+                ),
+            ]
+            operands = [x, gamma, beta]
+            operand_shapes = [x_shape, g_shape, b_shape]
+            args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
 
-        sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
+            sm_margin = get_forward_sm_margin()
 
-        opaque = transformer_engine_jax.pack_norm_descriptor(
-            batch_size,
-            hidden_size,
-            wkspace_aval.size,
-            barrier_aval.size,
-            (0,),  # no dgamma_part in FWD pass
-            (0,),  # no dbeta_part in BWD pass
-            jax_dtype_to_te_dtype(x_aval.dtype),
-            jax_dtype_to_te_dtype(gamma_aval.dtype),
-            jax_dtype_to_te_dtype(wkspace_aval.dtype),
-            jax_dtype_to_te_dtype(barrier_aval.dtype),
-            TEDType.kByte,  # dummy dgamma_part te_dtype
-            TEDType.kByte,  # dummy dbeta_part te_dtype
-            zero_centered_gamma,
-            epsilon,
-            sm_margin,
-        )
+            opaque = transformer_engine_jax.pack_norm_descriptor(
+                batch_size,
+                hidden_size,
+                wkspace_aval.size,
+                barrier_aval.size,
+                (0,),  # no dgamma_part in FWD pass
+                (0,),  # no dbeta_part in BWD pass
+                jax_dtype_to_te_dtype(x_aval.dtype),
+                jax_dtype_to_te_dtype(gamma_aval.dtype),
+                jax_dtype_to_te_dtype(wkspace_aval.dtype),
+                jax_dtype_to_te_dtype(barrier_aval.dtype),
+                TEDType.kByte,  # dummy dgamma_part te_dtype
+                TEDType.kByte,  # dummy dbeta_part te_dtype
+                zero_centered_gamma,
+                epsilon,
+                sm_margin,
+            )
 
-        out = custom_caller(LayerNormFwdPrimitive.name, args, opaque, False)
+            out = custom_caller(LayerNormFwdPrimitive.name, args, opaque, False)
 
         return out
 
@@ -354,6 +386,7 @@ class LayerNormBwdPrimitive(BasePrimitive):
                 True,
                 kwargs["zero_centered_gamma"],
                 kwargs["epsilon"],
+                get_backward_sm_margin(),
             )
         )
         wkspace_aval = dx_aval.update(
@@ -404,44 +437,59 @@ class LayerNormBwdPrimitive(BasePrimitive):
         assert g_type == b_type
         assert g_shape == b_shape
 
-        dz_shape = ir.RankedTensorType(dz.type).shape
-        mu_shape = ir.RankedTensorType(mu.type).shape
-        rsigma_shape = ir.RankedTensorType(rsigma.type).shape
+        if is_ffi_enabled():
+            name = "te_layernorm_backward_ffi"
+            sm_margin = get_backward_sm_margin()
+            out = ffi.ffi_lowering(name)(
+                ctx,
+                dz,
+                x,
+                mu,
+                rsigma,
+                gamma,
+                zero_centered_gamma=zero_centered_gamma,
+                eps=epsilon,
+                sm_margin=sm_margin,
+            )
+        else:
+            dz_shape = ir.RankedTensorType(dz.type).shape
+            mu_shape = ir.RankedTensorType(mu.type).shape
+            rsigma_shape = ir.RankedTensorType(rsigma.type).shape
 
-        hidden_size = reduce(operator.mul, g_shape)
-        batch_size = reduce(operator.mul, x_shape) // hidden_size
+            hidden_size = reduce(operator.mul, g_shape)
+            batch_size = reduce(operator.mul, x_shape) // hidden_size
 
-        out_types = [
-            ir.RankedTensorType.get(output.shape, mlir.dtype_to_ir_type(output.dtype))
-            for output in ctx.avals_out
-        ]
+            out_types = [
+                ir.RankedTensorType.get(output.shape, mlir.dtype_to_ir_type(output.dtype))
+                for output in ctx.avals_out
+            ]
 
-        operands = [dz, mu, rsigma, x, gamma]
-        operand_shapes = [dz_shape, mu_shape, rsigma_shape, x_shape, g_shape]
-        args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
+            operands = [dz, mu, rsigma, x, gamma]
+            operand_shapes = [dz_shape, mu_shape, rsigma_shape, x_shape, g_shape]
+            args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
 
-        sm_margin = int(os.getenv("NVTE_BWD_LAYERNORM_SM_MARGIN", "0"))
+            sm_margin = get_backward_sm_margin()
 
-        wkspace_aval, barrier_aval, dgamma_part_aval, dbeta_part_aval = ctx.avals_out[-4:]
-        opaque = transformer_engine_jax.pack_norm_descriptor(
-            batch_size,
-            hidden_size,
-            wkspace_aval.size,
-            barrier_aval.size,
-            dgamma_part_aval.shape,
-            dbeta_part_aval.shape,
-            jax_dtype_to_te_dtype(x_aval.dtype),
-            jax_dtype_to_te_dtype(gamma_aval.dtype),
-            jax_dtype_to_te_dtype(wkspace_aval.dtype),
-            jax_dtype_to_te_dtype(barrier_aval.dtype),
-            jax_dtype_to_te_dtype(dgamma_part_aval.dtype),
-            jax_dtype_to_te_dtype(dbeta_part_aval.dtype),
-            zero_centered_gamma,
-            epsilon,
-            sm_margin,
-        )
+            wkspace_aval, barrier_aval, dgamma_part_aval, dbeta_part_aval = ctx.avals_out[-4:]
+            opaque = transformer_engine_jax.pack_norm_descriptor(
+                batch_size,
+                hidden_size,
+                wkspace_aval.size,
+                barrier_aval.size,
+                dgamma_part_aval.shape,
+                dbeta_part_aval.shape,
+                jax_dtype_to_te_dtype(x_aval.dtype),
+                jax_dtype_to_te_dtype(gamma_aval.dtype),
+                jax_dtype_to_te_dtype(wkspace_aval.dtype),
+                jax_dtype_to_te_dtype(barrier_aval.dtype),
+                jax_dtype_to_te_dtype(dgamma_part_aval.dtype),
+                jax_dtype_to_te_dtype(dbeta_part_aval.dtype),
+                zero_centered_gamma,
+                epsilon,
+                sm_margin,
+            )
 
-        out = custom_caller(LayerNormBwdPrimitive.name, args, opaque, False)
+            out = custom_caller(LayerNormBwdPrimitive.name, args, opaque, False)
 
         return out
 
@@ -519,8 +567,8 @@ class LayerNormBwdPrimitive(BasePrimitive):
             local_dx, local_dgamma, local_dbeta = LayerNormBwdPrimitive.impl(
                 dz, x, mu, rsigma, gamma, zero_centered_gamma=zero_centered_gamma, epsilon=epsilon
             )
-            global_dgamma = all_reduce_sum_along_dp_fsdp(local_dgamma)
-            global_dbeta = all_reduce_sum_along_dp_fsdp(local_dbeta)
+            global_dgamma = all_reduce_sum_along_dp_fsdp(local_dgamma, mesh)
+            global_dbeta = all_reduce_sum_along_dp_fsdp(local_dbeta, mesh)
             return local_dx, global_dgamma, global_dbeta
 
         return mesh, sharded_impl, out_shardings, arg_shardings
@@ -591,6 +639,7 @@ class RmsNormFwdPrimitive(BasePrimitive):
             False,
             False,
             kwargs["epsilon"],
+            get_forward_sm_margin(),
         )
         wkspace_aval = out_aval.update(
             shape=wkspace_info[0], dtype=te_dtype_to_jax_dtype(wkspace_info[1])
@@ -614,51 +663,68 @@ class RmsNormFwdPrimitive(BasePrimitive):
         """
         RMSNorm fwd lowering rules
         """
-        x_aval, gamma_aval = ctx.avals_in
-        x_type = ir.RankedTensorType(x.type)
-        x_shape = x_type.shape
-        g_type = ir.RankedTensorType(gamma.type)
-        g_shape = g_type.shape
-        rsigma_element_type = ir.F32Type.get()
+        if is_ffi_enabled():
+            name = "te_rmsnorm_forward_ffi"
+            sm_margin = get_forward_sm_margin()
+            zero_centered_gamma = False  # RMSNorm doesn't support zero_centered_gamma
+            out = ffi.ffi_lowering(name)(
+                ctx,
+                x,
+                gamma,
+                zero_centered_gamma=zero_centered_gamma,
+                eps=epsilon,
+                sm_margin=sm_margin,
+            )
+        else:
+            x_aval, gamma_aval = ctx.avals_in
+            x_type = ir.RankedTensorType(x.type)
+            x_shape = x_type.shape
+            g_type = ir.RankedTensorType(gamma.type)
+            g_shape = g_type.shape
+            rsigma_element_type = ir.F32Type.get()
 
-        out_shape = x_shape
-        hidden_size = reduce(operator.mul, g_shape)
-        batch_shape = out_shape[:-1]
-        batch_size = reduce(operator.mul, x_shape) // hidden_size
+            out_shape = x_shape
+            hidden_size = reduce(operator.mul, g_shape)
+            batch_shape = out_shape[:-1]
+            batch_size = reduce(operator.mul, x_shape) // hidden_size
 
-        wkspace_aval, barrier_aval = ctx.avals_out[-2:]
+            wkspace_aval, barrier_aval = ctx.avals_out[-2:]
 
-        out_types = [
-            ir.RankedTensorType.get(out_shape, x_type.element_type),
-            ir.RankedTensorType.get(batch_shape, rsigma_element_type),
-            ir.RankedTensorType.get(wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)),
-            ir.RankedTensorType.get(barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)),
-        ]
-        operands = [x, gamma]
-        operand_shapes = [x_shape, g_shape]
-        args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
+            out_types = [
+                ir.RankedTensorType.get(out_shape, x_type.element_type),
+                ir.RankedTensorType.get(batch_shape, rsigma_element_type),
+                ir.RankedTensorType.get(
+                    wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)
+                ),
+                ir.RankedTensorType.get(
+                    barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)
+                ),
+            ]
+            operands = [x, gamma]
+            operand_shapes = [x_shape, g_shape]
+            args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
 
-        sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
+            sm_margin = get_forward_sm_margin()
 
-        opaque = transformer_engine_jax.pack_norm_descriptor(
-            batch_size,
-            hidden_size,
-            wkspace_aval.size,
-            barrier_aval.size,
-            (0,),  # no dgamma_part in FWD pass
-            (0,),  # no dbeta_part in BWD pass
-            jax_dtype_to_te_dtype(x_aval.dtype),
-            jax_dtype_to_te_dtype(gamma_aval.dtype),
-            jax_dtype_to_te_dtype(wkspace_aval.dtype),
-            jax_dtype_to_te_dtype(barrier_aval.dtype),
-            TEDType.kByte,  # dummy dgamma_part te_dtype
-            TEDType.kByte,  # dummy dbeta_part te_dtype
-            False,  # RMSNorm doesn't support zero_centered_gamma
-            epsilon,
-            sm_margin,
-        )
+            opaque = transformer_engine_jax.pack_norm_descriptor(
+                batch_size,
+                hidden_size,
+                wkspace_aval.size,
+                barrier_aval.size,
+                (0,),  # no dgamma_part in FWD pass
+                (0,),  # no dbeta_part in BWD pass
+                jax_dtype_to_te_dtype(x_aval.dtype),
+                jax_dtype_to_te_dtype(gamma_aval.dtype),
+                jax_dtype_to_te_dtype(wkspace_aval.dtype),
+                jax_dtype_to_te_dtype(barrier_aval.dtype),
+                TEDType.kByte,  # dummy dgamma_part te_dtype
+                TEDType.kByte,  # dummy dbeta_part te_dtype
+                False,  # RMSNorm doesn't support zero_centered_gamma
+                epsilon,
+                sm_margin,
+            )
 
-        out = custom_caller(RmsNormFwdPrimitive.name, args, opaque, False)
+            out = custom_caller(RmsNormFwdPrimitive.name, args, opaque, False)
 
         return out
 
@@ -776,6 +842,7 @@ class RmsNormBwdPrimitive(BasePrimitive):
                 False,
                 False,
                 kwargs["epsilon"],
+                get_backward_sm_margin(),
             )
         )
         wkspace_aval = dx_aval.update(
@@ -803,53 +870,72 @@ class RmsNormBwdPrimitive(BasePrimitive):
         """
         RMSNorm bwd lowering rules
         """
-        _, x_aval, _, gamma_aval = ctx.avals_in
-        x_type = ir.RankedTensorType(x.type)
-        x_shape = x_type.shape
-        g_type = ir.RankedTensorType(gamma.type)
-        g_shape = g_type.shape
-        dz_shape = ir.RankedTensorType(dz.type).shape
-        rsigma_shape = ir.RankedTensorType(rsigma.type).shape
+        if is_ffi_enabled():
+            name = "te_rmsnorm_backward_ffi"
+            sm_margin = get_backward_sm_margin()
+            zero_centered_gamma = False  # RMSNorm doesn't support zero_centered_gamma
+            out = ffi.ffi_lowering(name)(
+                ctx,
+                dz,
+                x,
+                rsigma,
+                gamma,
+                zero_centered_gamma=zero_centered_gamma,
+                eps=epsilon,
+                sm_margin=sm_margin,
+            )
+        else:
+            _, x_aval, _, gamma_aval = ctx.avals_in
+            x_type = ir.RankedTensorType(x.type)
+            x_shape = x_type.shape
+            g_type = ir.RankedTensorType(gamma.type)
+            g_shape = g_type.shape
+            dz_shape = ir.RankedTensorType(dz.type).shape
+            rsigma_shape = ir.RankedTensorType(rsigma.type).shape
 
-        hidden_size = reduce(operator.mul, g_shape)
-        batch_size = reduce(operator.mul, x_shape) // hidden_size
+            hidden_size = reduce(operator.mul, g_shape)
+            batch_size = reduce(operator.mul, x_shape) // hidden_size
 
-        wkspace_aval, barrier_aval, dgamma_part_aval = ctx.avals_out[-3:]
+            wkspace_aval, barrier_aval, dgamma_part_aval = ctx.avals_out[-3:]
 
-        out_types = [
-            ir.RankedTensorType.get(x_shape, x_type.element_type),
-            ir.RankedTensorType.get(g_shape, g_type.element_type),
-            ir.RankedTensorType.get(wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)),
-            ir.RankedTensorType.get(barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)),
-            ir.RankedTensorType.get(
-                dgamma_part_aval.shape, jax_dtype_to_ir_dtype(dgamma_part_aval.dtype)
-            ),
-        ]
-        operands = [dz, rsigma, x, gamma]
-        operand_shapes = [dz_shape, rsigma_shape, x_shape, g_shape]
-        args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
+            out_types = [
+                ir.RankedTensorType.get(x_shape, x_type.element_type),
+                ir.RankedTensorType.get(g_shape, g_type.element_type),
+                ir.RankedTensorType.get(
+                    wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)
+                ),
+                ir.RankedTensorType.get(
+                    barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)
+                ),
+                ir.RankedTensorType.get(
+                    dgamma_part_aval.shape, jax_dtype_to_ir_dtype(dgamma_part_aval.dtype)
+                ),
+            ]
+            operands = [dz, rsigma, x, gamma]
+            operand_shapes = [dz_shape, rsigma_shape, x_shape, g_shape]
+            args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
 
-        sm_margin = int(os.getenv("NVTE_BWD_LAYERNORM_SM_MARGIN", "0"))
+            sm_margin = get_backward_sm_margin()
 
-        opaque = transformer_engine_jax.pack_norm_descriptor(
-            batch_size,
-            hidden_size,
-            wkspace_aval.size,
-            barrier_aval.size,
-            dgamma_part_aval.shape,
-            (0,),  # no dbeta_part for RMSnorm
-            jax_dtype_to_te_dtype(x_aval.dtype),
-            jax_dtype_to_te_dtype(gamma_aval.dtype),
-            jax_dtype_to_te_dtype(wkspace_aval.dtype),
-            jax_dtype_to_te_dtype(barrier_aval.dtype),
-            jax_dtype_to_te_dtype(dgamma_part_aval.dtype),
-            TEDType.kByte,  # dummy dbeta_part te_dtype
-            False,  # RMSNorm doesn't support zero_centered_gamma
-            epsilon,
-            sm_margin,
-        )
+            opaque = transformer_engine_jax.pack_norm_descriptor(
+                batch_size,
+                hidden_size,
+                wkspace_aval.size,
+                barrier_aval.size,
+                dgamma_part_aval.shape,
+                (0,),  # no dbeta_part for RMSnorm
+                jax_dtype_to_te_dtype(x_aval.dtype),
+                jax_dtype_to_te_dtype(gamma_aval.dtype),
+                jax_dtype_to_te_dtype(wkspace_aval.dtype),
+                jax_dtype_to_te_dtype(barrier_aval.dtype),
+                jax_dtype_to_te_dtype(dgamma_part_aval.dtype),
+                TEDType.kByte,  # dummy dbeta_part te_dtype
+                False,  # RMSNorm doesn't support zero_centered_gamma
+                epsilon,
+                sm_margin,
+            )
 
-        out = custom_caller(RmsNormBwdPrimitive.name, args, opaque, False)
+            out = custom_caller(RmsNormBwdPrimitive.name, args, opaque, False)
 
         return out
 
@@ -919,7 +1005,7 @@ class RmsNormBwdPrimitive(BasePrimitive):
 
         def sharded_impl(dz, x, rsigma, gamma):
             local_dx, local_dgamma = RmsNormBwdPrimitive.impl(dz, x, rsigma, gamma, epsilon=epsilon)
-            global_dgamma = all_reduce_sum_along_dp_fsdp(local_dgamma)
+            global_dgamma = all_reduce_sum_along_dp_fsdp(local_dgamma, mesh)
             return local_dx, global_dgamma
 
         return mesh, sharded_impl, out_shardings, arg_shardings
@@ -989,6 +1075,7 @@ class LayerNormFwdFp8Primitive(BasePrimitive):
             True,
             zero_centered_gamma,
             epsilon,
+            get_forward_sm_margin(),
         )
 
         out_aval = x_aval.update(shape=x_aval.shape, dtype=out_dtype)
@@ -1041,64 +1128,84 @@ class LayerNormFwdFp8Primitive(BasePrimitive):
         assert g_type == b_type
         assert g_shape == b_shape
 
-        ir_out_dtype = jax_dtype_to_ir_dtype(out_dtype)
-        ir_mu_dtype = ir.F32Type.get()
-        ir_rsigma_dtype = ir.F32Type.get()
-        ir_amax_type = ir.RankedTensorType(amax.type)
-        ir_amax_dtype = ir_amax_type.element_type
-        ir_amax_shape = ir_amax_type.shape
-        ir_scale_shape = ir_amax_shape
-        ir_scale_inv_shape = ir_amax_shape
+        if is_ffi_enabled():
+            name = "te_layernorm_forward_fp8_ffi"
+            sm_margin = get_forward_sm_margin()
+            out = ffi.ffi_lowering(name, operand_output_aliases={3: 3})(
+                ctx,
+                x,
+                gamma,
+                beta,
+                amax,
+                scale,
+                scale_inv,
+                zero_centered_gamma=zero_centered_gamma,
+                eps=epsilon,
+                sm_margin=sm_margin,
+            )
+        else:
+            ir_out_dtype = jax_dtype_to_ir_dtype(out_dtype)
+            ir_mu_dtype = ir.F32Type.get()
+            ir_rsigma_dtype = ir.F32Type.get()
+            ir_amax_type = ir.RankedTensorType(amax.type)
+            ir_amax_dtype = ir_amax_type.element_type
+            ir_amax_shape = ir_amax_type.shape
+            ir_scale_shape = ir_amax_shape
+            ir_scale_inv_shape = ir_amax_shape
 
-        out_shape = x_shape
-        hidden_size = reduce(operator.mul, g_shape)
-        batch_shape = out_shape[:-1]
-        batch_size = reduce(operator.mul, x_shape) // hidden_size
+            out_shape = x_shape
+            hidden_size = reduce(operator.mul, g_shape)
+            batch_shape = out_shape[:-1]
+            batch_size = reduce(operator.mul, x_shape) // hidden_size
 
-        wkspace_aval, barrier_aval = ctx.avals_out[-2:]
+            wkspace_aval, barrier_aval = ctx.avals_out[-2:]
 
-        out_types = [
-            ir.RankedTensorType.get(out_shape, ir_out_dtype),
-            ir.RankedTensorType.get(batch_shape, ir_mu_dtype),
-            ir.RankedTensorType.get(batch_shape, ir_rsigma_dtype),
-            ir.RankedTensorType.get(ir_amax_shape, ir_amax_dtype),
-            ir.RankedTensorType.get(wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)),
-            ir.RankedTensorType.get(barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)),
-        ]
-        operands = [x, gamma, beta, amax, scale, scale_inv]
-        operand_shapes = [
-            x_shape,
-            g_shape,
-            b_shape,
-            ir_amax_shape,
-            ir_scale_shape,
-            ir_scale_inv_shape,
-        ]
-        args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
+            out_types = [
+                ir.RankedTensorType.get(out_shape, ir_out_dtype),
+                ir.RankedTensorType.get(batch_shape, ir_mu_dtype),
+                ir.RankedTensorType.get(batch_shape, ir_rsigma_dtype),
+                ir.RankedTensorType.get(ir_amax_shape, ir_amax_dtype),
+                ir.RankedTensorType.get(
+                    wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)
+                ),
+                ir.RankedTensorType.get(
+                    barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)
+                ),
+            ]
+            operands = [x, gamma, beta, amax, scale, scale_inv]
+            operand_shapes = [
+                x_shape,
+                g_shape,
+                b_shape,
+                ir_amax_shape,
+                ir_scale_shape,
+                ir_scale_inv_shape,
+            ]
+            args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
 
-        sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
+            sm_margin = get_forward_sm_margin()
 
-        opaque = transformer_engine_jax.pack_norm_descriptor(
-            batch_size,
-            hidden_size,
-            wkspace_aval.size,
-            barrier_aval.size,
-            (0,),  # no dgamma_part in FWD pass
-            (0,),  # no dbeta_part in BWD pass
-            jax_dtype_to_te_dtype(x_aval.dtype),
-            jax_dtype_to_te_dtype(gamma_aval.dtype),
-            jax_dtype_to_te_dtype(wkspace_aval.dtype),
-            jax_dtype_to_te_dtype(barrier_aval.dtype),
-            TEDType.kByte,  # dummy dgamma_part te_dtype
-            TEDType.kByte,  # dummy dbeta_part te_dtype
-            zero_centered_gamma,
-            epsilon,
-            sm_margin,
-        )
+            opaque = transformer_engine_jax.pack_norm_descriptor(
+                batch_size,
+                hidden_size,
+                wkspace_aval.size,
+                barrier_aval.size,
+                (0,),  # no dgamma_part in FWD pass
+                (0,),  # no dbeta_part in BWD pass
+                jax_dtype_to_te_dtype(x_aval.dtype),
+                jax_dtype_to_te_dtype(gamma_aval.dtype),
+                jax_dtype_to_te_dtype(wkspace_aval.dtype),
+                jax_dtype_to_te_dtype(barrier_aval.dtype),
+                TEDType.kByte,  # dummy dgamma_part te_dtype
+                TEDType.kByte,  # dummy dbeta_part te_dtype
+                zero_centered_gamma,
+                epsilon,
+                sm_margin,
+            )
 
-        out = custom_caller(
-            LayerNormFwdFp8Primitive.name, args, opaque, False, operand_output_aliases={3: 3}
-        )
+            out = custom_caller(
+                LayerNormFwdFp8Primitive.name, args, opaque, False, operand_output_aliases={3: 3}
+            )
 
         return out
 
@@ -1211,7 +1318,7 @@ class LayerNormFwdFp8Primitive(BasePrimitive):
                 zero_centered_gamma=zero_centered_gamma,
                 epsilon=epsilon,
             )
-            global_updated_amax = all_reduce_max_along_all_axes_except_PP(local_amax)
+            global_updated_amax = all_reduce_max_along_all_axes_except_PP(local_amax, mesh)
 
             return local_x, local_mu, local_rsigma, global_updated_amax
 
@@ -1296,6 +1403,7 @@ class RmsNormFwdFp8Primitive(BasePrimitive):
             False,
             False,
             epsilon,
+            get_forward_sm_margin(),
         )
 
         out_aval = x_aval.update(shape=x_aval.shape, dtype=out_dtype)
@@ -1327,67 +1435,87 @@ class RmsNormFwdFp8Primitive(BasePrimitive):
         # Currently only support casting to E4M3 only in C side.
         assert out_dtype == jnp.float8_e4m3fn
 
-        x_aval, gamma_aval, amax_aval, scale_aval, scale_inv_aval = ctx.avals_in
+        if is_ffi_enabled():
+            name = "te_rmsnorm_forward_fp8_ffi"
+            sm_margin = get_forward_sm_margin()
+            zero_centered_gamma = False  # RMSNorm doesn't support zero_centered_gamma
+            out = ffi.ffi_lowering(name, operand_output_aliases={2: 2})(
+                ctx,
+                x,
+                gamma,
+                amax,
+                scale,
+                scale_inv,
+                zero_centered_gamma=zero_centered_gamma,
+                eps=epsilon,
+                sm_margin=sm_margin,
+            )
+        else:
+            x_aval, gamma_aval, amax_aval, scale_aval, scale_inv_aval = ctx.avals_in
 
-        assert x_aval.dtype in [jnp.float32, jnp.float16, jnp.bfloat16]
-        assert amax_aval.dtype == jnp.float32
-        assert scale_aval.dtype == jnp.float32
-        assert scale_inv_aval.dtype == jnp.float32
+            assert x_aval.dtype in [jnp.float32, jnp.float16, jnp.bfloat16]
+            assert amax_aval.dtype == jnp.float32
+            assert scale_aval.dtype == jnp.float32
+            assert scale_inv_aval.dtype == jnp.float32
 
-        x_type = ir.RankedTensorType(x.type)
-        x_shape = x_type.shape
-        g_type = ir.RankedTensorType(gamma.type)
-        g_shape = g_type.shape
+            x_type = ir.RankedTensorType(x.type)
+            x_shape = x_type.shape
+            g_type = ir.RankedTensorType(gamma.type)
+            g_shape = g_type.shape
 
-        ir_out_dtype = jax_dtype_to_ir_dtype(out_dtype)
-        ir_rsigma_dtype = ir.F32Type.get()
-        ir_amax_type = ir.RankedTensorType(amax.type)
-        ir_amax_dtype = ir_amax_type.element_type
-        ir_amax_shape = ir_amax_type.shape
-        ir_scale_shape = ir_amax_shape
-        ir_scale_inv_shape = ir_amax_shape
+            ir_out_dtype = jax_dtype_to_ir_dtype(out_dtype)
+            ir_rsigma_dtype = ir.F32Type.get()
+            ir_amax_type = ir.RankedTensorType(amax.type)
+            ir_amax_dtype = ir_amax_type.element_type
+            ir_amax_shape = ir_amax_type.shape
+            ir_scale_shape = ir_amax_shape
+            ir_scale_inv_shape = ir_amax_shape
 
-        out_shape = x_shape
-        hidden_size = reduce(operator.mul, g_shape)
-        batch_shape = out_shape[:-1]
-        batch_size = reduce(operator.mul, x_shape) // hidden_size
+            out_shape = x_shape
+            hidden_size = reduce(operator.mul, g_shape)
+            batch_shape = out_shape[:-1]
+            batch_size = reduce(operator.mul, x_shape) // hidden_size
 
-        wkspace_aval, barrier_aval = ctx.avals_out[-2:]
+            wkspace_aval, barrier_aval = ctx.avals_out[-2:]
 
-        out_types = [
-            ir.RankedTensorType.get(out_shape, ir_out_dtype),
-            ir.RankedTensorType.get(batch_shape, ir_rsigma_dtype),
-            ir.RankedTensorType.get(ir_amax_shape, ir_amax_dtype),
-            ir.RankedTensorType.get(wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)),
-            ir.RankedTensorType.get(barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)),
-        ]
-        operands = [x, gamma, amax, scale, scale_inv]
-        operand_shapes = [x_shape, g_shape, ir_amax_shape, ir_scale_shape, ir_scale_inv_shape]
-        args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
+            out_types = [
+                ir.RankedTensorType.get(out_shape, ir_out_dtype),
+                ir.RankedTensorType.get(batch_shape, ir_rsigma_dtype),
+                ir.RankedTensorType.get(ir_amax_shape, ir_amax_dtype),
+                ir.RankedTensorType.get(
+                    wkspace_aval.shape, jax_dtype_to_ir_dtype(wkspace_aval.dtype)
+                ),
+                ir.RankedTensorType.get(
+                    barrier_aval.shape, jax_dtype_to_ir_dtype(barrier_aval.dtype)
+                ),
+            ]
+            operands = [x, gamma, amax, scale, scale_inv]
+            operand_shapes = [x_shape, g_shape, ir_amax_shape, ir_scale_shape, ir_scale_inv_shape]
+            args = CustomCallArgsWrapper(out_types, operands, operand_shapes)
 
-        sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
+            sm_margin = get_forward_sm_margin()
 
-        opaque = transformer_engine_jax.pack_norm_descriptor(
-            batch_size,
-            hidden_size,
-            wkspace_aval.size,
-            barrier_aval.size,
-            (0,),  # no dgamma_part in FWD pass
-            (0,),  # no dbeta_part in BWD pass
-            jax_dtype_to_te_dtype(x_aval.dtype),
-            jax_dtype_to_te_dtype(gamma_aval.dtype),
-            jax_dtype_to_te_dtype(wkspace_aval.dtype),
-            jax_dtype_to_te_dtype(barrier_aval.dtype),
-            TEDType.kByte,  # dummy dgamma_part te_dtype
-            TEDType.kByte,  # dummy dbeta_part te_dtype
-            False,  # RMSNorm doesn't support zero_centered_gamma
-            epsilon,
-            sm_margin,
-        )
+            opaque = transformer_engine_jax.pack_norm_descriptor(
+                batch_size,
+                hidden_size,
+                wkspace_aval.size,
+                barrier_aval.size,
+                (0,),  # no dgamma_part in FWD pass
+                (0,),  # no dbeta_part in BWD pass
+                jax_dtype_to_te_dtype(x_aval.dtype),
+                jax_dtype_to_te_dtype(gamma_aval.dtype),
+                jax_dtype_to_te_dtype(wkspace_aval.dtype),
+                jax_dtype_to_te_dtype(barrier_aval.dtype),
+                TEDType.kByte,  # dummy dgamma_part te_dtype
+                TEDType.kByte,  # dummy dbeta_part te_dtype
+                False,  # RMSNorm doesn't support zero_centered_gamma
+                epsilon,
+                sm_margin,
+            )
 
-        out = custom_caller(
-            RmsNormFwdFp8Primitive.name, args, opaque, False, operand_output_aliases={2: 2}
-        )
+            out = custom_caller(
+                RmsNormFwdFp8Primitive.name, args, opaque, False, operand_output_aliases={2: 2}
+            )
 
         return out
 
@@ -1463,7 +1591,7 @@ class RmsNormFwdFp8Primitive(BasePrimitive):
             local_x, local_rsigma, local_amax = RmsNormFwdFp8Primitive.impl(
                 x, gamma, amax, scale, scale_inv, out_dtype=out_dtype, epsilon=epsilon
             )
-            global_updated_amax = all_reduce_max_along_all_axes_except_PP(local_amax)
+            global_updated_amax = all_reduce_max_along_all_axes_except_PP(local_amax, mesh)
 
             return local_x, local_rsigma, global_updated_amax
 

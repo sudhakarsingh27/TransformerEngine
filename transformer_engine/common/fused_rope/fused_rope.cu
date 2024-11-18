@@ -4,6 +4,7 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+#include <assert.h>
 #include <cuda_runtime.h>
 #include <transformer_engine/fused_rope.h>
 
@@ -15,11 +16,10 @@ namespace transformer_engine {
 
 template <typename scalar_t>
 __device__ void fused_rope_block_forward(const scalar_t *src, const float *freqs, scalar_t *dst,
-                                         const int begin_offset, const int offset_block,
+                                         const int s_id, const int offset_block,
                                          const int offset_block_dst, const int h, const int d,
                                          const int d2, const int stride_h, const int stride_d,
                                          const int o_stride_h, const int o_stride_d) {
-  int s_id = blockIdx.x + begin_offset;
 #pragma unroll
   for (int d_id = threadIdx.x; d_id < d2; d_id += blockDim.x) {
     float v_cos, v_sin;
@@ -52,11 +52,10 @@ __device__ void fused_rope_block_forward(const scalar_t *src, const float *freqs
 
 template <typename scalar_t>
 __device__ void fused_rope_block_backward(const scalar_t *src, const float *freqs, scalar_t *dst,
-                                          const int begin_offset, const int offset_block,
+                                          const int s_id, const int offset_block,
                                           const int offset_block_dst, const int h, const int d,
                                           const int d2, const int stride_h, const int stride_d,
                                           const int o_stride_h, const int o_stride_d) {
-  int s_id = blockIdx.x + begin_offset;
 #pragma unroll
   for (int d_id = threadIdx.x; d_id < d2; d_id += blockDim.x) {
     float v_cos = cosf(freqs[s_id * d2 + d_id]);
@@ -99,7 +98,9 @@ __global__ void fused_rope_forward_kernel(const scalar_t *src, const float *freq
   int begin_offset = (start_positions == 0) ? 0 : start_positions[b_id];
   int offset_block = s_id * stride_s + b_id * stride_b;
   int offset_block_dst = s_id * o_stride_s + b_id * o_stride_b;
-  fused_rope_block_forward(src, freqs, dst, begin_offset, offset_block, offset_block_dst, h, d, d2,
+
+  s_id = s_id + begin_offset;
+  fused_rope_block_forward(src, freqs, dst, s_id, offset_block, offset_block_dst, h, d, d2,
                            stride_h, stride_d, o_stride_h, o_stride_d);
 }
 
@@ -115,42 +116,78 @@ __global__ void fused_rope_backward_kernel(const scalar_t *src, const float *fre
   int begin_offset = (start_positions == 0) ? 0 : start_positions[b_id];
   int offset_block = s_id * stride_s + b_id * stride_b;
   int offset_block_dst = s_id * o_stride_s + b_id * o_stride_b;
-  fused_rope_block_backward(src, freqs, dst, begin_offset, offset_block, offset_block_dst, h, d, d2,
+
+  s_id = s_id + begin_offset;
+  fused_rope_block_backward(src, freqs, dst, s_id, offset_block, offset_block_dst, h, d, d2,
                             stride_h, stride_d, o_stride_h, o_stride_d);
 }
 
 template <typename scalar_t>
 __global__ void fused_rope_thd_forward_kernel(const scalar_t *src, const int *cu_seqlens,
-                                              const float *freqs, const int *start_positions,
-                                              scalar_t *dst, const int h, const int d, const int d2,
-                                              const int stride_t, const int stride_h,
+                                              const float *freqs, const int *start_positions, 
+                                              scalar_t *dst, const int cp_size,
+                                              const int cp_rank, const int h, const int d,
+                                              const int d2, const int stride_t, const int stride_h,
                                               const int stride_d, const int o_stride_t,
                                               const int o_stride_h, const int o_stride_d) {
   int s_id = blockIdx.x, b_id = blockIdx.y;
-  int t_id = s_id + cu_seqlens[b_id];
-  if (t_id >= cu_seqlens[b_id + 1]) return;
+  int start = cu_seqlens[b_id] / cp_size;
+  int end = cu_seqlens[b_id + 1] / cp_size;
+  int t_id = s_id + start;
+  if (t_id >= end) return;
   int offset_block = t_id * stride_t;
   int offset_block_dst = t_id * o_stride_t;
-  int begin_offset = (start_positions == 0) ? 0 : start_positions[b_id];
-  fused_rope_block_forward(src, freqs, dst, begin_offset, offset_block, offset_block_dst, h, d, d2,
-                           stride_h, stride_d, o_stride_h, o_stride_d);
+
+  int s_id_for_freqs;
+  if (cp_size > 1) {
+    int cur_seqlens = end - start;
+    assert(cur_seqlens % 2 == 0);
+    if (s_id < cur_seqlens / 2) {
+      s_id_for_freqs = s_id + cp_rank * cur_seqlens / 2;
+    } else {
+      s_id_for_freqs =
+          cur_seqlens * cp_size - (cp_rank + 1) * cur_seqlens / 2 + s_id - cur_seqlens / 2;
+    }
+  } else {
+    int begin_offset = (start_positions == 0) ? 0 : start_positions[b_id];
+    s_id_for_freqs = s_id + begin_offset;
+  }
+  fused_rope_block_forward(src, freqs, dst, s_id_for_freqs, offset_block, offset_block_dst, h, d,
+                           d2, stride_h, stride_d, o_stride_h, o_stride_d);
 }
 
 template <typename scalar_t>
 __global__ void fused_rope_thd_backward_kernel(const scalar_t *src, const int *cu_seqlens,
                                                const float *freqs, const int *start_positions,
-                                               scalar_t *dst, const int h, const int d,
+                                               scalar_t *dst, const int cp_size,
+                                               const int cp_rank, const int h, const int d,
                                                const int d2, const int stride_t, const int stride_h,
                                                const int stride_d, const int o_stride_t,
                                                const int o_stride_h, const int o_stride_d) {
   int s_id = blockIdx.x, b_id = blockIdx.y;
-  int t_id = s_id + cu_seqlens[b_id];
-  if (t_id >= cu_seqlens[b_id + 1]) return;
+  int start = cu_seqlens[b_id] / cp_size;
+  int end = cu_seqlens[b_id + 1] / cp_size;
+  int t_id = s_id + start;
+  if (t_id >= end) return;
   int offset_block = t_id * stride_t;
   int offset_block_dst = t_id * o_stride_t;
-  int begin_offset = (start_positions == 0) ? 0 : start_positions[b_id];
-  fused_rope_block_backward(src, freqs, dst, begin_offset, offset_block, offset_block_dst, h, d, d2,
-                            stride_h, stride_d, o_stride_h, o_stride_d);
+
+  int s_id_for_freqs;
+  if (cp_size > 1) {
+    int cur_seqlens = end - start;
+    assert(cur_seqlens % 2 == 0);
+    if (s_id < cur_seqlens / 2) {
+      s_id_for_freqs = s_id + cp_rank * cur_seqlens / 2;
+    } else {
+      s_id_for_freqs =
+          cur_seqlens * cp_size - (cp_rank + 1) * cur_seqlens / 2 + s_id - cur_seqlens / 2;
+    }
+  } else {
+    int begin_offset = (start_positions == 0) ? 0 : start_positions[b_id];
+    s_id_for_freqs = s_id + begin_offset;
+  }
+  fused_rope_block_backward(src, freqs, dst, s_id_for_freqs, offset_block, offset_block_dst, h, d,
+                            d2, stride_h, stride_d, o_stride_h, o_stride_d);
 }
 
 template <typename scalar_t>
@@ -190,7 +227,8 @@ void fused_rope_backward_launcher(const scalar_t *output_grads, const float *fre
 template <typename scalar_t>
 void fused_rope_thd_forward_launcher(const scalar_t *input, const int *cu_seqlens,
                                      const float *freqs, const int *start_positions,
-                                     scalar_t *output, const int max_s, const int b, const int h,
+                                     scalar_t *output, const int cp_size,
+                                     const int cp_rank, const int max_s, const int b, const int h,
                                      const int d, const int d2, const int stride_t,
                                      const int stride_h, const int stride_d, const int o_stride_t,
                                      const int o_stride_h, const int o_stride_d,
@@ -200,7 +238,7 @@ void fused_rope_thd_forward_launcher(const scalar_t *input, const int *cu_seqlen
   dim3 threads(THREADS_PER_WARP, warps_per_block);
 
   fused_rope_thd_forward_kernel<<<blocks, threads, 0, stream>>>(
-      input, cu_seqlens, freqs, start_positions, output, h, d, d2, stride_t, stride_h, stride_d,
+      input, cu_seqlens, freqs, start_positions, output, cp_size, cp_rank, h, d, d2, stride_t, stride_h, stride_d,
       o_stride_t, o_stride_h, o_stride_d);
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
@@ -208,8 +246,9 @@ void fused_rope_thd_forward_launcher(const scalar_t *input, const int *cu_seqlen
 template <typename scalar_t>
 void fused_rope_thd_backward_launcher(const scalar_t *output_grads, const int *cu_seqlens,
                                       const float *freqs, const int *start_positions,
-                                      scalar_t *input_grads, const int max_s, const int b,
-                                      const int h, const int d, const int d2, const int stride_t,
+                                      scalar_t *input_grads, const int cp_size,
+                                      const int cp_rank, const int max_s, const int b, const int h,
+                                      const int d, const int d2, const int stride_t,
                                       const int stride_h, const int stride_d, const int o_stride_t,
                                       const int o_stride_h, const int o_stride_d,
                                       cudaStream_t stream) {
@@ -218,7 +257,7 @@ void fused_rope_thd_backward_launcher(const scalar_t *output_grads, const int *c
   dim3 threads(THREADS_PER_WARP, warps_per_block);
 
   fused_rope_thd_backward_kernel<<<blocks, threads, 0, stream>>>(
-      output_grads, cu_seqlens, freqs, start_positions, input_grads, h, d, d2, stride_t, stride_h,
+      output_grads, cu_seqlens, freqs, start_positions, input_grads, cp_size, cp_rank, h, d, d2, stride_t, stride_h,
       stride_d, o_stride_t, o_stride_h, o_stride_d);
   NVTE_CHECK_CUDA(cudaGetLastError());
 }
@@ -255,7 +294,8 @@ void fused_rope_backward(const Tensor &output_grads, const Tensor &freqs,
 }
 
 void fused_rope_thd_forward(const Tensor &input, const Tensor &cu_seqlens, const Tensor &freqs,
-                            const Tensor &start_positions, Tensor *output, const int max_s,
+                            const Tensor &start_positions, Tensor *output, const int cp_size, 
+                            const int cp_rank, const int max_s,
                             const int b, const int h, const int d, const int d2, const int stride_t,
                             const int stride_h, const int stride_d, const int o_stride_t,
                             const int o_stride_h, const int o_stride_d, cudaStream_t stream) {
@@ -265,14 +305,15 @@ void fused_rope_thd_forward(const Tensor &input, const Tensor &cu_seqlens, const
                                       reinterpret_cast<const int *>(cu_seqlens.data.dptr),
                                       reinterpret_cast<const float *>(freqs.data.dptr),
                                       reinterpret_cast<const int *>(start_positions.data.dptr),
-                                      reinterpret_cast<scalar_t *>(output->data.dptr), max_s, b, h,
-                                      d, d2, stride_t, stride_h, stride_d, o_stride_t, o_stride_h,
-                                      o_stride_d, stream););
+                                      reinterpret_cast<scalar_t *>(output->data.dptr), cp_size,
+                                      cp_rank, max_s, b, h, d, d2, stride_t, stride_h, stride_d,
+                                      o_stride_t, o_stride_h, o_stride_d, stream););
 }
 
 void fused_rope_thd_backward(const Tensor &output_grads, const Tensor &cu_seqlens,
                              const Tensor &freqs, const Tensor &start_positions,
-                             Tensor *input_grads, const int max_s, const int b, const int h,
+                             Tensor *input_grads, const int cp_size,
+                             const int cp_rank, const int max_s, const int b, const int h,
                              const int d, const int d2, const int stride_t, const int stride_h,
                              const int stride_d, const int o_stride_t, const int o_stride_h,
                              const int o_stride_d, cudaStream_t stream) {
@@ -282,9 +323,9 @@ void fused_rope_thd_backward(const Tensor &output_grads, const Tensor &cu_seqlen
                                        reinterpret_cast<const int *>(cu_seqlens.data.dptr),
                                        reinterpret_cast<const float *>(freqs.data.dptr),
                                        reinterpret_cast<const int *>(start_positions.data.dptr),
-                                       reinterpret_cast<scalar_t *>(input_grads->data.dptr), max_s,
-                                       b, h, d, d2, stride_t, stride_h, stride_d, o_stride_t,
-                                       o_stride_h, o_stride_d, stream););
+                                       reinterpret_cast<scalar_t *>(input_grads->data.dptr),
+                                       cp_size, cp_rank, max_s, b, h, d, d2, stride_t, stride_h,
+                                       stride_d, o_stride_t, o_stride_h, o_stride_d, stream););
 }
 
 }  // end namespace transformer_engine
@@ -321,22 +362,25 @@ void nvte_fused_rope_backward(const NVTETensor output_grads, const NVTETensor fr
 
 void nvte_fused_rope_thd_forward(const NVTETensor input, const NVTETensor cu_seqlens,
                                  const NVTETensor freqs, const NVTETensor start_positions,
-                                 NVTETensor output, const int max_s, const int b, const int h,
+                                 NVTETensor output, const int cp_size,
+                                 const int cp_rank, const int max_s, const int b, const int h,
                                  const int d, const int d2, const int stride_t, const int stride_h,
                                  const int stride_d, const int o_stride_t, const int o_stride_h,
                                  const int o_stride_d, cudaStream_t stream) {
   NVTE_API_CALL(nvte_fused_rope_thd_forward);
   using namespace transformer_engine;
-  fused_rope_thd_forward(
-      *reinterpret_cast<const Tensor *>(input), *reinterpret_cast<const Tensor *>(cu_seqlens),
-      *reinterpret_cast<const Tensor *>(freqs), *reinterpret_cast<const Tensor *>(start_positions),
-      reinterpret_cast<Tensor *>(output), max_s, b, h, d, d2, stride_t, stride_h, stride_d,
-      o_stride_t, o_stride_h, o_stride_d, stream);
+  fused_rope_thd_forward(*reinterpret_cast<const Tensor *>(input),
+                         *reinterpret_cast<const Tensor *>(cu_seqlens),
+                         *reinterpret_cast<const Tensor *>(freqs),
+                         *reinterpret_cast<const Tensor *>(start_positions),
+                         reinterpret_cast<Tensor *>(output), cp_size, cp_rank, max_s, b, h, d, d2,
+                         stride_t, stride_h, stride_d, o_stride_t, o_stride_h, o_stride_d, stream);
 }
 
 void nvte_fused_rope_thd_backward(const NVTETensor output_grads, const NVTETensor cu_seqlens,
                                   const NVTETensor freqs, const NVTETensor start_positions,
-                                  NVTETensor input_grads, const int max_s, const int b, const int h,
+                                  NVTETensor input_grads, const int cp_size,
+                                  const int cp_rank, const int max_s, const int b, const int h,
                                   const int d, const int d2, const int stride_t, const int stride_h,
                                   const int stride_d, const int o_stride_t, const int o_stride_h,
                                   const int o_stride_d, cudaStream_t stream) {
@@ -345,6 +389,7 @@ void nvte_fused_rope_thd_backward(const NVTETensor output_grads, const NVTETenso
   fused_rope_thd_backward(
       *reinterpret_cast<const Tensor *>(output_grads),
       *reinterpret_cast<const Tensor *>(cu_seqlens), *reinterpret_cast<const Tensor *>(freqs),
-      *reinterpret_cast<const Tensor *>(start_positions), reinterpret_cast<Tensor *>(input_grads),
-      max_s, b, h, d, d2, stride_t, stride_h, stride_d, o_stride_t, o_stride_h, o_stride_d, stream);
+      *reinterpret_cast<const Tensor *>(start_positions), reinterpret_cast<Tensor *>(input_grads), 
+      cp_size, cp_rank, max_s, b, h, d, d2, stride_t,
+      stride_h, stride_d, o_stride_t, o_stride_h, o_stride_d, stream);
 }

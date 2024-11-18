@@ -14,6 +14,13 @@ pybind11::capsule EncapsulateFunction(T *fn) {
   return pybind11::capsule(reinterpret_cast<void *>(fn), "xla._CUSTOM_CALL_TARGET");
 }
 
+template <typename T>
+pybind11::capsule EncapsulateFFI(T *fn) {
+  static_assert(std::is_invocable_r_v<XLA_FFI_Error *, T, XLA_FFI_CallFrame *>,
+                "Encapsulated function must be an XLA FFI handler");
+  return pybind11::capsule(reinterpret_cast<void *>(fn), "xla._CUSTOM_CALL_TARGET");
+}
+
 pybind11::dict Registrations() {
   pybind11::dict dict;
   dict["te_transpose"] = EncapsulateFunction(Transpose);
@@ -44,6 +51,56 @@ pybind11::dict Registrations() {
       EncapsulateFunction(ScaledUpperTriangMaskedSoftmaxBackward);
   dict["te_fused_attn_forward"] = EncapsulateFunction(FusedAttnForward);
   dict["te_fused_attn_backward"] = EncapsulateFunction(FusedAttnBackward);
+
+  // Transpose
+  dict["te_transpose_ffi"] = EncapsulateFFI(TransposeHandler);
+  dict["te_cast_transpose_ffi"] = EncapsulateFFI(CastTransposeHandler);
+  dict["te_dbias_cast_transpose_ffi"] = EncapsulateFFI(DBiasCastTransposeHandler);
+
+  // Activation
+  dict["te_act_lu_ffi"] = EncapsulateFFI(ActLuHandler);
+  dict["te_act_lu_fp8_ffi"] = EncapsulateFFI(ActLuFP8Handler);
+  dict["te_dact_lu_ffi"] = EncapsulateFFI(DActLuHandler);
+  dict["te_dact_lu_dbias_cast_transpose_ffi"] =
+      EncapsulateFunction(DActLuDBiasCastTransposeHandler);
+  dict["te_dgated_act_lu_cast_transpose_ffi"] =
+      EncapsulateFunction(DGatedActLuCastTransposeHandler);
+
+  // Quantization
+  dict["te_quantize_ffi"] = EncapsulateFFI(QuantizeHandler);
+  dict["te_dequantize_ffi"] = EncapsulateFFI(DequantizeHandler);
+
+  // Softmax
+  dict["te_scaled_softmax_forward_ffi"] = EncapsulateFunction(ScaledSoftmaxForwardHandler);
+  dict["te_scaled_softmax_backward_ffi"] = EncapsulateFunction(ScaledSoftmaxBackwardHandler);
+  dict["te_scaled_masked_softmax_forward_ffi"] =
+      EncapsulateFunction(ScaledMaskedSoftmaxForwardHandler);
+  dict["te_scaled_masked_softmax_backward_ffi"] =
+      EncapsulateFunction(ScaledMaskedSoftmaxBackwardHandler);
+  dict["te_scaled_upper_triang_masked_softmax_forward_ffi"] =
+      EncapsulateFunction(ScaledUpperTriangMaskedSoftmaxForwardHandler);
+  dict["te_scaled_upper_triang_masked_softmax_backward_ffi"] =
+      EncapsulateFunction(ScaledUpperTriangMaskedSoftmaxBackwardHandler);
+
+  // Normalization
+  dict["te_layernorm_forward_ffi"] = EncapsulateFFI(LayerNormForwardHandler);
+  dict["te_layernorm_forward_fp8_ffi"] = EncapsulateFFI(LayerNormForwardFP8Handler);
+  dict["te_layernorm_backward_ffi"] = EncapsulateFFI(LayerNormBackwardHandler);
+  dict["te_rmsnorm_forward_ffi"] = EncapsulateFunction(RMSNormForwardHandler);
+  dict["te_rmsnorm_forward_fp8_ffi"] = EncapsulateFunction(RMSNormForwardFP8Handler);
+  dict["te_rmsnorm_backward_ffi"] = EncapsulateFunction(RMSNormBackwardHandler);
+
+  // Attention
+  pybind11::dict fused_attn_forward_ffi;
+  fused_attn_forward_ffi["prepare"] = EncapsulateFFI(CudnnHandleInitHandler);
+  fused_attn_forward_ffi["execute"] = EncapsulateFFI(FusedAttnForwardHandler);
+  dict["te_fused_attn_forward_ffi"] = fused_attn_forward_ffi;
+
+  pybind11::dict fused_attn_backward_ffi;
+  fused_attn_backward_ffi["prepare"] = EncapsulateFFI(CudnnHandleInitHandler);
+  fused_attn_backward_ffi["execute"] = EncapsulateFFI(FusedAttnBackwardHandler);
+  dict["te_fused_attn_backward_ffi"] = fused_attn_backward_ffi;
+
   return dict;
 }
 
@@ -59,6 +116,7 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
   m.def("pack_fused_attn_descriptor", &PackCustomCallFusedAttnDescriptor);
   m.def("get_fused_attn_backend", &GetFusedAttnBackend);
   m.def("get_cuda_version", &GetCudaRuntimeVersion);
+  m.def("get_cudnn_version", &GetCudnnRuntimeVersion);
   m.def("get_device_compute_capability", &GetDeviceComputeCapability);
   m.def("get_cublasLt_version", &cublasLtGetVersion);
   m.def("get_dact_dbias_ct_workspace_sizes", &GetDActDBiasCastTransposeWorkspaceSizes);
@@ -88,7 +146,10 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
       .value("NVTE_NO_MASK", NVTE_Mask_Type::NVTE_NO_MASK)
       .value("NVTE_PADDING_MASK", NVTE_Mask_Type::NVTE_PADDING_MASK)
       .value("NVTE_CAUSAL_MASK", NVTE_Mask_Type::NVTE_CAUSAL_MASK)
-      .value("NVTE_PADDING_CAUSAL_MASK", NVTE_Mask_Type::NVTE_PADDING_CAUSAL_MASK);
+      .value("NVTE_PADDING_CAUSAL_MASK", NVTE_Mask_Type::NVTE_PADDING_CAUSAL_MASK)
+      .value("NVTE_CAUSAL_BOTTOM_RIGHT_MASK", NVTE_Mask_Type::NVTE_CAUSAL_BOTTOM_RIGHT_MASK)
+      .value("NVTE_PADDING_CAUSAL_BOTTOM_RIGHT_MASK",
+             NVTE_Mask_Type::NVTE_PADDING_CAUSAL_BOTTOM_RIGHT_MASK);
 
   pybind11::enum_<NVTE_QKV_Layout>(m, "NVTE_QKV_Layout", pybind11::module_local())
       .value("NVTE_BS3HD", NVTE_QKV_Layout::NVTE_BS3HD)
@@ -113,7 +174,8 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
       .value("QGELU", NVTE_Activation_Type::QGELU)
       .value("QGEGLU", NVTE_Activation_Type::QGEGLU)
       .value("SRELU", NVTE_Activation_Type::SRELU)
-      .value("SREGLU", NVTE_Activation_Type::SREGLU);
+      .value("SREGLU", NVTE_Activation_Type::SREGLU)
+      .export_values();
 
   pybind11::enum_<NVTE_Fused_Attn_Backend>(m, "NVTE_Fused_Attn_Backend", pybind11::module_local())
       .value("NVTE_No_Backend", NVTE_Fused_Attn_Backend::NVTE_No_Backend)

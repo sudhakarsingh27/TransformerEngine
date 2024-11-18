@@ -3,22 +3,28 @@
 # See LICENSE for license information.
 
 from itertools import product
-import unittest
 import copy
+from contextlib import nullcontext
 
+import pytest
 import torch
 from torch import nn
 from torch.testing._internal.common_device_type import largeTensorTest
 import transformer_engine.pytorch as te
+from transformer_engine.pytorch.attention import MultiheadAttention
+from transformer_engine.pytorch import fp8_model_init
+from transformer_engine.pytorch.utils import is_bf16_compatible
+from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+# Check if FP8 is supported
+fp8_available, reason_for_no_fp8 = FP8GlobalStateManager.is_fp8_available()
 
 
-class TestFusedOptimizer(unittest.TestCase):
-    def setUp(self, iters=7):
+class TestFusedOptimizer:
+
+    def setup_method(self, *, iters: int = 7) -> None:
         self.iters = iters
         torch.manual_seed(9876)
-
-    def tearDown(self):
-        pass
 
     def gen_param_optim(self, tensors, options, tst_options=None):
 
@@ -81,8 +87,8 @@ class TestFusedOptimizer(unittest.TestCase):
 
 class TestFusedAdam(TestFusedOptimizer):
 
-    def setUp(self):
-        super().setUp()
+    def setup_method(self) -> None:
+        super().setup_method()
         self.options = {
             "lr": 5e-4,
             "betas": (0.9, 0.999),
@@ -104,7 +110,7 @@ class TestFusedAdam(TestFusedOptimizer):
     def test_bfloat16(self):
         self.gen_single_type_test(param_type=torch.bfloat16, skip_assert=True)
 
-    @unittest.skipIf(torch.cuda.device_count() < 2, "more than 1 GPU required")
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="more than 1 GPU required")
     def test_multi_device(self):
         devices = ("cuda:0", "cuda:1")
         for current_dev, tensor_dev in product(devices, devices):
@@ -169,10 +175,304 @@ class TestFusedAdam(TestFusedOptimizer):
 
             torch.testing.assert_close(ref_param, tst_param)
 
+    def gen_precision_aware_test(
+        self,
+        use_fp8_params,
+        param_dtype,
+        use_master_weights,
+        master_weight_dtype,
+        grad_dtype,
+        exp_avg_dtype,
+        exp_avg_sq_dtype,
+        model_rtol=None,
+        model_atol=None,
+        master_rtol=None,
+        master_atol=None,
+        skip_assert=False,
+    ):
+        build_model_context = nullcontext
+        build_model_context_args = {}
+        if use_fp8_params:
+            build_model_context = fp8_model_init
+            build_model_context_args["enabled"] = True
+
+        with build_model_context(**build_model_context_args):
+            model = MultiheadAttention(
+                hidden_size=1024,
+                num_attention_heads=16,
+                layer_number=1,
+                params_dtype=param_dtype,
+                fuse_qkv_params=True,
+            ).cuda()
+
+        ref_params = []
+        model_params = []
+
+        for p in model.parameters():
+            if p.requires_grad:
+                ref_params.append(p.detach().clone().float())
+                model_params.append(p)
+
+        options = {
+            "lr": 1,
+            "betas": (0.1, 0.25),
+            "eps": 1e-08,
+            "weight_decay": 0,
+            "amsgrad": False,
+        }
+        ref_optim = torch.optim.Adam(ref_params, **options)
+        tst_optim = te.optimizers.FusedAdam(
+            model_params,
+            master_weights=use_master_weights,
+            master_weight_dtype=master_weight_dtype,
+            exp_avg_dtype=exp_avg_dtype,
+            exp_avg_sq_dtype=exp_avg_sq_dtype,
+            use_decoupled_grad=True,
+            **options,
+        )
+
+        def test_one_iteration(ref_optimizer, tst_optimizer):
+            for p_ref, p in zip(ref_params, model_params):
+                p_ref.grad = torch.rand_like(p_ref)
+                p.decoupled_grad = p_ref.grad.clone().to(grad_dtype)
+            ref_optimizer.step()
+            tst_optimizer.step()
+            if use_master_weights:
+                master_weights_to_fp32 = [
+                    tst_optim.get_unscaled_state(p, "master_param") for p in model_params
+                ]
+                if not skip_assert:
+                    torch.testing.assert_close(
+                        ref_params,
+                        master_weights_to_fp32,
+                        rtol=master_rtol,
+                        atol=master_atol,
+                        equal_nan=True,
+                    )
+            ref_params_to_model_dtype = [p.to(param_dtype) for p in ref_params]
+            if not skip_assert:
+                torch.testing.assert_close(
+                    ref_params_to_model_dtype,
+                    model_params,
+                    rtol=model_rtol,
+                    atol=model_atol,
+                    equal_nan=True,
+                )
+
+        for i in range(self.iters):
+            test_one_iteration(ref_optim, tst_optim)
+
+        state_dict = tst_optim.state_dict()
+        tst_optim = te.optimizers.FusedAdam(
+            model_params,
+            master_weights=use_master_weights,
+            master_weight_dtype=master_weight_dtype,
+            exp_avg_dtype=exp_avg_dtype,
+            exp_avg_sq_dtype=exp_avg_sq_dtype,
+            use_decoupled_grad=True,
+            **options,
+        )
+        tst_optim.load_state_dict(state_dict)
+
+        for i in range(self.iters):
+            test_one_iteration(ref_optim, tst_optim)
+
+    def test_fp32_no_master(self):
+        self.gen_precision_aware_test(
+            use_fp8_params=False,
+            param_dtype=torch.float32,
+            use_master_weights=False,
+            master_weight_dtype=torch.float32,
+            grad_dtype=torch.float32,
+            exp_avg_dtype=torch.float32,
+            exp_avg_sq_dtype=torch.float32,
+        )
+
+    @pytest.mark.skipif(not is_bf16_compatible(), reason="bf16 if not supported")
+    def test_fp32_master(self):
+        self.gen_precision_aware_test(
+            use_fp8_params=False,
+            param_dtype=torch.bfloat16,
+            use_master_weights=True,
+            master_weight_dtype=torch.float32,
+            grad_dtype=torch.float32,
+            exp_avg_dtype=torch.float32,
+            exp_avg_sq_dtype=torch.float32,
+        )
+
+    @pytest.mark.skipif(not is_bf16_compatible(), reason="bf16 if not supported")
+    def test_fp16_master(self):
+        self.gen_precision_aware_test(
+            use_fp8_params=False,
+            param_dtype=torch.bfloat16,
+            use_master_weights=True,
+            master_weight_dtype=torch.half,
+            grad_dtype=torch.float32,
+            exp_avg_dtype=torch.float32,
+            exp_avg_sq_dtype=torch.float32,
+            master_rtol=2e-3,
+            master_atol=2e-3,
+        )
+
+    @pytest.mark.skipif(not is_bf16_compatible(), reason="bf16 if not supported")
+    def test_bf16_grad(self):
+        self.gen_precision_aware_test(
+            use_fp8_params=False,
+            param_dtype=torch.bfloat16,
+            use_master_weights=True,
+            master_weight_dtype=torch.float32,
+            grad_dtype=torch.bfloat16,
+            exp_avg_dtype=torch.float32,
+            exp_avg_sq_dtype=torch.float32,
+            master_rtol=2e-3,
+            master_atol=2e-3,
+        )
+
+    @pytest.mark.skipif(not is_bf16_compatible(), reason="bf16 if not supported")
+    def test_fp16_exp_avg(self):
+        self.gen_precision_aware_test(
+            use_fp8_params=False,
+            param_dtype=torch.bfloat16,
+            use_master_weights=True,
+            master_weight_dtype=torch.float32,
+            grad_dtype=torch.float32,
+            exp_avg_dtype=torch.half,
+            exp_avg_sq_dtype=torch.float32,
+            master_rtol=2e-3,
+            master_atol=2e-3,
+        )
+
+    @pytest.mark.skipif(not is_bf16_compatible(), reason="bf16 if not supported")
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_fp8_exp_avg(self):
+        self.gen_precision_aware_test(
+            use_fp8_params=False,
+            param_dtype=torch.bfloat16,
+            use_master_weights=True,
+            master_weight_dtype=torch.float32,
+            grad_dtype=torch.float32,
+            exp_avg_dtype=torch.uint8,
+            exp_avg_sq_dtype=torch.float32,
+            master_rtol=1e-2,
+            master_atol=1e-2,
+        )
+
+    @pytest.mark.skipif(not is_bf16_compatible(), reason="bf16 if not supported")
+    def test_fp16_exp_avg_sq(self):
+        self.gen_precision_aware_test(
+            use_fp8_params=False,
+            param_dtype=torch.bfloat16,
+            use_master_weights=True,
+            master_weight_dtype=torch.float32,
+            grad_dtype=torch.float32,
+            exp_avg_dtype=torch.float32,
+            exp_avg_sq_dtype=torch.half,
+            master_rtol=2e-3,
+            master_atol=2e-3,
+        )
+
+    @pytest.mark.skipif(not is_bf16_compatible(), reason="bf16 if not supported")
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_fp8_exp_avg_sq(self):
+        self.gen_precision_aware_test(
+            use_fp8_params=False,
+            param_dtype=torch.bfloat16,
+            use_master_weights=True,
+            master_weight_dtype=torch.float32,
+            grad_dtype=torch.float32,
+            exp_avg_dtype=torch.float32,
+            exp_avg_sq_dtype=torch.uint8,
+            skip_assert=True,
+        )
+
+    @pytest.mark.skipif(not is_bf16_compatible(), reason="bf16 if not supported")
+    def test_bf16_model_weight_cast(self):
+        dtype = torch.bfloat16
+        model = MultiheadAttention(
+            hidden_size=1024,
+            num_attention_heads=16,
+            layer_number=1,
+            params_dtype=dtype,
+            fuse_qkv_params=True,
+        ).cuda()
+        ref_params = []
+        model_params = []
+        for p in model.parameters():
+            if p.requires_grad:
+                ref_params.append(p.detach().clone().float())
+                model_params.append(p)
+        options = {
+            "lr": 5e-4,
+            "betas": (0.9, 0.999),
+            "eps": 1e-08,
+            "weight_decay": 0,
+            "amsgrad": False,
+        }
+        ref_optim = torch.optim.Adam(ref_params, **options)
+        tst_optim = te.optimizers.FusedAdam(
+            model_params, master_weights=True, use_decoupled_grad=True, **options
+        )
+
+        for i in range(self.iters):
+            for p_ref, p in zip(ref_params, model_params):
+                p_ref.grad = torch.rand_like(p_ref)
+                p.decoupled_grad = p_ref.grad.clone()
+            ref_optim.step()
+            tst_optim.step()
+            master_params = [tst_optim.get_unscaled_state(p, "master_param") for p in model_params]
+            torch.testing.assert_close(ref_params, master_params)
+            model_params_to_fp32 = [p.float() for p in model_params]
+            torch.testing.assert_close(
+                ref_params, model_params_to_fp32, rtol=1e-3, atol=1e-3, equal_nan=True
+            )
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_fp8_model_weight_cast(self):
+        dtype = torch.bfloat16
+        with fp8_model_init(enabled=True):
+            model = MultiheadAttention(
+                hidden_size=1024,
+                num_attention_heads=16,
+                layer_number=1,
+                params_dtype=dtype,
+                fuse_qkv_params=True,
+            ).cuda()
+        ref_params = []
+        model_params = []
+        for p in model.parameters():
+            if p.requires_grad:
+                ref_params.append(p.detach().clone().float())
+                model_params.append(p)
+        options = {
+            "lr": 5e-4,
+            "betas": (0.9, 0.999),
+            "eps": 1e-08,
+            "weight_decay": 0,
+            "amsgrad": False,
+        }
+        ref_optim = torch.optim.Adam(ref_params, **options)
+        tst_optim = te.optimizers.FusedAdam(
+            model_params, master_weights=True, use_decoupled_grad=True, **options
+        )
+
+        for i in range(self.iters):
+            for p_ref, p in zip(ref_params, model_params):
+                p_ref.grad = torch.rand_like(p_ref)
+                p.decoupled_grad = p_ref.grad.clone()
+            ref_optim.step()
+            tst_optim.step()
+            master_params = [tst_optim.get_unscaled_state(p, "master_param") for p in model_params]
+            torch.testing.assert_close(ref_params, master_params)
+            model_params_to_fp32 = [p.float() for p in model_params]
+            torch.testing.assert_close(
+                ref_params, model_params_to_fp32, rtol=1e-2, atol=1e-2, equal_nan=True
+            )
+
 
 class TestFusedSGD(TestFusedOptimizer):
-    def __init__(self, *args, **kwargs):
-        super(TestFusedSGD, self).__init__(*args, **kwargs)
+
+    def setup_method(self) -> None:
+        super().setup_method()
         self.options = {"lr": 0.25, "momentum": 0.125}
         self.ref_optim = torch.optim.SGD
         self.fused_optim = te.optimizers.FusedSGD
@@ -183,7 +483,7 @@ class TestFusedSGD(TestFusedOptimizer):
     def test_half(self):
         self.gen_single_type_test(param_type=torch.float16)
 
-    @unittest.skipIf(torch.cuda.device_count() < 2, "more than 1 GPU required")
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="more than 1 GPU required")
     def test_multi_device(self):
         devices = ("cuda:0", "cuda:1")
         for current_dev, tensor_dev in product(devices, devices):
@@ -224,9 +524,9 @@ class Model(torch.nn.Module):
         return y
 
 
-class AdamTest(unittest.TestCase):
-    def setUp(self, seed=0):
-        super().setUp()
+class AdamTest:
+
+    def setup_method(self, *, seed: int = 0) -> None:
         torch.manual_seed(seed)
 
         self.model = Model().cuda()
@@ -237,7 +537,7 @@ class AdamTest(unittest.TestCase):
         params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.Adam(params, lr=self.lr)
 
-    def testGradScaler(self):
+    def test_grad_scaler(self):
         params_ = [p for p in self.model_.parameters() if p.requires_grad]
         optimizer_ = te.optimizers.FusedAdam(params_, lr=self.lr, capturable=False)
         scaler = torch.cuda.amp.GradScaler(enabled=True)
@@ -288,7 +588,7 @@ class AdamTest(unittest.TestCase):
 
             self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
 
-    def testGradScalerCapturable(self):
+    def test_grad_scaler_capturable(self):
         params_ = [p for p in self.model_.parameters() if p.requires_grad]
         optimizer_ = te.optimizers.FusedAdam(params_, lr=self.lr, capturable=True)
         scaler = torch.cuda.amp.GradScaler(enabled=True)
@@ -339,14 +639,15 @@ class AdamTest(unittest.TestCase):
 
             self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
 
-    def testGradScalerCapturableMaster(self):
+    def test_grad_scaler_capturable_master(self):
         # Cast conv layers to FP16
         for m in self.model_.modules():
             if m.__class__ in [torch.nn.Conv2d]:
                 m.half()
         params_ = [p for p in self.model_.parameters() if p.requires_grad]
+        master_weights = [p.float() for p in self.model_.parameters() if p.requires_grad]
         optimizer_ = te.optimizers.FusedAdam(
-            params_, lr=self.lr, capturable=True, master_weights=True
+            params_, lr=self.lr, capturable=True, master_weights=master_weights
         )
         scaler = torch.cuda.amp.GradScaler(enabled=True)
         scaler_ = torch.cuda.amp.GradScaler(enabled=True)
@@ -400,7 +701,7 @@ class AdamTest(unittest.TestCase):
 
             self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
 
-    def testNative(self):
+    def test_native(self):
         params_ = [p for p in self.model_.parameters() if p.requires_grad]
         optimizer_ = te.optimizers.FusedAdam(params_, lr=self.lr, capturable=False)
 
@@ -446,7 +747,7 @@ class AdamTest(unittest.TestCase):
             self.model_.load_state_dict(copy.deepcopy(self.model.state_dict()))
 
     @largeTensorTest("60GB", "cuda")
-    def testLargeTensor(self):
+    def test_large_tensor(self):
         t = torch.zeros(2359332864, dtype=torch.half, device="cuda")
         t2 = torch.zeros(2359332864, dtype=torch.half, device="cuda")
         grad = torch.randn_like(t)

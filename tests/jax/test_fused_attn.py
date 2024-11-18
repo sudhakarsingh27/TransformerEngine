@@ -6,6 +6,8 @@ from enum import Enum
 from dataclasses import dataclass
 from functools import partial
 from math import sqrt
+from typing import Tuple, Optional
+import random
 
 import jax
 import jax.numpy as jnp
@@ -27,9 +29,13 @@ from transformer_engine.jax.attention import (
     fused_attn,
     fused_attn_thd,
     get_qkv_format,
+    make_swa_mask,
 )
 from transformer_engine.jax.cpp_extensions import FusedAttnHelper
-from transformer_engine.transformer_engine_jax import NVTE_Fused_Attn_Backend
+from transformer_engine.transformer_engine_jax import (
+    NVTE_Fused_Attn_Backend,
+    get_cudnn_version,
+)
 
 from utils import assert_allclose
 
@@ -120,6 +126,7 @@ def make_mask(
     segment_pad_q: ArrayLike,
     segment_pad_kv: ArrayLike,
     attn_mask_type: AttnMaskType,
+    window_size: Optional[Tuple[int, int]] = None,
 ) -> Array:
     """
     Create attention mask based on mask type. A `True` value in the mask means
@@ -137,6 +144,15 @@ def make_mask(
             segment_pad_q, segment_pad_kv, lambda x, y: jnp.logical_and(x != 1, y != 1)
         )
         inv_mask = combine_masks(inv_pad_mask, inv_mask)
+
+    if window_size is not None:
+        max_seqlen_q = inv_mask.shape[-2]
+        max_seqlen_kv = inv_mask.shape[-1]
+        inv_swa_mask = make_swa_mask(max_seqlen_q, max_seqlen_kv, window_size, attn_mask_type)
+        inv_swa_mask = jnp.broadcast_to(inv_swa_mask, inv_mask.shape)
+        # In inv_swa_mask and inv_mask 0 is masked out
+        inv_mask = jnp.where(inv_mask != 0, inv_swa_mask, inv_mask)
+
     mask = jnp.logical_not(inv_mask)
     return mask
 
@@ -230,7 +246,14 @@ def customcall_fused_dpa(
         kwargs.pop("max_segments_per_seq")
         return fused_attn(qkv_args, bias, mask, dropout_rng, **kwargs).astype(query.dtype)
     return fused_attn_thd(
-        qkv_args, bias, seqlens_q, seqlens_kv, offsets_q, offsets_kv, dropout_rng, **kwargs
+        qkv_args,
+        bias,
+        seqlens_q,
+        seqlens_kv,
+        offsets_q,
+        offsets_kv,
+        dropout_rng,
+        **kwargs,
     ).astype(query.dtype)
 
 
@@ -264,6 +287,16 @@ class FusedAttnRunner:
     is_training: bool
     qkv_layout: QKVLayout
     bias_shape: BiasShape
+    window_size: Optional[Tuple[int, int]] = None
+
+    # See https://docs.nvidia.com/deeplearning/cudnn/latest/release-notes.html#cudnn-9-4-0 for known issue
+    # generating zero-length ragged tensors. This setting adjusts the test to avoid the zero-length cases.
+    def _get_max_segments_per_sequence(self):
+        if 90400 <= get_cudnn_version() < 90500:
+            return self.num_segments_per_seq
+        else:
+            # +1 for testing runtime_segments < max_segments
+            return self.num_segments_per_seq + 1
 
     def _check_configs(self):
         # TODO(rewang): probably adds this in is_fused_attn_available
@@ -273,11 +306,19 @@ class FusedAttnRunner:
         ]:
             pytest.skip("THD format requires padding masks.")
 
-        if self.qkv_layout == QKVLayout.BS3HD or get_qkv_format(self.qkv_layout) == QKVFormat.THD:
-            if self.num_heads_q != self.num_heads_kv:
-                pytest.skip("QKVPACKED layout requires num_heads_q and num_heads_kv to be equal.")
+        qkv_format = get_qkv_format(self.qkv_layout)
+        if self.qkv_layout == QKVLayout.BS3HD or qkv_format == QKVFormat.THD:
             if self.max_seqlen_q != self.max_seqlen_kv:
-                pytest.skip("QKVPACKED layout requires max_seqlen_q and max_seqlen_kv to be equal.")
+                pytest.skip(f"{self.qkv_layout} requires max_seqlen_q == max_seqlen_kv")
+
+        if self.qkv_layout == QKVLayout.BS3HD or self.qkv_layout == QKVLayout.T3HD:
+            if self.num_heads_q != self.num_heads_kv:
+                pytest.skip(f"{self.qkv_layout} requires num_heads_q == num_heads_kv")
+
+        if self.max_seqlen_q > self.max_seqlen_kv and self.window_size is not None:
+            pytest.skip(
+                "seqlen_q > seqlen_kv is not supported with sliding window attention in cuDNN"
+            )
 
         self.backend = FusedAttnHelper(
             self.dtype,
@@ -291,12 +332,19 @@ class FusedAttnRunner:
             self.max_seqlen_q,
             self.max_seqlen_kv,
             self.head_dim,
+            (-1, -1) if self.window_size is None else self.window_size,
         ).get_fused_attn_backend()
         if self.backend == NVTE_Fused_Attn_Backend.NVTE_No_Backend:
             pytest.skip("Unsupported inputs combination or device compute capability.")
 
-        if self.attn_bias_type == AttnBiasType.POST_SCALE_BIAS:
-            if self.attn_mask_type not in [AttnMaskType.NO_MASK, AttnMaskType.CAUSAL_MASK]:
+        if (
+            self.attn_bias_type == AttnBiasType.POST_SCALE_BIAS
+            and self.bias_shape != BiasShape.BIAS_1HSS
+        ):
+            if self.attn_mask_type not in [
+                AttnMaskType.NO_MASK,
+                AttnMaskType.CAUSAL_MASK,
+            ]:
                 pytest.skip(
                     "B1SS, BHSS and 11SS bias shapes are only supported for "
                     "AttnMaskType.NO_MASK and AttnMaskType.CAUSAL_MASK."
@@ -313,7 +361,12 @@ class FusedAttnRunner:
         q_key, k_key, v_key, bias_key, dropout_key = jax.random.split(key, 5)
 
         q_shape = (self.batch_size, self.max_seqlen_q, self.num_heads_q, self.head_dim)
-        k_shape = v_shape = (self.batch_size, self.max_seqlen_kv, self.num_heads_kv, self.head_dim)
+        k_shape = v_shape = (
+            self.batch_size,
+            self.max_seqlen_kv,
+            self.num_heads_kv,
+            self.head_dim,
+        )
 
         if self.attn_bias_type == AttnBiasType.NO_BIAS:
             bias_shape = None
@@ -322,7 +375,12 @@ class FusedAttnRunner:
         elif self.bias_shape == BiasShape.BIAS_B1SS:
             bias_shape = (self.batch_size, 1, self.max_seqlen_q, self.max_seqlen_kv)
         elif self.bias_shape == BiasShape.BIAS_BHSS:
-            bias_shape = (self.batch_size, self.num_heads_q, self.max_seqlen_q, self.max_seqlen_kv)
+            bias_shape = (
+                self.batch_size,
+                self.num_heads_q,
+                self.max_seqlen_q,
+                self.max_seqlen_kv,
+            )
         elif self.bias_shape == BiasShape.BIAS_11SS:
             bias_shape = (1, 1, self.max_seqlen_q, self.max_seqlen_kv)
         else:
@@ -391,7 +449,7 @@ class FusedAttnRunner:
             return segment_ids, segment_pad
 
         if get_qkv_format(self.qkv_layout) == QKVFormat.THD:
-            self.num_segments_per_seq = 3
+            self.num_segments_per_seq = 2
             self.token_q, self.segment_pad_q = generate_random_segment_ids(
                 self.batch_size, self.max_seqlen_q, self.num_segments_per_seq, seed=42
             )
@@ -402,7 +460,10 @@ class FusedAttnRunner:
                 self.segment_pad_kv = self.segment_pad_q
             else:
                 self.token_kv, self.segment_pad_kv = generate_random_segment_ids(
-                    self.batch_size, self.max_seqlen_kv, self.num_segments_per_seq, seed=2024
+                    self.batch_size,
+                    self.max_seqlen_kv,
+                    self.num_segments_per_seq,
+                    seed=2024,
                 )
             self.pad_q = self.segment_pad_q
             self.pad_kv = self.segment_pad_kv
@@ -418,6 +479,7 @@ class FusedAttnRunner:
             self.segment_pad_q,
             self.segment_pad_kv,
             self.attn_mask_type,
+            self.window_size,
         )
 
         if get_qkv_format(self.qkv_layout) == QKVFormat.THD:
@@ -461,7 +523,8 @@ class FusedAttnRunner:
             "dropout_probability": self.dropout_prob,
             "is_training": self.is_training,
             "qkv_layout": self.qkv_layout,
-            "max_segments_per_seq": self.num_segments_per_seq,
+            "max_segments_per_seq": self._get_max_segments_per_sequence(),
+            "window_size": self.window_size,
         }
 
         # Convert the outputs to float32 for the elementwise comparison
@@ -518,7 +581,8 @@ class FusedAttnRunner:
             "dropout_probability": self.dropout_prob,
             "is_training": self.is_training,
             "qkv_layout": self.qkv_layout,
-            "max_segments_per_seq": self.num_segments_per_seq,
+            "max_segments_per_seq": self._get_max_segments_per_sequence(),
+            "window_size": self.window_size,
         }
 
         # We can compute dBias only for the [1, h, s, s] layout
@@ -630,8 +694,17 @@ class FusedAttnRunner:
         pytest.param(4, 128, 128, 16, 16, 64, jnp.bfloat16, id="4-128-128-16-16-64-BF16-SELF"),
         pytest.param(4, 128, 128, 16, 16, 64, jnp.float16, id="4-128-128-16-16-64-FP16-SELF"),
         pytest.param(2, 2048, 2048, 12, 12, 64, jnp.bfloat16, id="2-2048-2048-12-12-64-BF16-SELF"),
-        pytest.param(4, 512, 128, 16, 16, 64, jnp.bfloat16, id="4-512-128-16-16-64-BF16-CROSS"),
-        pytest.param(2, 2048, 1024, 12, 12, 64, jnp.bfloat16, id="2-2048-1048-12-12-64-BF16-CROSS"),
+        pytest.param(4, 128, 256, 16, 16, 64, jnp.bfloat16, id="4-128-256-16-16-64-BF16-CROSS"),
+        pytest.param(
+            2,
+            2048,
+            1024,
+            12,
+            12,
+            64,
+            jnp.bfloat16,
+            id="2-2048-1024-12-12-64-BF16-CROSS",
+        ),
         pytest.param(4, 128, 128, 16, 8, 64, jnp.bfloat16, id="4-128-128-16-8-64-BF16-GQA"),
         pytest.param(2, 2048, 2048, 12, 6, 64, jnp.bfloat16, id="2-2048-2048-12-6-64-BF16-GQA"),
     ],
@@ -641,6 +714,13 @@ class FusedAttnRunner:
     [
         pytest.param(0.0, id="DROP_0.0"),
         pytest.param(0.1, id="DROP_0.1"),
+    ],
+)
+@pytest.mark.parametrize(
+    "swa",
+    [
+        pytest.param(False, id="NO_SWA"),
+        pytest.param(True, id="SWA"),
     ],
 )
 class TestFusedAttn:
@@ -670,12 +750,16 @@ class TestFusedAttn:
         is_training,
         qkv_layout,
         bias_shape,
+        swa,
     ):
         """
         Test forward with parameterized configs
         This test is not intended to run automatically during CI as it is time-consuming
         It is kept for development and debugging
         """
+        window_size = None
+        if swa:
+            window_size = (s_kv // 10, 0)
         runner = FusedAttnRunner(
             b,
             s_q,
@@ -690,6 +774,7 @@ class TestFusedAttn:
             is_training,
             qkv_layout,
             bias_shape,
+            window_size,
         )
         runner.test_forward()
 
@@ -707,10 +792,14 @@ class TestFusedAttn:
         dtype,
         qkv_layout,
         bias_shape,
+        swa,
     ):
         """
         Test backward with parameterized configs
         """
+        window_size = None
+        if swa:
+            window_size = (s_kv // 10, 0)
         runner = FusedAttnRunner(
             b,
             s_q,
@@ -725,5 +814,6 @@ class TestFusedAttn:
             True,
             qkv_layout,
             bias_shape,
+            window_size,
         )
         runner.test_backward()

@@ -91,7 +91,8 @@ struct FADescriptor_v1 {
   std::int64_t hg;
   std::int64_t s_q;
   std::int64_t s_kv;
-  std::int64_t d;
+  std::int64_t d_qk;
+  std::int64_t d_v;
   std::int64_t bias_b;
   std::int64_t bias_h;
   float attnScale;
@@ -107,52 +108,40 @@ struct FADescriptor_v1 {
   cudnn_frontend::DataType_t bwd_tensor_type;
 
   bool operator<(const FADescriptor_v1 &rhs) const {
-    return std::tie(b, h, hg, s_q, s_kv, d, bias_b, bias_h, attnScale, isTraining,
+    return std::tie(b, h, hg, s_q, s_kv, d_qk, d_v, bias_b, bias_h, attnScale, isTraining,
                     dropoutProbability, layout, mask_type, window_size_left, window_size_right,
                     deterministic, bias_type, fwd_tensor_type, bwd_tensor_type) <
-           std::tie(rhs.b, rhs.h, rhs.hg, rhs.s_q, rhs.s_kv, rhs.d, rhs.bias_b, rhs.bias_h,
-                    rhs.attnScale, rhs.isTraining, rhs.dropoutProbability, rhs.layout,
+           std::tie(rhs.b, rhs.h, rhs.hg, rhs.s_q, rhs.s_kv, rhs.d_qk, rhs.d_v, rhs.bias_b,
+                    rhs.bias_h, rhs.attnScale, rhs.isTraining, rhs.dropoutProbability, rhs.layout,
                     rhs.mask_type, rhs.window_size_left, rhs.window_size_right, rhs.deterministic,
                     rhs.bias_type, rhs.fwd_tensor_type, rhs.bwd_tensor_type);
   }
 };
 
-__global__ void cu_seqlens_to_offsets(size_t b, size_t h, size_t d, int32_t *cu_seqlens_q,
+__global__ void cu_seqlens_to_offsets(int64_t b, int64_t h, int64_t d, int32_t *cu_seqlens_q,
                                       int32_t *actual_seqlens_q, int32_t *qkv_ragged_offset,
                                       int32_t *o_ragged_offset);
 
-__global__ void cu_seqlens_to_actual_seqlens(size_t b, int32_t const *const q_cu_seqlens,
+__global__ void cu_seqlens_to_actual_seqlens(int64_t actual_b, int64_t max_b,
+                                             int32_t const *const q_cu_seqlens,
                                              int32_t const *const kv_cu_seqlens, int32_t *q_seqlens,
                                              int32_t *kv_seqlens);
 
-__global__ void cu_seqlens_padded_to_offsets(NVTE_QKV_Layout_Group layout_group, size_t b, size_t h,
-                                             size_t hg, size_t d, int32_t *cu_seqlens_q_padded,
-                                             int32_t *cu_seqlens_kv_padded, int32_t *offsets_q,
-                                             int32_t *offsets_k, int32_t *offsets_v,
-                                             int32_t *offsets_o);
+__global__ void cu_seqlens_padded_to_offsets(NVTE_QKV_Layout_Group layout_group, int64_t actual_b,
+                                             int64_t max_b, int64_t h, int64_t hg, int64_t d_qk,
+                                             int64_t d_v, const int32_t *cu_seqlens_q_padded,
+                                             const int32_t *cu_seqlens_kv_padded,
+                                             DType offset_dtype, void *offsets_q, void *offsets_k,
+                                             void *offsets_v, void *offsets_o, void *offsets_s);
+
+DType get_ragged_offset_dtype(NVTE_QKV_Layout_Group layout_group, int64_t num_attn_heads,
+                              int64_t num_gqa_groups, int64_t max_seqlen_q, int64_t max_seqlen_kv,
+                              int64_t head_dim_qk, int64_t head_dim_v);
+
+size_t get_max_batch_size(size_t batch_size);
+size_t get_max_tokens(size_t num_tokens);
+
 }  // namespace fused_attn
-
-cudnnDataType_t get_cudnn_dtype(const transformer_engine::DType t);
-cudnn_frontend::DataType_t get_cudnn_fe_dtype(const transformer_engine::DType t);
-
-class cudnnExecutionPlanManager {
- public:
-  static cudnnExecutionPlanManager &Instance() {
-    static thread_local cudnnExecutionPlanManager instance;
-    return instance;
-  }
-
-  cudnnHandle_t GetCudnnHandle() {
-    static thread_local std::once_flag flag;
-    std::call_once(flag, [&] { cudnnCreate(&handle_); });
-    return handle_;
-  }
-
-  ~cudnnExecutionPlanManager() {}
-
- private:
-  cudnnHandle_t handle_ = nullptr;
-};
 }  // namespace transformer_engine
 
 #endif

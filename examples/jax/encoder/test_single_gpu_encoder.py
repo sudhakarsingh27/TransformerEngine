@@ -19,6 +19,8 @@ from flax.training import train_state
 import transformer_engine.jax as te
 import transformer_engine.jax.flax as te_flax
 
+from common import is_bf16_supported
+
 PARAMS_KEY = "params"
 DROPOUT_KEY = "dropout"
 INPUT_KEY = "input_rng"
@@ -144,7 +146,7 @@ def eval_model(state, test_ds, batch_size, var_collect):
 
 def data_preprocess(dataset, vocab, word_id, max_seq_len):
     """Convert tokens to numbers."""
-    nltk.download("punkt")
+    nltk.download("punkt_tab")
     dataset_size = len(dataset["sentence"])
     output = np.zeros((dataset_size, max_seq_len), dtype=np.int32)
     mask_3d = np.ones((dataset_size, max_seq_len, max_seq_len), dtype=np.uint8)
@@ -321,6 +323,7 @@ class TestEncoder(unittest.TestCase):
         """Run 4 epochs for testing"""
         cls.args = encoder_parser(["--epochs", "3"])
 
+    @unittest.skipIf(not is_bf16_supported(), "Device compute capability 8.0+ is required for BF16")
     def test_te_bf16(self):
         """Test Transformer Engine with BF16"""
         actual = train_and_evaluate(self.args)

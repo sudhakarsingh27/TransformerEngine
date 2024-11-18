@@ -173,7 +173,7 @@ class TransformerLayer(torch.nn.Module):
           Type of activation used in MLP block.
           Options are: 'gelu', 'relu', 'reglu', 'geglu', 'swiglu', 'qgelu' and 'srelu'.
     device : Union[torch.device, str], default = "cuda"
-          The device on which the parameters of the model will allocated. It is the user's
+          The device on which the parameters of the model will be allocated. It is the user's
           responsibility to ensure all parameters are moved to the GPU before running the
           forward pass.
     attn_input_format: {'sbhd', 'bshd'}, default = 'sbhd'
@@ -491,9 +491,10 @@ class TransformerLayer(torch.nn.Module):
 
     def set_context_parallel_group(
         self,
-        cp_group: Union[dist_group_type, None],
+        cp_group: Union[dist_group_type, List[dist_group_type], None],
         cp_global_ranks: List[int],
         cp_stream: torch.cuda.Stream,
+        cp_comm_type: str = "p2p",
     ) -> None:
         """
         Set the context parallel attributes for the given
@@ -501,19 +502,34 @@ class TransformerLayer(torch.nn.Module):
 
         Parameters
         ----------
-        cp_group : ProcessGroup
+        cp_group : Union[ProcessGroup, List[ProcessGroup]]
                   context parallel process group.
+                  ProcessGroup is for cp_comm_type of "p2p", "all_gather", and "a2a".
+                  List[ProcessGroup] is for cp_comm_type of "a2a+p2p", where cp_group[0]
+                  and cp_group[1] are for a2a and p2p communications respectively.
         cp_global_ranks : List[int]
                          list of global ranks in the context group.
         cp_stream : torch.cuda.Stream
                    cuda stream for context parallel execution.
+        cp_comm_type : str, default = `p2p`
+                      inter-gpu communication type for context parallelism.
+                      Can be "p2p" or "all_gather" or "a2a", or "a2a+p2p".
+                      "p2p": Exchange KV chunks with P2P communications in ring topology.
+                             P2P is async and can be overlapped with attention compute.
+                      "all_gather": All-gather to get full sequence of KV before attention.
+                                    The all-gather is not async, and cannot be overlapped.
+                      "a2a": Like DeepSpeed Ulysses, scatter attention heads across the CP
+                             group, and gather to get full sequence of QKV.
+                      "a2a+p2p": hierarchical CP implementation. First applying a2a to QKV
+                      across each CP sub-group (e.g., via NVLink), then exchanging KV with
+                      p2p between sub-groups (e.g., via IBLink).
         """
         # Deep iterate but skip self to avoid infinite recursion.
         for index, child in enumerate(self.modules()):
             if index == 0:
                 continue
             if hasattr(child, "set_context_parallel_group"):
-                child.set_context_parallel_group(cp_group, cp_global_ranks, cp_stream)
+                child.set_context_parallel_group(cp_group, cp_global_ranks, cp_stream, cp_comm_type)
 
     def forward(
         self,
@@ -532,6 +548,10 @@ class TransformerLayer(torch.nn.Module):
         core_attention_bias_type: str = "no_bias",
         core_attention_bias: Optional[torch.Tensor] = None,
         alibi_slopes: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_kv: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_kv: Optional[int] = None,
         fast_zero_fill: bool = True,
     ) -> torch.Tensor:
         """
@@ -607,11 +627,23 @@ class TransformerLayer(torch.nn.Module):
                      ALiBi slopes in FP32 and shape [nheads] or [batch_size, nheads].
                      It adds a bias of (-alibi_slope * (i + seqlen_k - seqlen_q - j))
                      to the attention score of query i and key j.
+        cu_seqlens_q: Optional[torch.Tensor], default = `None`
+                   Cumulative sum of sequence lengths (without offset) in a batch for `query_layer`,
+                   with shape [batch_size + 1] and dtype torch.int32.
+        cu_seqlens_kv: Optional[torch.Tensor], default = `None`
+                   Cumulative sum of sequence lengths (without offset) in a batch for `key_layer`
+                   and `value_layer`, with shape [batch_size + 1] and dtype torch.int32.
+        max_seqlen_q: Optional[int], default = `None`
+                      Maximum sequence length in `query_layer`.
+                      Calculated from `cu_seqlens_q` if not provided.
+        max_seqlen_kv: Optional[int], default = `None`
+                       Maximum sequence length in `key_layer` and `value_layer`.
+                       Calculated from `cu_seqlens_kv` if not provided.
         fast_zero_fill: bool, default = `True`
                     Whether to set output tensors to 0 or not before use.
         inference_params: InferenceParams, default = None
                          Inference parameters that are passed to the main model in order
-                         to efficienly calculate and store the context during inference.
+                         to efficiently calculate and store the context during inference.
         """
 
         if self_attn_mask_type is None:
@@ -659,7 +691,7 @@ class TransformerLayer(torch.nn.Module):
             hidden_states,
             attention_mask=attention_mask,
             attn_mask_type=self_attn_mask_type,
-            window_size=enc_dec_window_size,
+            window_size=window_size,
             inference_params=inference_params,
             is_first_microbatch=is_first_microbatch,
             checkpoint_core_attention=checkpoint_core_attention,
@@ -667,6 +699,10 @@ class TransformerLayer(torch.nn.Module):
             core_attention_bias_type=core_attention_bias_type,
             core_attention_bias=core_attention_bias,
             alibi_slopes=alibi_slopes,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
             fast_zero_fill=fast_zero_fill,
         )
 
@@ -687,6 +723,8 @@ class TransformerLayer(torch.nn.Module):
             inter_attention_outputs = self.inter_attention(
                 hidden_states,
                 attention_mask=enc_dec_attn_mask,
+                attn_mask_type=enc_dec_attn_mask_type,
+                window_size=enc_dec_window_size,
                 encoder_output=encoder_output,
                 is_first_microbatch=is_first_microbatch,
                 checkpoint_core_attention=checkpoint_core_attention,
@@ -728,7 +766,7 @@ class TransformerLayer(torch.nn.Module):
         return output
 
     def _bias_dropout_add(self, hidden_state, bias, residual, drop_path=None):
-        if drop_path is None and bias.numel() != 0:
+        if drop_path is None and bias is not None and bias.numel() != 0:
             if self.bias_dropout_fusion:
                 if self.training:
                     bias_dropout_add_func = bias_dropout_add_fused_train
@@ -740,7 +778,7 @@ class TransformerLayer(torch.nn.Module):
             with self.bias_dropout_add_exec_handler():
                 output = bias_dropout_add_func(hidden_state, bias, residual, self.hidden_dropout)
         else:
-            if bias.numel() != 0:
+            if bias is not None and bias.numel() != 0:
                 hidden_state = hidden_state + bias
             out = torch.nn.functional.dropout(
                 hidden_state, p=self.hidden_dropout, training=self.training

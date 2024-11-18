@@ -10,8 +10,8 @@ import setuptools
 
 from .utils import (
     all_files_in_dir,
+    cuda_archs,
     cuda_version,
-    cuda_path,
 )
 
 
@@ -26,11 +26,8 @@ def setup_pytorch_extension(
     csrc_source_files = Path(csrc_source_files)
     extensions_dir = csrc_source_files / "extensions"
     sources = [
-        csrc_source_files / "common.cu",
+        csrc_source_files / "common.cpp",
         csrc_source_files / "ts_fp8_op.cpp",
-        csrc_source_files / "userbuffers" / "ipcsocket.cc",
-        csrc_source_files / "userbuffers" / "userbuffers.cu",
-        csrc_source_files / "userbuffers" / "userbuffers-host.cpp",
     ] + all_files_in_dir(extensions_dir)
 
     # Header files
@@ -48,8 +45,6 @@ def setup_pytorch_extension(
     ]
     nvcc_flags = [
         "-O3",
-        "-gencode",
-        "arch=compute_70,code=sm_70",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_OPERATORS__",
@@ -61,32 +56,39 @@ def setup_pytorch_extension(
         "--use_fast_math",
     ]
 
+    cuda_architectures = cuda_archs()
+
+    if "70" in cuda_architectures:
+        nvcc_flags.extend(["-gencode", "arch=compute_70,code=sm_70"])
+
     # Version-dependent CUDA options
     try:
         version = cuda_version()
     except FileNotFoundError:
         print("Could not determine CUDA Toolkit version")
     else:
-        if version >= (11, 2):
-            nvcc_flags.extend(["--threads", "4"])
-        if version >= (11, 0):
-            nvcc_flags.extend(["-gencode", "arch=compute_80,code=sm_80"])
-        if version >= (11, 8):
-            nvcc_flags.extend(["-gencode", "arch=compute_90,code=sm_90"])
+        if version < (12, 0):
+            raise RuntimeError("Transformer Engine requires CUDA 12.0 or newer")
+        nvcc_flags.extend(
+            (
+                "--threads",
+                os.getenv("NVTE_BUILD_THREADS_PER_JOB", "1"),
+            )
+        )
 
-    # Libraries
-    library_dirs = []
-    libraries = []
-    if os.getenv("NVTE_UB_WITH_MPI"):
+        for arch in cuda_architectures.split(";"):
+            if arch == "70":
+                continue  # Already handled
+            nvcc_flags.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
+
+    if bool(int(os.getenv("NVTE_UB_WITH_MPI", "0"))):
         assert (
             os.getenv("MPI_HOME") is not None
-        ), "MPI_HOME must be set when compiling with NVTE_UB_WITH_MPI=1"
-        mpi_home = Path(os.getenv("MPI_HOME"))
-        include_dirs.append(mpi_home / "include")
+        ), "MPI_HOME=/path/to/mpi must be set when compiling with NVTE_UB_WITH_MPI=1!"
+        mpi_path = Path(os.getenv("MPI_HOME"))
+        include_dirs.append(mpi_path / "include")
         cxx_flags.append("-DNVTE_UB_WITH_MPI")
         nvcc_flags.append("-DNVTE_UB_WITH_MPI")
-        library_dirs.append(mpi_home / "lib")
-        libraries.append("mpi")
 
     # Construct PyTorch CUDA extension
     sources = [str(path) for path in sources]
@@ -101,6 +103,4 @@ def setup_pytorch_extension(
             "cxx": cxx_flags,
             "nvcc": nvcc_flags,
         },
-        libraries=[str(lib) for lib in libraries],
-        library_dirs=[str(lib_dir) for lib_dir in library_dirs],
     )
