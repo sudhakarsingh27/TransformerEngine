@@ -184,6 +184,10 @@ class TransformerLayer(torch.nn.Module):
                          head size. Note that these formats are very closely
                          related to the `qkv_format` in the `MultiHeadAttention`
                          and `DotProductAttention` modules.
+                         Notion: The experimental version of the 'thd' attention is supported
+                         when :attr:`inference_params` is passed to the forward function.
+
+
 
     Parallelism parameters
     ----------------------
@@ -279,6 +283,9 @@ class TransformerLayer(torch.nn.Module):
         attn_input_format: str = "sbhd",
     ) -> None:
         super().__init__()
+
+        if ub_tp_comm_overlap:
+            assert tex.userbuf_comm_available(), "Userbuffer communication backend not available."
 
         self.self_attn_mask_type = self_attn_mask_type
         self.window_size = check_set_window_size(self_attn_mask_type, window_size)
@@ -710,6 +717,7 @@ class TransformerLayer(torch.nn.Module):
                 attention_output, attention_bias, hidden_states, self.drop_path
             )
 
+
         # Cross attention.
         if self.layer_type == "decoder":
             inter_attention_outputs = self.inter_attention(
@@ -752,6 +760,7 @@ class TransformerLayer(torch.nn.Module):
         # For BERT like architectures.
         if self.output_layernorm:
             output = self.layernorm(output)
+
 
         # output: [s, b, h]
         return output
