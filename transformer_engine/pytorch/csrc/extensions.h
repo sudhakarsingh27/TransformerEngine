@@ -416,10 +416,10 @@ at::Tensor fused_rope_backward(const at::Tensor &output_grads, const at::Tensor 
                                const bool transpose_output_memory);
 
 at::Tensor fused_rope_thd_forward(const at::Tensor &input, const at::Tensor &cu_seqlens,
-                                  const at::Tensor &freqs, const int cp_size, const int cp_rank, const at::Tensor &start_positions);
+                                  const at::Tensor &freqs, const at::Tensor &start_positions, const int cp_size, const int cp_rank);
 
 at::Tensor fused_rope_thd_backward(const at::Tensor &output_grads, const at::Tensor &cu_seqlens,
-                                   const at::Tensor &freqs, const int cp_size, const int cp_rank, const at::Tensor &start_positions);
+                                   const at::Tensor &freqs, const at::Tensor &start_positions, const int cp_size, const int cp_rank);
 
 /***************************************************************************************************
  * Miscellaneous

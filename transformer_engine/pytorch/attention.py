@@ -1224,7 +1224,7 @@ class InferenceParams:  # pylint: disable=too-few-public-methods
             inference_value_memory,
         )
 
-    def set_params_to_thd_attention(self, buffers, channels):
+    def set_params_to_thd_attention(self, buffers):
         """
             Fused attention with q/k/v of thd layout with offsets needs some parameters informing
             about sequence lengths. This function computes them and
@@ -1251,8 +1251,7 @@ class InferenceParams:  # pylint: disable=too-few-public-methods
         """
         max_seqlen_q, max_seqlen_kv = self.max_incoming_seq_len, self.max_sequence_length
 
-        cu_seqlens_q, cu_seqlens_kv, seq_offsets_q, seq_offsets_k, seq_offsets_v, seq_offsets_o = \
-            buffers
+        cu_seqlens_q, cu_seqlens_kv, seq_offsets_q, seq_offsets_k = buffers
 
         torch.cumsum(self.input_sequence_lengths, dim=0, out=cu_seqlens_q[1:])
         torch.cumsum(
@@ -1261,11 +1260,9 @@ class InferenceParams:  # pylint: disable=too-few-public-methods
         # If layer has shape [b * s_layer, h, d]
         # offsets are of the form [k * s_layer * h * d for k = 0, ..., batch_size]
         seq_offsets_q.copy_(
-            torch.arange(0, self.max_batch_size + 1, device="cuda") * channels * max_seqlen_q)
+            torch.arange(0, self.max_batch_size + 1, device="cuda") * max_seqlen_q)
         seq_offsets_k.copy_(
-            torch.arange(0, self.max_batch_size + 1, device="cuda") * channels * max_seqlen_kv)
-        seq_offsets_v.copy_(seq_offsets_k)
-        seq_offsets_o.copy_(seq_offsets_q)
+            torch.arange(0, self.max_batch_size + 1, device="cuda") * max_seqlen_kv)
 
         return max_seqlen_q, max_seqlen_kv, buffers
 
@@ -8210,10 +8207,13 @@ class DotProductAttention(TransformerEngineBaseModule):
             if inference_params is not None:
                 assert self.layer_number is not None, "Layer number must be set!"
 
+                # @sudhakars: Distinguish the case when both context and gen
+                # phase have `thd_thd_thd` layout.
                 # convert causal to causal_bottom_right in inference when KV-caching is in use
                 # so users can run with the same attn_mask_type for training and inference
-                if attn_mask_type in ["causal", "padding_causal"]:
-                    attn_mask_type = attn_mask_type + "_bottom_right"
+                # if attn_mask_type in ["causal", "padding_causal"]:
+                #     attn_mask_type = attn_mask_type + "_bottom_right"
+                
 
                 if qkv_format == "bshd":
                     key_layer = key_layer.transpose(0, 1)
@@ -8225,19 +8225,19 @@ class DotProductAttention(TransformerEngineBaseModule):
 
                 if qkv_format == "thd":
                     # Allocation of buffers, it works correctly with CUDA Graphs.
-                    NR_BUFFERS = 6
+                    NR_BUFFERS = 4
                     buffers = [
                         self.alloc(batch_size + 1, dtype=torch.int32, device="cuda")
                         for _ in range(NR_BUFFERS)
                     ]
 
                     max_seqlen_q, max_seqlen_kv, buffers = \
-                        inference_params.set_params_to_thd_attention(buffers, self.channels)
+                        inference_params.set_params_to_thd_attention(buffers)
                     cu_seqlens_q, cu_seqlens_kv, seq_offsets_q, \
-                        seq_offsets_k, seq_offsets_v, seq_offsets_o = buffers
+                        seq_offsets_k = buffers
 
                     # @sudhakars: remove this hardcoded value
-                    cu_seqlens_q_padded, cu_seqlens_kv_padded = seq_offsets_q//4096, seq_offsets_k//4096
+                    cu_seqlens_q_padded, cu_seqlens_kv_padded = seq_offsets_q, seq_offsets_k
 
                     # query_layer is reshaped to the format [t, h, d]
                     # and make contiguous - needed by the THD attention
@@ -8405,6 +8405,8 @@ class DotProductAttention(TransformerEngineBaseModule):
                         False
                     ), "core_attention_bias must be in one of {bhss, 1hss, b1ss, 11ss} shapes"
 
+            # @sudhakars: if using Flash Attention, need to check the `cu_seqlens_padded`
+            # and `cu_seqlens`
             pad_between_seqs = True
             # @sudhakars: this condition isn't compatible with CUDA Graphs capture.
             # pad_between_seqs = (
@@ -8422,6 +8424,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                     # Flash attention does not self-support max_seqlen_q != max_seqlen_kv
                     use_flash_attention = False
 
+            
             attention_params = AttentionParams(
                 qkv_type=type(query_layer),
                 qkv_dtype=query_layer.dtype,
@@ -9269,7 +9272,8 @@ class MultiheadAttention(torch.nn.Module):
                     dim=split_dim,
                 )
 
-            if self.qkv_format == "thd":
+            # @sudhakars: fix this to `self.qkv_format == "thd"` later
+            if len(query_layer.shape) == 4:
                 query_layer, key_layer, value_layer = (
                     x.reshape(x.size(0), -1, self.hidden_size_per_attention_head)
                     for x in (query_layer, key_layer, value_layer)
