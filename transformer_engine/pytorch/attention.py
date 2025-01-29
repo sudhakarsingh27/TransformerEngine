@@ -1016,6 +1016,8 @@ class InferenceParams:  # pylint: disable=too-few-public-methods
     ----------
     max_batch_size : int
                     maximum batch size during inference.
+    num_layers : int
+                total number of layers in the transformer model
     max_sequence_length : int
                          maximum sequence length during inference.
     num_heads: int
@@ -1037,6 +1039,7 @@ class InferenceParams:  # pylint: disable=too-few-public-methods
     def __init__(
         self,
         max_batch_size: int,
+        num_layers: int,
         max_seqlen_kv: int,
         num_heads_kv: int,
         head_dim_k: int,
@@ -1050,6 +1053,7 @@ class InferenceParams:  # pylint: disable=too-few-public-methods
         head_dim_q: Optional[int] = None,
     ):
         self.max_batch_size = max_batch_size
+        self.num_layers = num_layers
         self.max_seqlen_kv = max_seqlen_kv
         self.num_heads_kv = num_heads_kv
         self.head_dim_k = head_dim_k
@@ -1066,6 +1070,7 @@ class InferenceParams:  # pylint: disable=too-few-public-methods
         if not self.is_paged:
             self.cache_manager = NonPagedKVCacheManager(
                 max_batch_size=self.max_batch_size,
+                num_layers=num_layers,
                 max_seqlen=self.max_seqlen_kv,
                 num_heads=self.num_heads_kv,
                 head_dim_k=self.head_dim_k,
@@ -9641,11 +9646,24 @@ class MultiheadAttention(torch.nn.Module):
 
                 # pylint: disable=fixme
                 # TODO: consider cases where sequences have different seqlens
-                sequence_start = inference_params.seqlens[0]
-                sequence_end = sequence_start + sequence_length
 
-                q_pos_emb = q_pos_emb[sequence_start:sequence_end, ...]
-                k_pos_emb = k_pos_emb[sequence_start:sequence_end, ...]
+                sequence_start, sequence_end = inference_params.cache_manager.get_sequences_start_end(inference_params.step_dict)
+
+                if isinstance(sequence_start, list) and isinstance(sequence_end, list):
+
+                    def vstack_with_padding(tensors, pad_value=0):
+                        max_length = max(tensor.shape[0] for tensor in tensors)
+                        padded_tensors = [F.pad(tensor, tuple(0 for i in range(2 * len(tensor.shape[1:]))) + (0, max_length - tensor.shape[0]), value=pad_value) for tensor in tensors]
+                        return torch.vstack(padded_tensors)
+                        
+                    q_pos_emb = vstack_with_padding([q_pos_emb[i:j] for i,j in zip(sequence_start, sequence_end)])
+                    k_pos_emb = vstack_with_padding([k_pos_emb[i:j] for i,j in zip(sequence_start, sequence_end)])
+
+                else:
+                    assert isinstance(sequence_start, int) and isinstance(sequence_end, int) , \
+                           "`sequence start` and `sequence_end` should be integers!"
+                    q_pos_emb = q_pos_emb[sequence_start:sequence_end, ...]
+                    k_pos_emb = k_pos_emb[sequence_start:sequence_end, ...]
 
             query_layer = apply_rotary_pos_emb(
                 query_layer,
