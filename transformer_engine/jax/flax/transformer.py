@@ -1079,6 +1079,10 @@ class MultiHeadAttention(nn.Module):  # pylint: disable=too-few-public-methods
             Output tensors.
         """
 
+        from jax_array_info import sharding_info, sharding_vis
+        sharding_info(inputs_q, f"inputs_q")
+        sharding_vis(inputs_q)
+
         assert (
             inputs_q.dtype == inputs_kv.dtype
         ), f"q.dtype = {inputs_q.dtype}, kv.dtype = {inputs_kv.dtype}"
@@ -1799,6 +1803,7 @@ class TransformerLayer(nn.Module):  # pylint: disable=too-few-public-methods
             Output tensors.
         """
 
+        print("transformer layer __call__")
         input_dtype = inputs.dtype
         assert (
             self.layer_type in TransformerLayerType

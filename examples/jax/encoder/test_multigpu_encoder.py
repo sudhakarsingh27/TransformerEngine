@@ -23,9 +23,20 @@ from common import is_bf16_supported, get_fp8_recipe_from_name_string
 import transformer_engine.jax as te
 import transformer_engine.jax.flax as te_flax
 from transformer_engine.jax.quantize import is_fp8_available, ScalingMode
+from transformer_engine.jax.sharding import (
+    HIDDEN_AXES,
+    HIDDEN_TP_AXES,
+    BATCH_AXES,
+    SEQLEN_TP_AXES,
+    SEQLEN_AXES,
+    W_NO_SHARD_AXES,
+    W_FSDP_AXES,
+    W_TP_AXES,
+    W_JOINED_AXES,
+)
 
-
-DEVICE_DP_AXIS = "data"
+DEVICE_DP_AXIS = W_FSDP_AXES #"data"
+DEVICE_TP_AXIS = W_TP_AXES #"model"
 PARAMS_KEY = "params"
 PARAMS_AXES_KEY = PARAMS_KEY + "_axes"
 DROPOUT_KEY = "dropout"
@@ -39,8 +50,13 @@ class Net(nn.Module):
 
     @nn.compact
     def __call__(self, x, mask, disable_dropout=False):
+        from jax_array_info import sharding_info, sharding_vis
+        sharding_info(x, f"net input")
+        sharding_vis(x)
+
         x = nn.Embed(num_embeddings=self.num_embed, features=256, dtype=jnp.bfloat16)(x)
 
+        print("transformer layer")
         te_Encoder = partial(
             te_flax.TransformerLayer,
             hidden_size=256,
@@ -55,9 +71,17 @@ class Net(nn.Module):
         )
         x = te_Encoder()(x, attention_mask=mask, deterministic=disable_dropout)
 
+        from jax_array_info import sharding_info, sharding_vis
+        sharding_info(x, f"out_encoder")
+        sharding_vis(x)
+
         x = x.reshape(x.shape[0], -1)
 
-        x = te_flax.DenseGeneral(features=256)(x)
+        from jax_array_info import sharding_info, sharding_vis
+        sharding_info(x, f"out_encoder_reshape")
+        sharding_vis(x)
+
+        x = te_flax.DenseGeneral(features=256, kernel_axes=(DEVICE_DP_AXIS, DEVICE_TP_AXIS))(x)
 
         x = te_flax.DenseGeneral(features=256)(x)
 
@@ -223,6 +247,67 @@ def get_params_sharding(sharding_rules, abs_var_collect, mesh):
     return params_sharding
 
 
+def assert_params_sufficiently_sharded(params, mesh, tolerance=0.01):
+    """Checks whether most params are sharded across sharding axis.
+
+    This function determines whether the majority of parameters  are distributed
+    across a specified sharding axes with an acceptable tolerance. It compares the
+    current distribution to a scenario where all parameters are fully sharded
+    across the 'fsdp', 'fsdp_transpose', 'sequence', and 'tensor' axes.
+
+    Args:
+        params: params of the model state
+        mesh: mesh constructed from config
+        tolerance: float between 0.0 and 1.0 representing the allowed percentage of
+        non-sharded parameters.
+    Returns:
+        bool: True if the majority of parameters are sufficiently sharded
+    """
+    def calculate_num_params_from_pytree(params):
+        params_sizes = jax.tree_util.tree_map(jax.numpy.size, params)
+        total_parameters = jax.tree_util.tree_reduce(lambda x, y: x + y, params_sizes)
+        assert total_parameters >= 0
+        return total_parameters
+
+    def calculate_total_params_per_chip(params):
+        """Calculate total paramsper chip."""
+        def calculate_leaf_params_per_chip(arr):
+            shard = arr.addressable_shards[0]
+            return np.prod(shard.data.shape)
+
+        params_sizes_per_chip = jax.tree_util.tree_map(calculate_leaf_params_per_chip, params)
+        total_parameters_per_chip = jax.tree_util.tree_reduce(lambda x, y: x + y, params_sizes_per_chip)
+        return total_parameters_per_chip
+
+    total_num_params = calculate_num_params_from_pytree(params)
+    print(f"Total number of parameters: {total_num_params}")
+
+    product_num_devices_for_weight_sharding = 1
+    for axis in [
+        DEVICE_TP_AXIS,
+    ]:
+        product_num_devices_for_weight_sharding *= mesh.shape[axis]
+    print(f"product_num_devices_for_weight_sharding = {product_num_devices_for_weight_sharding}")
+
+    total_num_params_per_chip = calculate_total_params_per_chip(params)
+    print(f"Total parameters per chip: {total_num_params_per_chip}")
+
+    perfectly_sharded_params_per_chip = total_num_params / product_num_devices_for_weight_sharding
+    print(f"Perfectly sharded parameters per chip: {perfectly_sharded_params_per_chip}")
+
+    assert total_num_params_per_chip >= perfectly_sharded_params_per_chip, (
+        "Number of parameters per chip must not be less than in the ideal sharded "
+        "scenario across `fsdp`, `fsdp_transpose`, `context`, `sequence`, `tensor`, `tensor_transpose`, `tensor_sequence`, `stage`, `expert` axes."
+    )
+
+    unsharded_param_perc = total_num_params_per_chip / perfectly_sharded_params_per_chip - 1
+    print(f"Percentage of unsharded parameters: {unsharded_param_perc * 100}%")
+
+    assert unsharded_param_perc < tolerance, (
+        f"Number of unsharded parameters exceeds tolerance {tolerance * 100}% "
+        f"of total parameters with a value of {unsharded_param_perc * 100}%."
+    )
+
 def get_state_sharding(state, params_sharding):
     """Refer params_sharding to create state sharding"""
 
@@ -242,37 +327,46 @@ def train_and_evaluate(args):
     train_ds, test_ds, num_embed = get_datasets(args.max_seq_len)
 
     num_gpu = jax.local_device_count()
-    assert args.batch_size % num_gpu == 0, f"Batch size needs to be multiple of {num_gpu}"
-    assert args.test_batch_size % num_gpu == 0, f"Test batch size needs to be multiple of {num_gpu}"
+    assert num_gpu % 2 == 0 and num_gpu >= 2, f"Number of GPUs ({num_gpu}) must be even and >= 2 for TP=2"
+    tp_size = 4
+    dp_size = num_gpu // tp_size
+
+
+    assert args.batch_size % dp_size == 0, f"Batch size needs to be multiple of DP size ({dp_size})"
+    assert args.test_batch_size % dp_size == 0, f"Test batch size needs to be multiple of DP size ({dp_size})"
     if args.fp8_recipe == "MXFP8BlockScaling":
         assert (
-            args.batch_size / num_gpu % 32 == 0
-        ), "Batch size needs to be multiple of 32 for MXFP8"
+            args.batch_size / dp_size % 32 == 0
+        ), "Batch size per DP device needs to be multiple of 32 for MXFP8"
         assert (
-            args.test_batch_size / num_gpu % 32 == 0
-        ), "Test batch size needs to be multiple of 32 for MXFP8"
+            args.test_batch_size / dp_size % 32 == 0
+        ), "Test batch size per DP device needs to be multiple of 32 for MXFP8"
 
     if args.use_fp8:
         fp8_recipe = get_fp8_recipe_from_name_string(args.fp8_recipe)
     else:
         fp8_recipe = None
 
-    device_mesh = mesh_utils.create_device_mesh((num_gpu,))
-    with jax.sharding.Mesh(devices=device_mesh, axis_names=(DEVICE_DP_AXIS,)) as mesh:
+    print("create device mesh")
+    device_mesh = mesh_utils.create_device_mesh((dp_size, tp_size))
+    with jax.sharding.Mesh(devices=device_mesh, axis_names=(DEVICE_DP_AXIS, DEVICE_TP_AXIS)) as mesh:
 
         rng = jax.random.PRNGKey(args.seed)
         rng, params_rng = jax.random.split(rng)
         rng, dropout_rng = jax.random.split(rng)
         init_rngs = {PARAMS_KEY: params_rng, DROPOUT_KEY: dropout_rng}
 
-        input_shape = [args.batch_size, args.max_seq_len]
-        mask_shape = [args.batch_size, 1, args.max_seq_len, args.max_seq_len]
-        label_shape = [args.batch_size]
+        global_batch_size = args.batch_size
+        global_test_batch_size = args.test_batch_size
+
+        input_shape = [global_batch_size, args.max_seq_len]
+        mask_shape = [global_batch_size, 1, args.max_seq_len, args.max_seq_len]
+        label_shape = [global_batch_size]
 
         with te.fp8_autocast(
             enabled=args.use_fp8,
             fp8_recipe=fp8_recipe,
-            mesh_resource=te.MeshResource(DEVICE_DP_AXIS, None, None, None),
+            mesh_resource=te.MeshResource(DEVICE_DP_AXIS, DEVICE_TP_AXIS, None, None),
         ):
             encoder = Net(num_embed)
             inputs = jnp.zeros(input_shape, dtype=jnp.int32)
@@ -291,6 +385,11 @@ def train_and_evaluate(args):
             jit_encoder_init = jax.jit(encoder.init, in_shardings, out_shardings)
             var_collect = jit_encoder_init(init_rngs, inputs, masks)
 
+            import pdb; pdb.set_trace()
+            assert_params_sufficiently_sharded(state.params, mesh)
+            # from jax_array_info import sharding_info, sharding_vis
+            # sharding_info(kernel, "kernel")
+            # sharding_vis(kernel)
             optimizer = optax.adamw(args.lr)
             var_collect, params = flax.core.pop(var_collect, PARAMS_KEY)
             state = train_state.TrainState.create(
@@ -325,9 +424,15 @@ def train_and_evaluate(args):
             if args.dry_run:
                 labels = jnp.zeros(label_shape, dtype=jnp.bfloat16)
                 rngs = {DROPOUT_KEY: dropout_rng}
-                jit_train_step(state, inputs, masks, labels, var_collect, rngs)
+                dummy_inputs = jax.device_put(inputs, inputs_sharding)
+                dummy_masks = jax.device_put(masks, masks_sharding)
+                dummy_labels = jax.device_put(labels, labels_sharding)
+                jit_train_step(state, dummy_inputs, dummy_masks, dummy_labels, var_collect, rngs)
                 print("PASSED")
                 return None
+
+            import pdb; pdb.set_trace()
+            assert_params_sufficiently_sharded(state.params, mesh)
 
             for epoch in range(1, args.epochs + 1):
                 rng, input_rng = jax.random.split(rng)
@@ -335,11 +440,11 @@ def train_and_evaluate(args):
                 rngs = {INPUT_KEY: input_rng, DROPOUT_KEY: dropout_rng}
 
                 state, train_loss, train_accuracy, var_collect = train_epoch(
-                    state, train_ds, args.batch_size, rngs, var_collect, jit_train_step
+                    state, train_ds, global_batch_size, rngs, var_collect, jit_train_step
                 )
 
                 test_loss, test_accuracy = eval_model(
-                    state, test_ds, args.test_batch_size, var_collect, jit_eval_step
+                    state, test_ds, global_test_batch_size, var_collect, jit_eval_step
                 )
 
                 print(
@@ -486,4 +591,6 @@ class TestEncoder(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    train_and_evaluate(encoder_parser(None))
+    args = encoder_parser(None)
+    args.disable_jit = True
+    train_and_evaluate(args)

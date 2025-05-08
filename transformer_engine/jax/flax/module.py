@@ -33,6 +33,8 @@ from ..cpp_extensions import (
 )
 from ..quantize import QuantizerFactory, QuantizeConfig, QuantizeMeta, QuantizeMetaSet, ScalingMode
 from ..sharding import get_non_contracting_logical_axes
+from jax_array_info import sharding_info, sharding_vis
+import jax
 
 PRNGKey = Any
 Shape = Tuple[int, ...]
@@ -470,6 +472,9 @@ class DenseGeneral(TransformerEngineBase):
         kernel = nn_partitioning.param_with_axes(
             "kernel", self.kernel_init, kernel_shape, self.dtype, axes=self.kernel_axes
         )
+        from jax_array_info import sharding_info, sharding_vis
+        sharding_info(kernel, f"kernel_{self.name}")
+        sharding_vis(kernel)
 
         if not QuantizeConfig.is_fp8_enabled():
             kernel = kernel.astype(input_dtype)
@@ -1076,6 +1081,9 @@ class LayerNormMLP(TransformerEngineBase):
             self.dtype,
             axes=self.kernel_axes_1,
         )
+        from jax_array_info import sharding_info, sharding_vis
+        sharding_info(kernel_1, f"kernel 1_{self.name}")
+        sharding_vis(kernel_1)
 
         if not QuantizeConfig.is_fp8_enabled():
             kernel_1 = kernel_1.astype(input_dtype)
@@ -1090,6 +1098,8 @@ class LayerNormMLP(TransformerEngineBase):
             self.dtype,
             axes=self.kernel_axes_2,
         )
+        sharding_info(kernel_2, "kernel 2")
+        sharding_vis(kernel_2)
         if not QuantizeConfig.is_fp8_enabled():
             kernel_2 = kernel_2.astype(input_dtype)
 
@@ -1173,6 +1183,11 @@ class LayerNormMLP(TransformerEngineBase):
                 *get_non_contracting_logical_axes(kernel_1.ndim, self.kernel_axes_1, contract_ind),
             )
             x = with_sharding_constraint_by_logical_axes(x, dot_1_output_axes)
+
+            sharding_info(x, "hidden")
+            sharding_vis(x)
+            jax.debug.print("here")
+            print("here")
 
             if self.enable_low_rank_adaptation:
                 wi_lora_a_kernel_each_shape = (

@@ -28,6 +28,7 @@ def is_package_installed(package):
 
 def get_te_path() -> Path:
     """Find Transformer Engine install path using pip"""
+    return Path(__file__).resolve().parent.parent.parent
     return Path(importlib.metadata.distribution("transformer_engine").locate_file("").resolve())
 
 
@@ -111,6 +112,13 @@ def _load_cudnn():
 
 def _load_library():
     """Load shared library with Transformer Engine C extensions"""
+
+    import os;
+    if "CUSTOM_SO_DIR" in os.environ:
+        custom_lib_dir = os.environ["CUSTOM_SO_DIR"]
+        so_path = os.path.join(custom_lib_dir, f"libtransformer_engine.{_get_sys_extension()}")
+        if os.path.exists(so_path):
+            return ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
 
     so_path = get_te_path() / "transformer_engine" / f"libtransformer_engine.{_get_sys_extension()}"
     if not so_path.exists():
