@@ -35,12 +35,33 @@ from transformer_engine.jax.sharding import (
     W_JOINED_AXES,
 )
 
-DEVICE_DP_AXIS = W_FSDP_AXES #"data"
+def unbox_logicallypartioned(boxed_pytree):
+  """Unboxes the flax.LogicallyPartitioned pieces
+
+  Args:
+    boxed_pytree: a pytree that includes LogicallyPartitioned
+      leaves.
+  Returns:
+    a pytree where all all LogicallyPartitioned leaves have been unboxed.
+  """
+  return jax.tree_util.tree_map(
+      lambda x: x.unbox() if isinstance(x, flax.linen.spmd.LogicallyPartitioned) else x,
+      boxed_pytree,
+      is_leaf=lambda k: isinstance(k, flax.linen.spmd.LogicallyPartitioned),
+  )
+
+DEVICE_DP_AXIS = "data"
 DEVICE_TP_AXIS = W_TP_AXES #"model"
 PARAMS_KEY = "params"
 PARAMS_AXES_KEY = PARAMS_KEY + "_axes"
 DROPOUT_KEY = "dropout"
 INPUT_KEY = "input_rng"
+
+LOGICAL_AXIS_RULES = (
+    (DEVICE_DP_AXIS, (DEVICE_DP_AXIS,)),
+    (DEVICE_TP_AXIS, (DEVICE_TP_AXIS,)),
+    (W_FSDP_AXES, ()),
+)
 
 
 class Net(nn.Module):
@@ -62,7 +83,7 @@ class Net(nn.Module):
 
         x = nn.Embed(
             num_embeddings=self.num_embed,
-            embedding_init=nn.with_partitioning(self.embedding_init, (DEVICE_DP_AXIS, DEVICE_TP_AXIS)),
+            embedding_init=nn.with_partitioning(self.embedding_init, (None, DEVICE_TP_AXIS)),
             features=256,
             dtype=jnp.bfloat16)(x)
 
@@ -91,11 +112,11 @@ class Net(nn.Module):
         sharding_info(x, f"out_encoder_reshape")
         sharding_vis(x)
 
-        x = te_flax.DenseGeneral(features=256, kernel_axes=(DEVICE_DP_AXIS, DEVICE_TP_AXIS))(x)
+        x = te_flax.DenseGeneral(features=256, kernel_axes=(None, DEVICE_TP_AXIS))(x)
 
-        x = te_flax.DenseGeneral(features=256, kernel_axes=(DEVICE_DP_AXIS, DEVICE_TP_AXIS))(x)
+        x = te_flax.DenseGeneral(features=256, kernel_axes=(None, DEVICE_TP_AXIS))(x)
 
-        x = te_flax.DenseGeneral(features=2, kernel_axes=(DEVICE_DP_AXIS, DEVICE_TP_AXIS))(x)
+        x = te_flax.DenseGeneral(features=2, kernel_axes=(None, DEVICE_TP_AXIS))(x)
         return x
 
 
@@ -257,7 +278,7 @@ def get_params_sharding(sharding_rules, abs_var_collect, mesh):
     return params_sharding
 
 
-def assert_params_sufficiently_sharded(params, mesh, tolerance=0.01):
+def assert_params_sufficiently_sharded(params, mesh, weight_split_axes, tolerance=0.01):
     """Checks whether most params are sharded across sharding axis.
 
     This function determines whether the majority of parameters  are distributed
@@ -298,9 +319,7 @@ def assert_params_sufficiently_sharded(params, mesh, tolerance=0.01):
     # exit()
 
     product_num_devices_for_weight_sharding = 1
-    for axis in [
-        DEVICE_TP_AXIS,
-    ]:
+    for axis in weight_split_axes:
         product_num_devices_for_weight_sharding *= mesh.shape[axis]
     print(f"product_num_devices_for_weight_sharding = {product_num_devices_for_weight_sharding}")
 
@@ -324,7 +343,7 @@ def assert_params_sufficiently_sharded(params, mesh, tolerance=0.01):
                 perfectly_sharded_params_per_chip = full_size / product_num_devices_for_weight_sharding
 
                 ratio = params_per_chip / perfectly_sharded_params_per_chip - 1
-                print(f"{indent_str}{key}: {ratio * 100:.2f}%")
+                print(f"{indent_str}{key}: {ratio * 100:.2f}%, actual:{params_per_chip}, perfect:{perfectly_sharded_params_per_chip}, shard:{shard.data.shape}, full:{jax_array.shape}")
 
     print_shard_tree(params)
 
@@ -368,7 +387,7 @@ def train_and_evaluate(args):
     num_gpu = jax.local_device_count()
     assert num_gpu % 2 == 0 and num_gpu >= 2, f"Number of GPUs ({num_gpu}) must be even and >= 2 for TP=2"
     tp_size = 2
-    dp_size = num_gpu // tp_size
+    dp_size = 1#num_gpu // tp_size
 
 
     assert args.batch_size % dp_size == 0, f"Batch size needs to be multiple of DP size ({dp_size})"
@@ -387,8 +406,9 @@ def train_and_evaluate(args):
         fp8_recipe = None
 
     print("create device mesh")
-    device_mesh = mesh_utils.create_device_mesh((dp_size, tp_size))
-    with jax.sharding.Mesh(devices=device_mesh, axis_names=(DEVICE_DP_AXIS, DEVICE_TP_AXIS)) as mesh:
+    mesh = jax.sharding.Mesh(devices=mesh_utils.create_device_mesh((dp_size, tp_size)), axis_names=(DEVICE_DP_AXIS, DEVICE_TP_AXIS))
+
+    if 1 == 1:
 
         rng = jax.random.PRNGKey(args.seed)
         rng, params_rng = jax.random.split(rng)
@@ -405,94 +425,100 @@ def train_and_evaluate(args):
         with te.fp8_autocast(
             enabled=args.use_fp8,
             fp8_recipe=fp8_recipe,
-            mesh_resource=te.MeshResource(DEVICE_DP_AXIS, DEVICE_TP_AXIS, None, None),
+            mesh_resource=te.MeshResource(
+                dp_resource=DEVICE_DP_AXIS,
+                tp_resource=DEVICE_TP_AXIS,),
         ):
-            encoder = Net(num_embed)
-            inputs = jnp.zeros(input_shape, dtype=jnp.int32)
-            masks = jnp.zeros(mask_shape, dtype=jnp.uint8)
-            abs_var_collect = jax.eval_shape(encoder.init, init_rngs, inputs, masks)
+            with mesh, nn_partitioning.axis_rules(LOGICAL_AXIS_RULES):
+                encoder = Net(num_embed)
+                inputs = jnp.zeros(input_shape, dtype=jnp.int32)
+                masks = jnp.zeros(mask_shape, dtype=jnp.uint8)
+                abs_var_collect = jax.eval_shape(encoder.init, init_rngs, inputs, masks)
 
-            sharding_rules = te_flax.extend_logical_axis_rules(tuple())
-            params_sharding = get_params_sharding(sharding_rules, abs_var_collect, mesh)
-            inputs_sharding = NamedSharding(mesh, PartitionSpec(DEVICE_DP_AXIS, None))
-            masks_sharding = NamedSharding(mesh, PartitionSpec(DEVICE_DP_AXIS, None, None, None))
+                sharding_rules = te_flax.extend_logical_axis_rules(tuple())
+                params_sharding = get_params_sharding(sharding_rules, abs_var_collect, mesh)
+                inputs_sharding = NamedSharding(mesh, PartitionSpec(DEVICE_DP_AXIS, None))
+                masks_sharding = NamedSharding(mesh, PartitionSpec(DEVICE_DP_AXIS, None, None, None))
 
-            in_shardings = (None, inputs_sharding, masks_sharding)
-            out_shardings = {
-                key: params_sharding if key is PARAMS_KEY else None for key in abs_var_collect
-            }
-            jit_encoder_init = jax.jit(encoder.init, in_shardings, out_shardings)
-            var_collect = jit_encoder_init(init_rngs, inputs, masks)
+                in_shardings = (None, inputs_sharding, masks_sharding)
+                out_shardings = {
+                    key: params_sharding if key is PARAMS_KEY else None for key in abs_var_collect
+                }
+                jit_encoder_init = jax.jit(encoder.init, in_shardings, out_shardings)
+                var_collect = jit_encoder_init(init_rngs, inputs, masks)
 
-            # import pdb; pdb.set_trace()
-            # assert_params_sufficiently_sharded(var_collect['params'], mesh)
-            # from jax_array_info import sharding_info, sharding_vis
-            # sharding_info(kernel, "kernel")
-            # sharding_vis(kernel)
-            optimizer = optax.adamw(args.lr)
-            var_collect, params = flax.core.pop(var_collect, PARAMS_KEY)
-            state = train_state.TrainState.create(
-                apply_fn=encoder.apply, params=params, tx=optimizer
-            )
-            assert_params_sufficiently_sharded(state.params, mesh)
-            state_sharding = get_state_sharding(state, params_sharding)
-            labels_sharding = NamedSharding(
-                mesh,
-                PartitionSpec(
-                    DEVICE_DP_AXIS,
-                ),
-            )
-            in_shardings = (
-                state_sharding,
-                inputs_sharding,
-                masks_sharding,
-                labels_sharding,
-                None,
-                None,
-            )
-            out_shardings = (state_sharding, None, None, None)
-            jit_train_step = jax.jit(train_step, in_shardings, out_shardings)
-
-            in_shardings = (state_sharding, inputs_sharding, masks_sharding, labels_sharding, None)
-            out_shardings = (None, None)
-            jit_eval_step = jax.jit(eval_step, in_shardings, out_shardings)
-
-            if args.use_fp8:
-                labels = jnp.zeros(label_shape, dtype=jnp.bfloat16)
-                check_fp8(state, var_collect, inputs, masks, labels)
-
-            if args.dry_run:
-                labels = jnp.zeros(label_shape, dtype=jnp.bfloat16)
-                rngs = {DROPOUT_KEY: dropout_rng}
-                dummy_inputs = jax.device_put(inputs, inputs_sharding)
-                dummy_masks = jax.device_put(masks, masks_sharding)
-                dummy_labels = jax.device_put(labels, labels_sharding)
-                jit_train_step(state, dummy_inputs, dummy_masks, dummy_labels, var_collect, rngs)
-                print("PASSED")
-                return None
-
-            assert_params_sufficiently_sharded(state.params, mesh)
-
-            for epoch in range(1, args.epochs + 1):
-                rng, input_rng = jax.random.split(rng)
-                rng, dropout_rng = jax.random.split(rng)
-                rngs = {INPUT_KEY: input_rng, DROPOUT_KEY: dropout_rng}
-
-                state, train_loss, train_accuracy, var_collect = train_epoch(
-                    state, train_ds, global_batch_size, rngs, var_collect, jit_train_step
+            with nn_partitioning.axis_rules(LOGICAL_AXIS_RULES):
+                # import pdb; pdb.set_trace()
+                # assert_params_sufficiently_sharded(var_collect['params'], mesh)
+                # from jax_array_info import sharding_info, sharding_vis
+                # sharding_info(kernel, "kernel")
+                # sharding_vis(kernel)
+                optimizer = optax.adamw(args.lr)
+                var_collect, params = flax.core.pop(var_collect, PARAMS_KEY)
+                state = train_state.TrainState.create(
+                    apply_fn=encoder.apply, params=params, tx=optimizer
                 )
-
-                test_loss, test_accuracy = eval_model(
-                    state, test_ds, global_test_batch_size, var_collect, jit_eval_step
+                # assert_params_sufficiently_sharded(state.params, mesh)
+                state_sharding = get_state_sharding(state, params_sharding)
+                labels_sharding = NamedSharding(
+                    mesh,
+                    PartitionSpec(
+                        DEVICE_DP_AXIS,
+                    ),
                 )
-
-                print(
-                    f"Epoch: {epoch:>2} "
-                    f"Train Loss: {train_loss:.6f} "
-                    f"Train Accuracy: {train_accuracy:.6f} "
-                    f"Test Loss: {test_loss:.6f} "
-                    f"Test Accuracy: {test_accuracy:.6f} "
+                in_shardings = (
+                    state_sharding,
+                    inputs_sharding,
+                    masks_sharding,
+                    labels_sharding,
+                    None,
+                    None,
                 )
+                out_shardings = (state_sharding, None, None, None)
+                jit_train_step = jax.jit(train_step, in_shardings, out_shardings)
+
+                in_shardings = (state_sharding, inputs_sharding, masks_sharding, labels_sharding, None)
+                out_shardings = (None, None)
+                jit_eval_step = jax.jit(eval_step, in_shardings, out_shardings)
+
+                if args.use_fp8:
+                    labels = jnp.zeros(label_shape, dtype=jnp.bfloat16)
+                    check_fp8(state, var_collect, inputs, masks, labels)
+
+                if args.dry_run:
+                    labels = jnp.zeros(label_shape, dtype=jnp.bfloat16)
+                    rngs = {DROPOUT_KEY: dropout_rng}
+                    dummy_inputs = jax.device_put(inputs, inputs_sharding)
+                    dummy_masks = jax.device_put(masks, masks_sharding)
+                    dummy_labels = jax.device_put(labels, labels_sharding)
+                    jit_train_step(state, dummy_inputs, dummy_masks, dummy_labels, var_collect, rngs)
+                    print("PASSED")
+                    return None
+            
+            state = unbox_logicallypartioned(state)
+            assert_params_sufficiently_sharded(state.params, mesh, weight_split_axes=(DEVICE_TP_AXIS,))
+
+            with mesh, nn_partitioning.axis_rules(LOGICAL_AXIS_RULES):
+                for epoch in range(1, args.epochs + 1):
+                    rng, input_rng = jax.random.split(rng)
+                    rng, dropout_rng = jax.random.split(rng)
+                    rngs = {INPUT_KEY: input_rng, DROPOUT_KEY: dropout_rng}
+
+                    state, train_loss, train_accuracy, var_collect = train_epoch(
+                        state, train_ds, global_batch_size, rngs, var_collect, jit_train_step
+                    )
+
+                    test_loss, test_accuracy = eval_model(
+                        state, test_ds, global_test_batch_size, var_collect, jit_eval_step
+                    )
+
+                    print(
+                        f"Epoch: {epoch:>2} "
+                        f"Train Loss: {train_loss:.6f} "
+                        f"Train Accuracy: {train_accuracy:.6f} "
+                        f"Test Loss: {test_loss:.6f} "
+                        f"Test Accuracy: {test_accuracy:.6f} "
+                    )
 
             return [train_loss, train_accuracy, test_loss, test_accuracy]
 
