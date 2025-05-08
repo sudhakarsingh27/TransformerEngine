@@ -48,13 +48,23 @@ class Net(nn.Module):
 
     num_embed: int
 
+    def __post_init__(self):
+        self.embedding_init = nn.initializers.variance_scaling(
+            1.0, "fan_in", "truncated_normal", dtype=jnp.bfloat16
+        )
+        super().__post_init__()
+
     @nn.compact
     def __call__(self, x, mask, disable_dropout=False):
         from jax_array_info import sharding_info, sharding_vis
         sharding_info(x, f"net input")
         sharding_vis(x)
 
-        x = nn.Embed(num_embeddings=self.num_embed, features=256, dtype=jnp.bfloat16)(x)
+        x = nn.Embed(
+            num_embeddings=self.num_embed,
+            embedding_init=nn.with_partitioning(self.embedding_init, (DEVICE_DP_AXIS, DEVICE_TP_AXIS)),
+            features=256,
+            dtype=jnp.bfloat16)(x)
 
         print("transformer layer")
         te_Encoder = partial(
@@ -83,9 +93,9 @@ class Net(nn.Module):
 
         x = te_flax.DenseGeneral(features=256, kernel_axes=(DEVICE_DP_AXIS, DEVICE_TP_AXIS))(x)
 
-        x = te_flax.DenseGeneral(features=256)(x)
+        x = te_flax.DenseGeneral(features=256, kernel_axes=(DEVICE_DP_AXIS, DEVICE_TP_AXIS))(x)
 
-        x = nn.Dense(features=2)(x)
+        x = te_flax.DenseGeneral(features=2, kernel_axes=(DEVICE_DP_AXIS, DEVICE_TP_AXIS))(x)
         return x
 
 
@@ -272,6 +282,7 @@ def assert_params_sufficiently_sharded(params, mesh, tolerance=0.01):
     def calculate_total_params_per_chip(params):
         """Calculate total paramsper chip."""
         def calculate_leaf_params_per_chip(arr):
+            # import pdb; pdb.set_trace()
             shard = arr.addressable_shards[0]
             return np.prod(shard.data.shape)
 
@@ -282,12 +293,40 @@ def assert_params_sufficiently_sharded(params, mesh, tolerance=0.01):
     total_num_params = calculate_num_params_from_pytree(params)
     print(f"Total number of parameters: {total_num_params}")
 
+    # import pdb; pdb.set_trace()
+    # print(params.keys())
+    # exit()
+
     product_num_devices_for_weight_sharding = 1
     for axis in [
         DEVICE_TP_AXIS,
     ]:
         product_num_devices_for_weight_sharding *= mesh.shape[axis]
     print(f"product_num_devices_for_weight_sharding = {product_num_devices_for_weight_sharding}")
+
+    def print_shard_tree(params, indent=0):
+        indent_str = " " * indent
+        for key, value in params.items():
+            if isinstance(value, dict):
+                print(f"{indent_str}{key}:")
+                print_shard_tree(value, indent = indent + 2)
+            else:
+                # Assumes it's an instance of LogicallyPartitioned
+                logically_partitioned_array = value
+                if 'value' in dir(logically_partitioned_array):
+                    jax_array = logically_partitioned_array.value
+                else:
+                    jax_array = logically_partitioned_array
+                shard = jax_array.addressable_shards[0]
+                shard_size = np.prod(shard.data.shape)
+                full_size = np.prod(jax_array.shape)
+                params_per_chip = shard_size
+                perfectly_sharded_params_per_chip = full_size / product_num_devices_for_weight_sharding
+
+                ratio = params_per_chip / perfectly_sharded_params_per_chip - 1
+                print(f"{indent_str}{key}: {ratio * 100:.2f}%")
+
+    print_shard_tree(params)
 
     total_num_params_per_chip = calculate_total_params_per_chip(params)
     print(f"Total parameters per chip: {total_num_params_per_chip}")
@@ -328,7 +367,7 @@ def train_and_evaluate(args):
 
     num_gpu = jax.local_device_count()
     assert num_gpu % 2 == 0 and num_gpu >= 2, f"Number of GPUs ({num_gpu}) must be even and >= 2 for TP=2"
-    tp_size = 4
+    tp_size = 2
     dp_size = num_gpu // tp_size
 
 
@@ -385,8 +424,8 @@ def train_and_evaluate(args):
             jit_encoder_init = jax.jit(encoder.init, in_shardings, out_shardings)
             var_collect = jit_encoder_init(init_rngs, inputs, masks)
 
-            import pdb; pdb.set_trace()
-            assert_params_sufficiently_sharded(state.params, mesh)
+            # import pdb; pdb.set_trace()
+            # assert_params_sufficiently_sharded(var_collect['params'], mesh)
             # from jax_array_info import sharding_info, sharding_vis
             # sharding_info(kernel, "kernel")
             # sharding_vis(kernel)
@@ -395,6 +434,7 @@ def train_and_evaluate(args):
             state = train_state.TrainState.create(
                 apply_fn=encoder.apply, params=params, tx=optimizer
             )
+            assert_params_sufficiently_sharded(state.params, mesh)
             state_sharding = get_state_sharding(state, params_sharding)
             labels_sharding = NamedSharding(
                 mesh,
@@ -431,7 +471,6 @@ def train_and_evaluate(args):
                 print("PASSED")
                 return None
 
-            import pdb; pdb.set_trace()
             assert_params_sufficiently_sharded(state.params, mesh)
 
             for epoch in range(1, args.epochs + 1):
@@ -592,5 +631,5 @@ class TestEncoder(unittest.TestCase):
 
 if __name__ == "__main__":
     args = encoder_parser(None)
-    args.disable_jit = True
+    # args.disable_jit = True
     train_and_evaluate(args)
