@@ -34,6 +34,7 @@ from transformer_engine.jax.sharding import (
     W_TP_AXES,
     W_JOINED_AXES,
 )
+from transformer_engine.jax.debug import JaxTracingContext
 
 def unbox_logicallypartioned(boxed_pytree):
   """Unboxes the flax.LogicallyPartitioned pieces
@@ -58,9 +59,9 @@ DROPOUT_KEY = "dropout"
 INPUT_KEY = "input_rng"
 
 LOGICAL_AXIS_RULES = (
-    (DEVICE_DP_AXIS, (DEVICE_DP_AXIS,)),
-    (DEVICE_TP_AXIS, (DEVICE_TP_AXIS,)),
-    (W_FSDP_AXES, ()),
+    ("embed", (DEVICE_DP_AXIS,)),
+    ("mlp", (DEVICE_TP_AXIS,)),
+    # (W_FSDP_AXES, ()),
 )
 
 
@@ -81,42 +82,43 @@ class Net(nn.Module):
         sharding_info(x, f"net input")
         sharding_vis(x)
 
-        x = nn.Embed(
-            num_embeddings=self.num_embed,
-            embedding_init=nn.with_partitioning(self.embedding_init, (None, DEVICE_TP_AXIS)),
-            features=256,
-            dtype=jnp.bfloat16)(x)
+        # x = nn.Embed(
+        #     num_embeddings=self.num_embed,
+        #     # embedding_init=nn.with_partitioning(self.embedding_init, ("embed", "mlp")),
+        #     embedding_init=self.embedding_init,
+        #     features=256,
+        #     dtype=jnp.bfloat16)(x)
 
-        print("transformer layer")
-        te_Encoder = partial(
-            te_flax.TransformerLayer,
-            hidden_size=256,
-            mlp_hidden_size=1024,
-            num_attention_heads=8,
-            hidden_dropout=0.1,
-            attention_dropout=0.1,
-            dropout_rng_name=DROPOUT_KEY,
-            layer_type=te_flax.TransformerLayerType.ENCODER,
-            self_attn_mask_type="padding",
-            enable_relative_embedding=False,
-        )
-        x = te_Encoder()(x, attention_mask=mask, deterministic=disable_dropout)
+        # print("transformer layer")
+        # te_Encoder = partial(
+        #     te_flax.TransformerLayer,
+        #     hidden_size=256,
+        #     mlp_hidden_size=1024,
+        #     num_attention_heads=8,
+        #     hidden_dropout=0.1,
+        #     attention_dropout=0.1,
+        #     dropout_rng_name=DROPOUT_KEY,
+        #     layer_type=te_flax.TransformerLayerType.ENCODER,
+        #     self_attn_mask_type="padding",
+        #     enable_relative_embedding=False,
+        # )
+        # x = te_Encoder()(x, attention_mask=mask, deterministic=disable_dropout)
 
-        from jax_array_info import sharding_info, sharding_vis
-        sharding_info(x, f"out_encoder")
-        sharding_vis(x)
+        # from jax_array_info import sharding_info, sharding_vis
+        # sharding_info(x, f"out_encoder")
+        # sharding_vis(x)
 
-        x = x.reshape(x.shape[0], -1)
+        # x = x.reshape(x.shape[0], -1)
 
-        from jax_array_info import sharding_info, sharding_vis
-        sharding_info(x, f"out_encoder_reshape")
-        sharding_vis(x)
+        # from jax_array_info import sharding_info, sharding_vis
+        # sharding_info(x, f"out_encoder_reshape")
+        # sharding_vis(x)
 
-        x = te_flax.DenseGeneral(features=256, kernel_axes=(None, DEVICE_TP_AXIS))(x)
+        # x = te_flax.DenseGeneral(features=256, kernel_axes=(None, "mlp"))(x)
 
-        x = te_flax.DenseGeneral(features=256, kernel_axes=(None, DEVICE_TP_AXIS))(x)
+        # x = te_flax.DenseGeneral(features=256, kernel_axes=(None, "mlp"))(x)
 
-        x = te_flax.DenseGeneral(features=2, kernel_axes=(None, DEVICE_TP_AXIS))(x)
+        x = te_flax.DenseGeneral(features=2, kernel_axes=(None, "mlp"))(x)
         return x
 
 
@@ -387,7 +389,7 @@ def train_and_evaluate(args):
     num_gpu = jax.local_device_count()
     assert num_gpu % 2 == 0 and num_gpu >= 2, f"Number of GPUs ({num_gpu}) must be even and >= 2 for TP=2"
     tp_size = 2
-    dp_size = 1#num_gpu // tp_size
+    dp_size = num_gpu // tp_size
 
 
     assert args.batch_size % dp_size == 0, f"Batch size needs to be multiple of DP size ({dp_size})"
@@ -447,7 +449,7 @@ def train_and_evaluate(args):
                 jit_encoder_init = jax.jit(encoder.init, in_shardings, out_shardings)
                 var_collect = jit_encoder_init(init_rngs, inputs, masks)
 
-            with nn_partitioning.axis_rules(LOGICAL_AXIS_RULES):
+            with mesh, nn_partitioning.axis_rules(LOGICAL_AXIS_RULES):
                 # import pdb; pdb.set_trace()
                 # assert_params_sufficiently_sharded(var_collect['params'], mesh)
                 # from jax_array_info import sharding_info, sharding_vis
@@ -658,4 +660,6 @@ class TestEncoder(unittest.TestCase):
 if __name__ == "__main__":
     args = encoder_parser(None)
     # args.disable_jit = True
-    train_and_evaluate(args)
+    # with JaxTracingContext():
+    if True:
+        train_and_evaluate(args)
