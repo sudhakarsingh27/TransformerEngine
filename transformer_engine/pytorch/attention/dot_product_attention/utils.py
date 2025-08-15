@@ -1829,16 +1829,18 @@ def get_attention_quantizers(fp8, quantizers, cp_specific_quantizers=False):
 ### context parallel utils ###
 ##############################
 
-def get_batch_on_this_cp_rank(
+def get_sequences_on_this_cp_rank(
     batch: Dict[str, Any],
     qkv_format: str = "bshd",
-    cu_seqlens_padded: torch.Tensor = None
+    mask_seq_dim: int = 2,
+    cu_seqlens_padded: torch.Tensor = None,
+    cp_group: torch.distributed.ProcessGroup = None
 ):
-        """Slice batch input along sequence dimension into multiple chunks,
+    """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
     """
+    # Create a world process group for CP.
     if cp_group is None:
-        # Create a world process group for CP.
         cp_group = torch.distributed.new_group()
 
     keys_to_change = ['input_ids_padded', 'labels_padded', 'position_ids_padded']
@@ -1852,10 +1854,9 @@ def get_batch_on_this_cp_rank(
     cp_size = torch.distributed.get_world_size(group=cp_group)
     if cp_size > 1:
 
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+        # Slice out batch['input_ids'] and batch['labels'] And MAYBE the positional_ids
         if qkv_format == "bshd":
-
-            cp_rank = torch.distributed.get_rank(group=cp_group)
-            # Slice out batch['input_ids'] and batch['labels'] And MAYBE the positional_ids
 
             if batch['input_ids_padded'].shape[seq_dim] % (2 * cp_size) != 0:
                 raise ValueError(f"Input ids must be divisible by 2 * cp_size, but got {batch['input_ids_padded'].shape[seq_dim]} % {2 * cp_size} != 0")
@@ -1890,8 +1891,8 @@ def get_batch_on_this_cp_rank(
                  "the right chunk sizes for each sequence.")
 
             # Calculate the chunk sizes for each sequence
-            total_chunks = 2 * cp_size
-            chunk_sizes = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]) // total_chunks
+            total_slices_of_any_sequence = 2 * cp_size
+            slice_sizes = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]) // total_slices_of_any_sequence
 
             for key in keys_to_change:
                 val = batch[key]
@@ -1903,25 +1904,30 @@ def get_batch_on_this_cp_rank(
                     else:
                         raise ValueError("Make sure the inputs are in THD format and padded correctly.")
 
+                    # On this particular rank, for each sequence, get two slices, one from the beginning
+                    # and one from the end.
                     cp_rank_slices = []
-                    for chunk_size, seq_start in zip(chunk_sizes,cu_seqlens_padded[:-1]):
+                    for slice_size, seq_start in zip(slice_sizes,cu_seqlens_padded[:-1]):
                         # 1st segment
                         cp_rank_slices.append(
                             torch.arange(
-                                seq_start + (cp_rank * chunk_size),
-                                seq_start + ((cp_rank + 1) * chunk_size)
-                            )
+                                seq_start + (cp_rank * slice_size),
+                                seq_start + ((cp_rank + 1) * slice_size)
+                            ).cuda()
                         )
 
                         # 2nd segment
                         cp_rank_slices.append(
                             torch.arange(
-                                seq_start + ((total_chunks - cp_rank - 1) * chunk_size),
-                                seq_start + ((total_chunks - cp_rank) * chunk_size)
-                            )
+                                seq_start + ((total_slices_of_any_sequence - cp_rank - 1) * slice_size),
+                                seq_start + ((total_slices_of_any_sequence - cp_rank) * slice_size)
+                            ).cuda()
                         )
 
-                    val.index_select(seq_dim, torch.cat(cp_rank_slices))
+                    val = val.index_select(seq_dim, torch.cat(cp_rank_slices))
+
+                    # Update the key
+                    batch[key] = val
 
         # Overwrite them
         batch['input_ids'] = batch['input_ids_padded']
