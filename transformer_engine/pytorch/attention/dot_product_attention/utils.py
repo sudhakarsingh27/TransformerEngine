@@ -1823,3 +1823,109 @@ def get_attention_quantizers(fp8, quantizers, cp_specific_quantizers=False):
         )
 
     return QKV_quantizer, O_quantizer, S_quantizer, dQKV_quantizer, dO_quantizer, dP_quantizer
+
+
+##############################
+### context parallel utils ###
+##############################
+
+def get_batch_on_this_cp_rank(
+    batch: Dict[str, Any],
+    qkv_format: str = "bshd",
+    cu_seqlens_padded: torch.Tensor = None
+):
+        """Slice batch input along sequence dimension into multiple chunks,
+    which are parallelized across GPUs in a context parallel group.
+    """
+    if cp_group is None:
+        # Create a world process group for CP.
+        cp_group = torch.distributed.new_group()
+
+    keys_to_change = ['input_ids_padded', 'labels_padded', 'position_ids_padded']
+
+    # With causal masking, each token only attends to its prior tokens. Simply split
+    # sequence into CP chunks can result in severe load imbalance. That's to say, chunks
+    # at the end of sequence have bigger workload than others. To address this issue,
+    # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
+    # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
+    # that we can get balanced workload among GPUs in a context parallel group.
+    cp_size = torch.distributed.get_world_size(group=cp_group)
+    if cp_size > 1:
+
+        if qkv_format == "bshd":
+
+            cp_rank = torch.distributed.get_rank(group=cp_group)
+            # Slice out batch['input_ids'] and batch['labels'] And MAYBE the positional_ids
+
+            if batch['input_ids_padded'].shape[seq_dim] % (2 * cp_size) != 0:
+                raise ValueError(f"Input ids must be divisible by 2 * cp_size, but got {batch['input_ids_padded'].shape[seq_dim]} % {2 * cp_size} != 0")
+
+            if batch['labels_padded'].shape[seq_dim] % (2 * cp_size) != 0:
+                raise ValueError(f"Labels must be divisible by 2 * cp_size, but got {batch['labels_padded'].shape[seq_dim]} % {2 * cp_size} != 0")
+
+            if batch['position_ids_padded'] is not None and batch['position_ids_padded'].shape[seq_dim] % (2 * cp_size) != 0:
+                raise ValueError(f"Positional ids must be divisible by 2 * cp_size, but got {batch['position_ids_padded'].shape[seq_dim]} % {2 * cp_size} != 0")
+
+
+            for key in keys_to_change:
+                val = batch[key]
+                if val is not None:
+                    seq_dim = seq_dim if key != 'attention_mask' else mask_seq_dim
+                    val = val.view(
+                        *val.shape[0:seq_dim],
+                        2 * cp_size,
+                        val.shape[seq_dim] // (2 * cp_size),
+                        *val.shape[(seq_dim + 1) :],
+                    )
+                    index = torch.tensor(
+                        [cp_rank, (2 * cp_size - cp_rank - 1)], device='cpu', pin_memory=True
+                    )
+                    val = val.index_select(seq_dim, index)
+                    val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+                    batch[key] = val
+
+        elif qkv_format == "thd":
+            assert cu_seqlens_padded is not None, \
+                ("cu_seqlens_padded is required for thd format to calculate"
+                 "the right chunk sizes for each sequence.")
+
+            # Calculate the chunk sizes for each sequence
+            total_chunks = 2 * cp_size
+            chunk_sizes = (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]) // total_chunks
+
+            for key in keys_to_change:
+                val = batch[key]
+                if val is not None:
+                    if val.shape[1] == cu_seqlens_padded[-1]:
+                        seq_dim = 1
+                    elif val.shape[0] == cu_seqlens_padded[-1]:
+                        seq_dim = 0
+                    else:
+                        raise ValueError("Make sure the inputs are in THD format and padded correctly.")
+
+                    cp_rank_slices = []
+                    for chunk_size, seq_start in zip(chunk_sizes,cu_seqlens_padded[:-1]):
+                        # 1st segment
+                        cp_rank_slices.append(
+                            torch.arange(
+                                seq_start + (cp_rank * chunk_size),
+                                seq_start + ((cp_rank + 1) * chunk_size)
+                            )
+                        )
+
+                        # 2nd segment
+                        cp_rank_slices.append(
+                            torch.arange(
+                                seq_start + ((total_chunks - cp_rank - 1) * chunk_size),
+                                seq_start + ((total_chunks - cp_rank) * chunk_size)
+                            )
+                        )
+
+                    val.index_select(seq_dim, torch.cat(cp_rank_slices))
+
+        # Overwrite them
+        batch['input_ids'] = batch['input_ids_padded']
+        batch['labels'] = batch['labels_padded']
+        batch['position_ids'] = batch['position_ids_padded']
+
+    return batch
