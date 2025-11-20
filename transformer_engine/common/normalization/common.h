@@ -10,6 +10,7 @@
 #include <cudnn.h>
 #include <cudnn_frontend.h>
 #include <cudnn_frontend_utils.h>
+#include <transformer_engine/normalization.h>
 #include <transformer_engine/transformer_engine.h>
 
 #include <functional>
@@ -125,6 +126,9 @@ struct BackwardKernelParams : public KernelParamsBase {
   // Input: gradient wrt. LN FWD output.
   void* dz;
 
+  // Input: extra tensor to add for fused backward+add
+  void* add;
+
   // Workspace for Wgrad pre-reduction.
   void* dbeta_part;
   void* dgamma_part;
@@ -136,9 +140,10 @@ struct BackwardKernelParams : public KernelParamsBase {
   void* dgamma;
 };
 
+using BackwardAddKernelParams = BackwardKernelParams;
+
 enum class NVTE_Norm_Backend { Te, Cudnn };
-enum class NVTE_Norm_Type { LayerNorm, RMSNorm };
-enum class NVTE_Norm_Stage { Forward, Backward };
+enum class NVTE_Norm_Stage { Forward, Backward, BackwardAdd };
 
 using TupleKeyType = std::tuple<uint64_t, uint64_t, uint64_t, bool>;
 struct TupleHash {
@@ -154,9 +159,12 @@ struct TupleHash {
   }
 };
 
-TupleKeyType get_key(NVTE_Norm_Type NormType, NVTE_Norm_Stage NormStage, DType wtype, DType itype,
-                     DType otype, DType ctype, uint64_t batch_size, uint64_t hidden_size,
-                     bool zero_centered_gamma, bool is_tuned);
+// Note: the default mode here should match with the default mode with QTensor
+TupleKeyType get_key(NVTE_Norm_Backend NormBackend, NVTE_Norm_Type NormType,
+                     NVTE_Norm_Stage NormStage, DType wtype, DType itype, DType otype, DType ctype,
+                     uint64_t batch_size, uint64_t hidden_size, bool zero_centered_gamma,
+                     bool is_tuned, NVTEScalingMode mode = NVTE_DELAYED_TENSOR_SCALING,
+                     bool training = true, bool gamma_in_weight_dtype = false);
 
 template <typename KernelParamsType>
 class TeNormalizationRegistry {
@@ -218,8 +226,8 @@ class NormalizationPlanBase {
                        cudaStream_t stream) = 0;
 
   virtual void execute(void* x_dptr, void* gamma_dptr, void* mean_dptr, void* rsigma_dptr,
-                       void* dx_dptr, void* dz_dptr, void* dbeta_dptr, void* dgamma_dptr,
-                       void* workspace_dptr, cudaStream_t stream) = 0;
+                       void* dx_dptr, void* dz_dptr, void* add_dptr, void* dbeta_dptr,
+                       void* dgamma_dptr, void* workspace_dptr, cudaStream_t stream) = 0;
 
  private:
   virtual void _build() = 0;
@@ -238,8 +246,8 @@ class TeNormalizationPlan : public NormalizationPlanBase {
                cudaStream_t stream) override;
 
   void execute(void* x_dptr, void* gamma_dptr, void* mean_dptr, void* rsigma_dptr, void* dx_dptr,
-               void* dz_dptr, void* dbeta_dptr, void* dgamma_dptr, void* workspace_dptr,
-               cudaStream_t stream) override;
+               void* dz_dptr, void* add_dptr, void* dbeta_dptr, void* dgamma_dptr,
+               void* workspace_dptr, cudaStream_t stream) override;
 
  private:
   void _set_workspace();
@@ -257,7 +265,8 @@ class CudnnNormalizationPlan : public NormalizationPlanBase {
   CudnnNormalizationPlan(NVTE_Norm_Type NormType, NVTE_Norm_Stage NormStage, DType wtype,
                          DType itype, DType otype, DType ctype, const size_t batch_size,
                          const size_t hidden_size, const size_t sm_count,
-                         const bool zero_centered_gamma);
+                         const bool zero_centered_gamma, const NVTEScalingMode mode,
+                         const bool training);
 
   std::vector<size_t> getWorkspaceShape() const override;
 
@@ -266,17 +275,24 @@ class CudnnNormalizationPlan : public NormalizationPlanBase {
                cudaStream_t stream) override;
 
   void execute(void* x_dptr, void* gamma_dptr, void* mean_dptr, void* rsigma_dptr, void* dx_dptr,
-               void* dz_dptr, void* dbeta_dptr, void* dgamma_dptr, void* workspace_dptr,
-               cudaStream_t stream) override;
+               void* dz_dptr, void* add_dptr, void* dbeta_dptr, void* dgamma_dptr,
+               void* workspace_dptr, cudaStream_t stream) override;
 
  private:
   void _build() override;
 
   const bool _zero_centered, _fp8_out;
+  int _ndim_scale_block;
+  const NVTE_Norm_Stage _norm_stage;
+  const NVTE_Norm_Type _norm_type;
   std::unique_ptr<char[]> _scalar_dptr;
+  std::unique_ptr<float> _one_dptr = std::make_unique<float>(1.0f);
   // FWD
   std::shared_ptr<fe::graph::Tensor_attributes> _x, _gamma_zero, _scalar_offset, _gamma, _beta,
-      _eps, _mean, _rsigma, _z, _z_scale, _amax, _z_fp8;
+      _eps, _mean, _rsigma, _z, _z_scale, _one_for_div, _z_scale_inv, _amax, _z_fp8;
+  // MX FWD
+  std::shared_ptr<fe::graph::Tensor_attributes> _z_mx_row, _z_mx_col, _sf_row, _sf_col;
+  const bool _training;
   // BWD
   std::shared_ptr<fe::graph::Tensor_attributes> _dz, _dx, _dgamma, _dbeta;
 
@@ -292,12 +308,12 @@ class NormalizationPlanRegistry {
     return instance;
   }
 
-  NormalizationPlanBase* getNormalizationPlan(NVTE_Norm_Backend NormBackend,
-                                              NVTE_Norm_Type NormType, NVTE_Norm_Stage NormStage,
-                                              DType wtype, DType itype, DType otype,
-                                              const size_t batch_size, const size_t hidden_size,
-                                              const size_t sm_count, const bool zero_centered_gamma,
-                                              const bool is_aligned);
+  NormalizationPlanBase* getNormalizationPlan(
+      NVTE_Norm_Backend NormBackend, NVTE_Norm_Type NormType, NVTE_Norm_Stage NormStage,
+      DType wtype, DType itype, DType otype, const size_t batch_size, const size_t hidden_size,
+      const size_t sm_count, const bool zero_centered_gamma, const bool is_aligned,
+      const NVTEScalingMode mode = NVTE_DELAYED_TENSOR_SCALING, const bool training = true,
+      const bool gamma_in_weight_dtype = false);
 
  private:
   NormalizationPlanRegistry() {}
@@ -356,14 +372,11 @@ struct TypeToDType<byte> {
   static int                                                                                                        \
       register_##NORM_TYPE##_##NORM_STAGE##_##LAUNCH_TYPE##_##HIDDEN_SIZE##_##WTYPE##_##ITYPE##_##OTYPE##_##CTYPE = \
           TeNormalizationRegistry<NORM_STAGE##KernelParams>::registerFunction(                                      \
-              (get_key(NVTE_Norm_Type::NORM_TYPE, NVTE_Norm_Stage::NORM_STAGE,                                      \
-                       (TypeToDType<WTYPE>::value), (TypeToDType<ITYPE>::value),                                    \
-                       (TypeToDType<OTYPE>::value), (TypeToDType<CTYPE>::value), 0, HIDDEN_SIZE,                    \
-                       0, IS_TUNED(LAUNCH_TYPE))),                                                                  \
+              (get_key(NVTE_Norm_Backend::Te, NVTE_Norm_Type::NORM_TYPE,                                            \
+                       NVTE_Norm_Stage::NORM_STAGE, (TypeToDType<WTYPE>::value),                                    \
+                       (TypeToDType<ITYPE>::value), (TypeToDType<OTYPE>::value),                                    \
+                       (TypeToDType<CTYPE>::value), 0, HIDDEN_SIZE, 0, IS_TUNED(LAUNCH_TYPE))),                     \
               FUNC_NAME)
-
-// For FP8 only
-void ComputeScaleInv(void* scale, void* scale_inv);
 
 // Alignment check
 template <size_t Alignment = 16, typename... Args>
@@ -374,8 +387,9 @@ bool is_ptr_aligned(const Args*... ptrs) {
 bool use_cudnn_norm_fwd();
 bool use_cudnn_norm_bwd();
 
-}  // namespace normalization
+bool& use_zero_centered_gamma_in_weight_dtype();
 
+}  // namespace normalization
 }  // namespace transformer_engine
 
 #endif

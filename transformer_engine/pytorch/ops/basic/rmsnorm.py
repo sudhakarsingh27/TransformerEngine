@@ -13,13 +13,10 @@ from typing import Optional
 import torch
 
 from transformer_engine_torch import rmsnorm_bwd, rmsnorm_fwd
-from ...cpp_extensions import (
-    rmsnorm_fwd_fp8,
-    rmsnorm_fwd_fp8_inf,
-    rmsnorm_fwd_inf,
-)
-from ...fp8 import FP8GlobalStateManager, get_fp8_te_dtype
-from ...tensor import Float8Tensor, QuantizedTensor
+from ...constants import TE_DType
+from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload
+from ...export import is_in_onnx_export_mode
+from ...tensor import Quantizer
 from ...utils import (
     canonicalize_device,
     canonicalize_dtype,
@@ -27,7 +24,7 @@ from ...utils import (
     devices_match,
 )
 from ..op import BasicOperation, OperationContext
-from .._common import maybe_autocast_dtype, reshape
+from .._common import maybe_autocast_dtype, maybe_dequantize
 
 
 class RMSNorm(BasicOperation):
@@ -154,8 +151,8 @@ class RMSNorm(BasicOperation):
             weight = torch.nn.Parameter(weight)
         self.weight = weight
 
-    def pre_forward(self, *args, **kwargs) -> None:
-        super().pre_forward(*args, **kwargs)
+    def pre_first_fuser_forward(self) -> None:
+        super().pre_first_fuser_forward()
         if self.weight.device.type == "meta":
             self.reset_parameters()
 
@@ -163,9 +160,11 @@ class RMSNorm(BasicOperation):
         self,
         ctx: OperationContext,
         input_: torch.Tensor,
-        prev_op: Optional[BasicOperation] = None,
-        next_op: Optional[BasicOperation] = None,
+        prev_op_grad_output_quantizer: Optional[Quantizer],
+        next_op_input_quantizer: Optional[Quantizer],
     ) -> torch.Tensor:
+        if is_in_onnx_export_mode():
+            return self.op_onnx_forward(input_)
 
         # Check tensor dims
         weight = self.weight
@@ -179,81 +178,32 @@ class RMSNorm(BasicOperation):
 
         # Check input tensors
         inner_dim = math.prod(weight_dims)
-        device = weight.device
-        if device.type != "cuda":
-            device = canonicalize_device(None)
         dtype = maybe_autocast_dtype(default_dtype=weight.dtype)
-        x = reshape(input_, (-1, inner_dim), device=device, dtype=dtype)
-        w = reshape(self.weight, (inner_dim,), device=device, dtype=dtype)
-        if isinstance(x, QuantizedTensor):
-            x = x.dequantize()
-        if isinstance(w, QuantizedTensor):
-            w = w.dequantize()
-
-        # Check if backward pass is needed
-        requires_grad = ctx.requires_grad
-
-        # Check if FP8 is enabled
-        with_fp8_output = (
-            FP8GlobalStateManager.is_fp8_enabled()
-            and next_op is not None
-            and next_op.num_fp8_scales("input") > 0
-        )
-        output_fp8_meta = None
-        if with_fp8_output:
-            output_fp8_meta = next_op.get_fp8_meta("input")
+        x = maybe_dequantize(input_.contiguous(), dtype).view((-1, inner_dim))
+        w = maybe_dequantize(self.weight, dtype).view((inner_dim,))
 
         # Compute RMSNorm
-        y = None
-        rstdevs = None
-        sm_margin = self._sm_margins["forward" if requires_grad else "inference"]
-        if with_fp8_output:
-            fp8_meta_key = FP8GlobalStateManager.get_meta_tensor_key(forward=True)
-            fp8_dtype = get_fp8_te_dtype(output_fp8_meta["recipe"], fprop_tensor=True)
-            args = (
-                x,
-                w,
-                self.eps,
-                output_fp8_meta[fp8_meta_key],
-                0,  # fp8_meta_index
-                fp8_dtype,
-                sm_margin,
-                self.zero_centered_gamma,
-            )
-            if requires_grad:
-                data, rstdevs = rmsnorm_fwd_fp8(*args)
-            else:
-                data = rmsnorm_fwd_fp8_inf(*args)
-            y = Float8Tensor(
-                data=data,
-                fp8_meta=output_fp8_meta,
-                fp8_meta_forward=True,
-                fp8_meta_index=0,
-                fp8_dtype=fp8_dtype,
-                dtype=dtype,
-            )
-        else:
-            args = (
-                x,
-                w,
-                self.eps,
-                sm_margin,
-                self.zero_centered_gamma,
-            )
-            if requires_grad:
-                y, rstdevs = rmsnorm_fwd(*args)
-            else:
-                y = rmsnorm_fwd_inf(*args)
+        sm_margin = self._sm_margins["forward" if ctx.requires_grad else "inference"]
+        y, _, rstdevs = rmsnorm_fwd(
+            x,
+            w,
+            self.eps,
+            None,
+            next_op_input_quantizer,
+            TE_DType[dtype],
+            sm_margin,
+            self.zero_centered_gamma,
+        )
 
         # Save state for backward pass
-        if requires_grad:
+        if ctx.requires_grad:
+            if is_cpu_offload_enabled():
+                mark_activation_offload(x, rstdevs)
             ctx.save_for_backward(x, rstdevs)
-            ctx.device = device
             ctx.dtype = dtype
-            ctx.has_prev_op = prev_op is not None
 
         # Reshape output tensor
-        out = reshape(y, input_dims)
+        out = y.view(input_dims)
         return out
 
     def op_backward(
@@ -270,14 +220,9 @@ class RMSNorm(BasicOperation):
         inner_dim = math.prod(weight_dims)
 
         # Check input tensors
-        device = ctx.device
         dtype = ctx.dtype
-        dy = reshape(grad_output, x.size(), device=device, dtype=dtype)
-        w = reshape(self.weight, (inner_dim,), device=device, dtype=dtype)
-        if isinstance(w, QuantizedTensor):
-            w = w.dequantize()
-        if isinstance(dy, QuantizedTensor):
-            dy = dy.dequantize()
+        dy = maybe_dequantize(grad_output.contiguous(), dtype).view(x.size())
+        w = maybe_dequantize(self.weight, dtype).view((inner_dim,))
 
         # Compute RMSNorm backward pass
         dx, dw = rmsnorm_bwd(
@@ -290,11 +235,18 @@ class RMSNorm(BasicOperation):
         )
 
         # Clear saved tensors if possible
-        if ctx.has_prev_op:
-            clear_tensor_data(x)
+        clear_tensor_data(x)
         clear_tensor_data(rstdevs)
 
         # Reshape results
-        grad_input = reshape(dx, grad_output.size())
-        grad_weight = reshape(dw, weight_dims)
+        grad_input = dx.view(grad_output.size())
+        grad_weight = dw.view(weight_dims)
         return grad_input, (grad_weight,)
+
+    def op_onnx_forward(
+        self,
+        input_: torch.Tensor,
+    ) -> torch.Tensor:
+        """Every operand in this function has a defined ONNX translation."""
+        weight = self.weight + 1 if self.zero_centered_gamma else self.weight
+        return torch.nn.functional.rms_norm(input_, input_.shape[-1:], weight, self.eps)

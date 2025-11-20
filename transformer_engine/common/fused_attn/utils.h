@@ -93,6 +93,12 @@ struct FADescriptor_v1 {
   std::int64_t s_kv;
   std::int64_t d_qk;
   std::int64_t d_v;
+  std::int64_t num_pages_k;
+  std::int64_t num_pages_v;
+  std::int64_t page_size_k;
+  std::int64_t page_size_v;
+  std::int64_t max_pages_per_seq_k;
+  std::int64_t max_pages_per_seq_v;
   std::int64_t bias_b;
   std::int64_t bias_h;
   float attnScale;
@@ -101,23 +107,30 @@ struct FADescriptor_v1 {
   NVTE_QKV_Layout layout;
   NVTE_Bias_Type bias_type;
   NVTE_Mask_Type mask_type;
+  NVTE_Softmax_Type softmax_type;
   std::int64_t window_size_left;
   std::int64_t window_size_right;
   bool bottom_right_diagonal;
   bool deterministic;
-  cudnn_frontend::DataType_t fwd_tensor_type;
-  cudnn_frontend::DataType_t bwd_tensor_type;
+  cudnn_frontend::DataType_t qkv_tensor_type;
+  cudnn_frontend::DataType_t o_tensor_type;
+  cudnn_frontend::DataType_t do_tensor_type;
+  cudnn_frontend::DataType_t dqkv_tensor_type;
+  bool generate_max_sum_exp;
 
   bool operator<(const FADescriptor_v1 &rhs) const {
-    return std::tie(b, h, hg, s_q, s_kv, d_qk, d_v, bias_b, bias_h, attnScale, isTraining,
-                    dropoutProbability, layout, mask_type, window_size_left, window_size_right,
-                    bottom_right_diagonal, deterministic, bias_type, fwd_tensor_type,
-                    bwd_tensor_type) <
-           std::tie(rhs.b, rhs.h, rhs.hg, rhs.s_q, rhs.s_kv, rhs.d_qk, rhs.d_v, rhs.bias_b,
-                    rhs.bias_h, rhs.attnScale, rhs.isTraining, rhs.dropoutProbability, rhs.layout,
-                    rhs.mask_type, rhs.window_size_left, rhs.window_size_right,
-                    rhs.bottom_right_diagonal, rhs.deterministic, rhs.bias_type,
-                    rhs.fwd_tensor_type, rhs.bwd_tensor_type);
+    return std::tie(b, h, hg, s_q, s_kv, d_qk, d_v, num_pages_k, num_pages_v, page_size_k,
+                    page_size_v, max_pages_per_seq_k, max_pages_per_seq_v, bias_b, bias_h,
+                    attnScale, isTraining, dropoutProbability, layout, mask_type, softmax_type,
+                    window_size_left, window_size_right, bottom_right_diagonal, deterministic, bias_type, qkv_tensor_type,
+                    o_tensor_type, do_tensor_type, dqkv_tensor_type, generate_max_sum_exp) <
+           std::tie(rhs.b, rhs.h, rhs.hg, rhs.s_q, rhs.s_kv, rhs.d_qk, rhs.d_v, rhs.num_pages_k,
+                    rhs.num_pages_v, rhs.page_size_k, rhs.page_size_v, rhs.max_pages_per_seq_k,
+                    rhs.max_pages_per_seq_v, rhs.bias_b, rhs.bias_h, rhs.attnScale, rhs.isTraining,
+                    rhs.dropoutProbability, rhs.layout, rhs.mask_type, rhs.softmax_type,
+                    rhs.window_size_left, rhs.window_size_right, rhs.bottom_right_diagonal, rhs.deterministic, rhs.bias_type,
+                    rhs.qkv_tensor_type, rhs.o_tensor_type, rhs.do_tensor_type,
+                    rhs.dqkv_tensor_type, rhs.generate_max_sum_exp);
   }
 };
 
@@ -143,6 +156,38 @@ DType get_ragged_offset_dtype(NVTE_QKV_Layout_Group layout_group, int64_t num_at
 
 size_t get_max_batch_size(size_t batch_size);
 size_t get_max_tokens(size_t num_tokens);
+
+class FusedAttnOffsetManager {
+ public:
+  static FusedAttnOffsetManager &Instance() {
+    static thread_local FusedAttnOffsetManager instance;
+    return instance;
+  }
+
+  size_t GetAndUpdateOffset(size_t increment) {
+    size_t ret = offset_;
+    offset_ += increment;
+    return ret;
+  }
+
+  FusedAttnOffsetManager(FusedAttnOffsetManager const &) = delete;
+  void operator=(FusedAttnOffsetManager const &) = delete;
+
+ private:
+  FusedAttnOffsetManager() {}
+  size_t offset_ = 0;
+};
+
+__global__ void populate_rng_state_kernel(int64_t *rng_state_dst, const int64_t *const seed,
+                                          int64_t offset);
+
+__global__ void get_runtime_num_segments_kernel(int32_t *cu_seqlen, size_t len, uint32_t *out);
+
+void PopulateRngStateAsync(void *rng_state_dst, const void *const seed, size_t q_max_seqlen,
+                           size_t kv_max_seqlen, NVTE_Fused_Attn_Backend backend,
+                           cudaStream_t stream);
+
+uint32_t GetRuntimeNumSegments(void *cu_seqlen, void *workspace, size_t len, cudaStream_t stream);
 
 }  // namespace fused_attn
 }  // namespace transformer_engine

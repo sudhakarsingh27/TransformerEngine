@@ -10,20 +10,26 @@ from typing import Optional
 
 import torch
 
-import transformer_engine_torch
-from ...constants import TE_DType
-from ...cpp_extensions import (
-    geglu as tex_geglu,
-    gelu as tex_gelu,
-    reglu as tex_reglu,
-    relu as tex_relu,
-    swiglu as tex_swiglu,
-    fp8_dswiglu_cast_transpose_fused,
-)
-from ...fp8 import FP8GlobalStateManager, get_fp8_te_dtype
-from ...tensor import Float8Tensor, QuantizedTensor
-from ...utils import clear_tensor_data, devices_match
+import transformer_engine_torch as tex
+from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload
+from ...tensor.float8_tensor import Float8CurrentScalingQuantizer, Quantizer
+from ...utils import clear_tensor_data
 from ..op import BasicOperation, OperationContext
+from .._common import maybe_dequantize
+
+__all__ = [
+    "GELU",
+    "GEGLU",
+    "QGELU",
+    "QGEGLU",
+    "ReLU",
+    "ReGLU",
+    "SReLU",
+    "SReGLU",
+    "SiLU",
+    "SwiGLU",
+    "ClampedSwiGLU",
+]
 
 
 class _ActivationOperation(BasicOperation, metaclass=abc.ABCMeta):
@@ -45,7 +51,19 @@ class _ActivationOperation(BasicOperation, metaclass=abc.ABCMeta):
        the first half of the input tensor, while PyTorch applies it to
        the second half.
 
+    Parameters
+    ----------
+    cache_quantized_input: bool, default = False
+        Quantize input tensor when caching for use in the backward
+        pass. This will typically reduce memory usage but require
+        extra compute and increase numerical error. This feature is
+        highly experimental.
+
     """
+
+    def __init__(self, *, cache_quantized_input: bool = False):
+        super().__init__()
+        self.cache_quantized_input: bool = cache_quantized_input
 
     @abc.abstractmethod
     def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
@@ -67,8 +85,8 @@ class _ActivationOperation(BasicOperation, metaclass=abc.ABCMeta):
         self,
         ctx: OperationContext,
         input_: torch.Tensor,
-        prev_op: Optional[BasicOperation] = None,
-        next_op: Optional[BasicOperation] = None,
+        prev_op_grad_output_quantizer: Optional[Quantizer],
+        next_op_input_quantizer: Optional[Quantizer],
     ) -> torch.Tensor:
 
         # Compute dtype
@@ -81,57 +99,24 @@ class _ActivationOperation(BasicOperation, metaclass=abc.ABCMeta):
             raise RuntimeError(f"Unsupported dtype ({dtype})")
 
         # Check input tensor
-        x = input_
-        if isinstance(x, QuantizedTensor):
-            x = x.dequantize()
-        if x.device.type != "cuda":
-            x = x.cuda()
-        if x.dtype != dtype:
-            x = x.to(dtype=dtype)
-        if not x.is_contiguous():
-            x = x.contiguous()
-
-        # Check if FP8 is enabled
-        fp8_enabled = FP8GlobalStateManager.is_fp8_enabled()
-        with_fp8_output = False
-        output_fp8_meta = None
-        output_dtype = TE_DType[dtype]
-        output_fp8_scale_inv = None
-        if fp8_enabled and next_op is not None and next_op.num_fp8_scales("input") > 0:
-            with_fp8_output = True
-            fp8_meta = next_op.get_fp8_meta("input")
-            fp8_meta_key = FP8GlobalStateManager.get_meta_tensor_key(forward=True)
-            output_fp8_meta = fp8_meta[fp8_meta_key]
-            output_dtype = get_fp8_te_dtype(fp8_meta["recipe"], fprop_tensor=True)
-            output_fp8_scale_inv = torch.empty([1], dtype=torch.float32, device=x.device)
+        x = maybe_dequantize(input_.contiguous(), dtype)
 
         # Launch kernel
-        y = self._activation_forward_impl(
-            x,
-            output_fp8_meta,
-            0,
-            output_dtype,
-            scale_inv=output_fp8_scale_inv,
-        )
+        y = self._activation_forward_impl(x, next_op_input_quantizer)
 
-        # Check output tensor
-        if y.dim() != x.dim():
-            y = y.reshape(list(x.shape[:-1]) + [-1])
-        if with_fp8_output:
-            y = Float8Tensor(
-                data=y,
-                fp8_meta=output_fp8_meta,
-                fp8_meta_forward=True,
-                fp8_meta_index=0,
-                fp8_dtype=output_dtype,
-                fp8_scale_inv=output_fp8_scale_inv,
-                dtype=dtype,
-            )
+        # Quantize input to FP8 before caching if needed
+        if self.cache_quantized_input:
+            input_quantizer = Float8CurrentScalingQuantizer(tex.DType.kFloat8E4M3, x.device)
+            input_quantizer.set_usage(rowwise=True, columnwise=False)
+            x = input_quantizer(x)
 
         # Save state for backward pass
-        ctx.save_for_backward(x)
-        ctx.fp8_enabled = fp8_enabled
-        ctx.prev_op = prev_op
+        if ctx.requires_grad:
+            if is_cpu_offload_enabled():
+                mark_activation_offload(x)
+            ctx.save_for_backward(x)
+            ctx.dtype = dtype
+            ctx.prev_op_grad_output_quantizer = prev_op_grad_output_quantizer
 
         return y
 
@@ -144,25 +129,17 @@ class _ActivationOperation(BasicOperation, metaclass=abc.ABCMeta):
         # Saved tensors from forward pass
         (x,) = ctx.saved_tensors
 
+        # Check input tensor
+        x = maybe_dequantize(x.contiguous(), ctx.dtype)
+
         # Check grad output tensor
-        dy = grad_output
-        if isinstance(dy, QuantizedTensor):
-            dy = dy.dequantize()
-        if not devices_match(dy.device, x.device) or dy.dtype != x.dtype:
-            dy = dy.to(device=x.device, dtype=x.dtype)
-        if not dy.is_contiguous():
-            dy = dy.contiguous()
+        dy = maybe_dequantize(grad_output.contiguous(), x.dtype)
 
         # Launch kernel
-        dx = self._activation_backward_impl(dy, x, TE_DType[x.dtype])
-
-        # Check grad input tensor
-        if dx.size() != x.size():
-            dx = dx.reshape(x.size())
+        dx = self._activation_backward_impl(dy, x, ctx.prev_op_grad_output_quantizer)
 
         # Clear input tensor if possible
-        if ctx.prev_op is not None:
-            clear_tensor_data(x)
+        clear_tensor_data(x)
 
         return dx, ()
 
@@ -181,30 +158,14 @@ class GELU(_ActivationOperation):
     """
 
     def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return tex_gelu(*args, **kwargs)
+        return tex.gelu(*args, **kwargs)
 
     def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return transformer_engine_torch.dgelu(*args, **kwargs)
-
-
-class ReLU(_ActivationOperation):
-    r"""Rectified linear unit
-
-    .. math::
-
-       \text{ReLU}(x) = \max(x,0)
-
-    """
-
-    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return tex_relu(*args, **kwargs)
-
-    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return transformer_engine_torch.drelu(*args, **kwargs)
+        return tex.dgelu(*args, **kwargs)
 
 
 class GEGLU(_ActivationOperation):
-    r"""Gaussian error gated linear unit
+    r"""Gaussian Error Gated Linear Unit
 
     The input tensor is split into chunks :math:`a` and :math:`b`
     along the last dimension and the following is computed:
@@ -232,14 +193,82 @@ class GEGLU(_ActivationOperation):
     """
 
     def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return tex_geglu(*args, **kwargs)
+        return tex.geglu(*args, **kwargs)
 
     def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return transformer_engine_torch.dgeglu(*args, **kwargs)
+        return tex.dgeglu(*args, **kwargs)
+
+
+class QGELU(_ActivationOperation):
+    r"""Quick Gaussian Error Linear Unit
+
+    Quick GELU from `HuggingFace<https://github.com/huggingface/transformers/blob/3e93dd295b5343557a83bc07b0b2ea64c926f9b4/src/transformers/activations.py#L90>`__
+    and `paper<https://github.com/hendrycks/GELUs>`__.
+
+    .. math::
+
+       \text{QGELU}(x) \approx x * \sigma(1.702 * x)
+
+    """
+
+    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.qgelu(*args, **kwargs)
+
+    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.dqgelu(*args, **kwargs)
+
+
+class QGEGLU(_ActivationOperation):
+    r"""Quick Gaussian Error Gated Linear Unit
+
+    The input tensor is split into chunks :math:`a` and :math:`b`
+    along the last dimension and the following is computed:
+
+    .. math::
+
+       \text{QGEGLU}(a,b) = \text{QGELU}(a) * b
+
+    where
+
+    .. math::
+
+       \text{QGELU}(x) \approx x * \sigma(1.702 * x)
+
+    .. warning::
+
+       Transformer Engine's gated activations and PyTorch's GLU
+       activation follow opposite conventions for :math:`a` and
+       :math:`b`. Transformer Engine applies the gating function to
+       the first half of the input tensor, while PyTorch applies it to
+       the second half.
+
+    """
+
+    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.qgeglu(*args, **kwargs)
+
+    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.dqgeglu(*args, **kwargs)
+
+
+class ReLU(_ActivationOperation):
+    r"""Rectified Linear Unit
+
+    .. math::
+
+       \text{ReLU}(x) = \max(x,0)
+
+    """
+
+    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.relu(*args, **kwargs)
+
+    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.drelu(*args, **kwargs)
 
 
 class ReGLU(_ActivationOperation):
-    r"""Rectified gated linear unit
+    r"""Rectified Gated Linear Unit
 
     The input tensor is split into chunks :math:`a` and :math:`b`
     along the last dimension and the following is computed:
@@ -261,10 +290,71 @@ class ReGLU(_ActivationOperation):
     """
 
     def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return tex_reglu(*args, **kwargs)
+        return tex.reglu(*args, **kwargs)
 
     def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return transformer_engine_torch.dreglu(*args, **kwargs)
+        return tex.dreglu(*args, **kwargs)
+
+
+class SReLU(_ActivationOperation):
+    r"""Squared Rectified Linear Unit
+
+    .. math::
+
+       \text{SReLU}(x) = \max(x^2,0)
+
+    See `Primer: Searching for Efficient Transformers for Language Modeling<https://arxiv.org/abs/2109.08668v2>`__.
+
+    """
+
+    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.srelu(*args, **kwargs)
+
+    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.dsrelu(*args, **kwargs)
+
+
+class SReGLU(_ActivationOperation):
+    r"""Squared Rectified Gated Linear Unit
+
+    The input tensor is split into chunks :math:`a` and :math:`b`
+    along the last dimension and the following is computed:
+
+    .. math::
+
+       \text{SReGLU}(a,b) = \max(a^2,0) * b
+
+    .. warning::
+
+       Transformer Engine's gated activations and PyTorch's GLU
+       activation follow opposite conventions for :math:`a` and
+       :math:`b`. Transformer Engine applies the gating function to
+       the first half of the input tensor, while PyTorch applies it to
+       the second half.
+
+    """
+
+    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.sreglu(*args, **kwargs)
+
+    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.dsreglu(*args, **kwargs)
+
+
+class SiLU(_ActivationOperation):
+    r"""Sigmoid Linear Unit
+
+    .. math::
+
+       \text{SiLU}(x) = x \sigma(x) = \frac{x}{1+\exp(-x)}
+
+    """
+
+    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.silu(*args, **kwargs)
+
+    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.dsilu(*args, **kwargs)
 
 
 class SwiGLU(_ActivationOperation):
@@ -299,92 +389,42 @@ class SwiGLU(_ActivationOperation):
     """
 
     def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return tex_swiglu(*args, **kwargs)
+        return tex.swiglu(*args, **kwargs)
 
     def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
-        return transformer_engine_torch.dswiglu(*args, **kwargs)
+        return tex.dswiglu(*args, **kwargs)
 
-    def op_backward(
-        self,
-        ctx: OperationContext,
-        grad_output: torch.Tensor,
-    ) -> tuple[torch.Tensor, tuple[()]]:
 
-        # Saved tensors from forward pass
-        (x,) = ctx.saved_tensors
+class ClampedSwiGLU(_ActivationOperation):
+    r"""GPT-OSS
+    Implementation based on `GPT-OSS<https://github.com/openai/gpt-oss/blob/a0a84273e9e0c14a233cb9befdfd159c2bcfa6cd/gpt_oss/torch/model.py#L250>`__.
 
-        # Tensor attributes
-        dtype = x.dtype
-        device = x.device
+    This activation has two differences compared to the original SwiGLU
+       1. Both gate and pre-activations are clipped based on parameter limit.
+       2. Activation uses sigmoid(alpha * x) instead of sigmoid(x) used in Swish activation.
 
-        # Check grad output tensor
-        dy = grad_output
-        if isinstance(dy, QuantizedTensor):
-            dy = dy.dequantize()
-        if not devices_match(dy.device, device) or dy.dtype != dtype:
-            dy = dy.to(device=device, dtype=dtype)
-        if not dy.is_contiguous():
-            dy = dy.contiguous()
+    .. warning::    The input tensor is chunked along the last dimension to get gates/pre-activations which is differnt
+    from GPT OSS implementation where the gates/pre-activations are assumed to be interleaved in the input tensor.
 
-        # Check if FP8 is enabled
-        with_fp8_grad_input = False
-        grad_input_fp8_meta = None
-        grad_input_dtype = TE_DType[dtype]
-        grad_input_fp8_scale_inv = None
-        if (
-            ctx.fp8_enabled
-            and ctx.prev_op is not None
-            and ctx.prev_op.num_fp8_scales("grad_output") > 0
-        ):
-            with_fp8_grad_input = True
-            fp8_meta = ctx.prev_op.get_fp8_meta("grad_output")
-            fp8_meta_key = FP8GlobalStateManager.get_meta_tensor_key(forward=False)
-            grad_input_fp8_meta = fp8_meta[fp8_meta_key]
-            grad_input_dtype = get_fp8_te_dtype(fp8_meta["recipe"], fprop_tensor=False)
-            grad_input_fp8_scale_inv = torch.empty([1], dtype=torch.float32, device=device)
+    Parameters
+    ----------
+    limit: float
+        The clamp limit.
+    alpha: float
+        The scaling factor for the sigmoid function used in the activation.
+    cache_quantized_input: bool, default = False
+        Quantize input tensor when caching for use in the backward pass.
+    """
 
-        # Launch kernel
-        if with_fp8_grad_input:
-            # Fused with FP8 cast-transpose
-            input_dims = x.size()
-            flat_input_dims = [x.numel() // input_dims[-1], input_dims[-1]]
-            flat_output_dims = [flat_input_dims[0], flat_input_dims[1] // 2]
-            dx = torch.empty(input_dims, dtype=torch.uint8, device=device)
-            dx_t = torch.empty(
-                (flat_input_dims[1], flat_input_dims[0]),
-                dtype=torch.uint8,
-                device=device,
-            )
-            fp8_dswiglu_cast_transpose_fused(
-                dy.reshape(flat_output_dims),
-                x.reshape(flat_input_dims),
-                grad_input=dx.reshape(flat_input_dims),
-                grad_input_transpose=dx_t,
-                otype=grad_input_dtype,
-                fp8_meta=grad_input_fp8_meta,
-                fp8_meta_index=0,
-                scale_inv=grad_input_fp8_scale_inv,
-            )
-            dx = Float8Tensor(
-                data=dx,
-                fp8_meta=grad_input_fp8_meta,
-                fp8_meta_forward=True,
-                fp8_meta_index=0,
-                fp8_dtype=grad_input_dtype,
-                fp8_scale_inv=grad_input_fp8_scale_inv,
-                dtype=dtype,
-            )
-            dx._transpose = dx_t
-            dx._transpose_invalid = False
-        else:
-            # Standard impl
-            dx = self._activation_backward_impl(dy, x, TE_DType[dtype])
-            if dx.size() != x.size():
-                dx = dx.reshape(x.size())
+    def __init__(
+        self, *, limit: float = 7.0, alpha: float = 1.702, cache_quantized_input: bool = False
+    ):
+        super().__init__(cache_quantized_input=cache_quantized_input)
+        self.limit = limit
+        self.alpha = alpha
 
-        # Note: This fails if op is preceeded by an identity op like Quantize(forward=False)
-        # # Clear input tensor if possible
-        # if ctx.prev_op is not None:
-        #     clear_tensor_data(x)
+    def _activation_forward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.clamped_swiglu(*args, limit=self.limit, alpha=self.alpha, **kwargs)
 
-        return dx, ()
+    def _activation_backward_impl(self, *args, **kwargs) -> torch.Tensor:
+        return tex.clamped_dswiglu(*args, limit=self.limit, alpha=self.alpha, **kwargs)

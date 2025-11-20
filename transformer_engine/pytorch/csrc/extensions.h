@@ -10,370 +10,283 @@
 #include <optional>
 
 #include "common.h"
-#include "common/common.h"
+
+class CommOverlapHelper;
+class CommOverlap;
+class CommOverlapP2P;
+
+namespace transformer_engine::pytorch {
+
+/***************************************************************************************************
+ * Router fusion
+ **************************************************************************************************/
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fwd(
+    at::Tensor logits, int topk, bool use_pre_softmax, c10::optional<int> num_groups,
+    c10::optional<int> group_topk, c10::optional<float> scaling_factor, std::string score_function,
+    c10::optional<at::Tensor> expert_bias);
+
+at::Tensor fused_topk_with_score_function_bwd(int num_tokens, int num_experts,
+                                              at::Tensor routing_map,
+                                              at::Tensor intermediate_output, at::Tensor grad_probs,
+                                              int topk, bool use_pre_softmax,
+                                              c10::optional<float> scaling_factor,
+                                              std::string score_function);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_score_for_moe_aux_loss_fwd(
+    at::Tensor logits, int topk, std::string score_function);
+
+at::Tensor fused_score_for_moe_aux_loss_bwd(int num_tokens, int num_experts,
+                                            at::Tensor intermediate_output, at::Tensor grad_probs,
+                                            int topk, std::string score_function);
+
+std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
+                                                          at::Tensor tokens_per_expert,
+                                                          int total_num_tokens, int num_experts,
+                                                          int num_rows, int num_cols, int topk,
+                                                          float coeff);
+
+at::Tensor fused_moe_aux_loss_bwd(at::Tensor Const_buf, at::Tensor tokens_per_expert, int num_rows,
+                                  int num_cols, at::Tensor grad_aux_loss);
 
 /***************************************************************************************************
  * Permutation
  **************************************************************************************************/
 
 std::tuple<at::Tensor, at::Tensor, std::vector<at::Tensor>> moe_permute_fwd(
-    at::Tensor input, const transformer_engine::DType dtype, at::Tensor indices,
-    int64_t num_out_tokens, std::vector<at::Tensor> workspace, int64_t max_expanded_token_num);
+    at::Tensor input, const DType dtype, at::Tensor indices, int64_t num_out_tokens,
+    std::vector<at::Tensor> workspace, int64_t max_expanded_token_num);
 
-at::Tensor moe_permute_bwd(at::Tensor input, const transformer_engine::DType dtype,
-                           at::Tensor row_id_map, at::Tensor prob, int64_t num_tokens,
-                           int64_t topK);
+at::Tensor moe_permute_bwd(at::Tensor input, const DType dtype, at::Tensor row_id_map,
+                           at::Tensor prob, int64_t num_tokens, int64_t topK);
 
-at::Tensor moe_unpermute_fwd(at::Tensor input, const transformer_engine::DType dtype,
-                             at::Tensor row_id_map, at::Tensor prob, int64_t num_tokens,
-                             int64_t topK);
+at::Tensor moe_unpermute_fwd(at::Tensor input, const DType dtype, at::Tensor row_id_map,
+                             at::Tensor prob, int64_t num_tokens, int64_t topK);
 
 std::tuple<at::Tensor, at::Tensor> moe_unpermute_bwd(at::Tensor input_bwd, at::Tensor input_fwd,
-                                                     const transformer_engine::DType dtype,
-                                                     at::Tensor row_id_map, at::Tensor prob);
+                                                     const DType dtype, at::Tensor row_id_map,
+                                                     at::Tensor prob);
 
 /***************************************************************************************************
  * Attention
  **************************************************************************************************/
 
-NVTE_Fused_Attn_Backend get_fused_attn_backend(const transformer_engine::DType q_dtype,
-                                               const transformer_engine::DType kv_dtype,
-                                               NVTE_QKV_Layout qkv_layout, NVTE_Bias_Type bias_type,
-                                               NVTE_Mask_Type attn_mask_type, float p_dropout,
-                                               size_t num_attn_heads, size_t num_gqa_groups,
-                                               size_t max_seqlen_q, size_t max_seqlen_kv,
-                                               size_t head_dim_qk, size_t head_dim_v,
-                                               int64_t window_size_left, int64_t window_size_right);
+NVTE_Fused_Attn_Backend get_fused_attn_backend(
+    bool is_training, const DType q_dtype, const DType kv_dtype, NVTE_QKV_Layout qkv_layout,
+    NVTE_Bias_Type bias_type, NVTE_Mask_Type attn_mask_type, NVTE_Softmax_Type softmax_type,
+    float p_dropout, size_t num_attn_heads, size_t num_gqa_groups, size_t max_seqlen_q,
+    size_t max_seqlen_kv, size_t head_dim_qk, size_t head_dim_v, int64_t window_size_left,
+    int64_t window_size_right, bool return_max_logit, bool cuda_graph);
 
-std::vector<at::Tensor> fused_attn_fwd_qkvpacked(
-    size_t max_seqlen, bool is_training, float attn_scale, float p_dropout, bool set_zero,
-    NVTE_QKV_Layout qkv_layout, NVTE_Bias_Type bias_type, NVTE_Mask_Type attn_mask_type,
-    const std::vector<int64_t> window_size, bool bottom_right_diagonal, const at::Tensor cu_seqlens,
-    const at::Tensor QKV, const transformer_engine::DType qkv_type,
-    const c10::optional<at::Tensor> cu_seqlens_padded, const c10::optional<at::Tensor> descale_QKV,
-    const int descale_QKV_offset, const c10::optional<at::Tensor> descale_S,
-    const int descale_S_offset, const c10::optional<at::Tensor> scale_S, const int scale_S_offset,
-    const c10::optional<at::Tensor> scale_O, const int scale_O_offset,
-    c10::optional<at::Tensor> amax_S, const int amax_S_offset, c10::optional<at::Tensor> amax_O,
-    const int amax_O_offset, const c10::optional<at::Tensor> Bias,
-    const c10::optional<at::Generator> rng_gen, size_t rng_elts_per_thread);
+std::pair<TensorWrapper, py::object> quantizer_helper(py::handle quantizer,
+                                                      const std::vector<size_t> &shape, DType dtype,
+                                                      bool create_hp_tensor_for_cs,
+                                                      std::optional<at::Tensor> data);
 
-std::vector<at::Tensor> fused_attn_bwd_qkvpacked(
-    size_t max_seqlen, float attn_scale, float p_dropout, bool set_zero, NVTE_QKV_Layout qkv_layout,
-    NVTE_Bias_Type bias_type, NVTE_Mask_Type attn_mask_type, const std::vector<int64_t> window_size,
-    bool bottom_right_diagonal, bool deterministic, const at::Tensor cu_seqlens,
-    const at::Tensor QKV, const at::Tensor O, const at::Tensor dO,
-    const transformer_engine::DType qkv_type, const transformer_engine::DType dqkv_type,
-    const std::vector<at::Tensor> Aux_CTX_Tensors,
-    const c10::optional<at::Tensor> cu_seqlens_padded, const c10::optional<at::Tensor> descale_QKV,
-    const c10::optional<at::Tensor> descale_S, const c10::optional<at::Tensor> descale_O,
-    const c10::optional<at::Tensor> descale_dO, const c10::optional<at::Tensor> descale_dP,
-    const c10::optional<at::Tensor> scale_S, const c10::optional<at::Tensor> scale_dP,
-    const c10::optional<at::Tensor> scale_dQKV, c10::optional<at::Tensor> amax_dP,
-    c10::optional<at::Tensor> amax_dQKV);
-
-std::vector<at::Tensor> fused_attn_fwd_kvpacked(
+std::vector<py::object> fused_attn_fwd(
     size_t max_seqlen_q, size_t max_seqlen_kv, bool is_training, float attn_scale, float p_dropout,
     bool set_zero, NVTE_QKV_Layout qkv_layout, NVTE_Bias_Type bias_type,
-    NVTE_Mask_Type attn_mask_type, const std::vector<int64_t> window_size,
-    bool bottom_right_diagonal, const at::Tensor cu_seqlens_q, const at::Tensor cu_seqlens_kv,
-    const at::Tensor Q, const at::Tensor KV, const transformer_engine::DType qkv_type,
-    const c10::optional<at::Tensor> cu_seqlens_q_padded,
-    const c10::optional<at::Tensor> cu_seqlens_kv_padded,
-    const c10::optional<at::Tensor> descale_QKV, const int descale_QKV_offset,
-    const c10::optional<at::Tensor> descale_S, const int descale_S_offset,
-    const c10::optional<at::Tensor> scale_S, const int scale_S_offset,
-    const c10::optional<at::Tensor> scale_O, const int scale_O_offset,
-    c10::optional<at::Tensor> amax_S, const int amax_S_offset, c10::optional<at::Tensor> amax_O,
-    const int amax_O_offset, const c10::optional<at::Tensor> Bias,
-    const c10::optional<at::Generator> rng_gen, size_t rng_elts_per_thread);
+    NVTE_Mask_Type attn_mask_type, NVTE_Softmax_Type softmax_type,
+    const std::vector<int64_t> window_size, bool bottom_right_diagonal, const at::Tensor cu_seqlens_q,
+    const at::Tensor cu_seqlens_kv, const py::handle Q, const py::handle K, const py::handle V,
+    const at::ScalarType fake_dtype, const std::optional<at::Tensor> cu_seqlens_q_padded,
+    const std::optional<at::Tensor> cu_seqlens_kv_padded,
+    const std::optional<at::Tensor> page_table_k, const std::optional<at::Tensor> page_table_v,
+    py::handle s_quantizer, py::handle o_quantizer, const std::optional<at::Tensor> Bias,
+    const std::optional<at::Tensor> SoftmaxOffset, const std::optional<at::Generator> rng_gen,
+    size_t rng_elts_per_thread, bool return_max_logit, bool cuda_graph);
 
-std::vector<at::Tensor> fused_attn_bwd_kvpacked(
+std::vector<py::object> fused_attn_bwd(
     size_t max_seqlen_q, size_t max_seqlen_kv, float attn_scale, float p_dropout, bool set_zero,
     NVTE_QKV_Layout qkv_layout, NVTE_Bias_Type bias_type, NVTE_Mask_Type attn_mask_type,
-    const std::vector<int64_t> window_size, bool bottom_right_diagonal, bool deterministic,
-    const at::Tensor cu_seqlens_q, const at::Tensor cu_seqlens_kv, const at::Tensor Q,
-    const at::Tensor KV, const at::Tensor O, const at::Tensor dO,
-    const transformer_engine::DType qkv_type, const transformer_engine::DType dqkv_type,
+    NVTE_Softmax_Type softmax_type, const std::vector<int64_t> window_size, bool bottom_right_diagonal,
+    bool deterministic, const at::Tensor cu_seqlens_q, const at::Tensor cu_seqlens_kv,
+    const py::handle Q, const py::handle K, const py::handle V, const py::handle O, const py::handle dO,
+    const at::ScalarType fake_dtype, const DType dqkv_type,
     const std::vector<at::Tensor> Aux_CTX_Tensors,
-    const c10::optional<at::Tensor> cu_seqlens_q_padded,
-    const c10::optional<at::Tensor> cu_seqlens_kv_padded,
-    const c10::optional<at::Tensor> descale_QKV, const c10::optional<at::Tensor> descale_S,
-    const c10::optional<at::Tensor> descale_O, const c10::optional<at::Tensor> descale_dO,
-    const c10::optional<at::Tensor> descale_dP, const c10::optional<at::Tensor> scale_S,
-    const c10::optional<at::Tensor> scale_dP, const c10::optional<at::Tensor> scale_dQKV,
-    c10::optional<at::Tensor> amax_dP, c10::optional<at::Tensor> amax_dQKV);
-
-std::vector<at::Tensor> fused_attn_fwd(
-    size_t max_seqlen_q, size_t max_seqlen_kv, bool is_training, float attn_scale, float p_dropout,
-    bool set_zero, NVTE_QKV_Layout qkv_layout, NVTE_Bias_Type bias_type,
-    NVTE_Mask_Type attn_mask_type, const std::vector<int64_t> window_size,
-    bool bottom_right_diagonal, const at::Tensor cu_seqlens_q, const at::Tensor cu_seqlens_kv,
-    const at::Tensor Q, const at::Tensor K, const at::Tensor V,
-    const transformer_engine::DType qkv_type, const c10::optional<at::Tensor> cu_seqlens_q_padded,
-    const c10::optional<at::Tensor> cu_seqlens_kv_padded,
-    const c10::optional<at::Tensor> descale_QKV, const int descale_QKV_offset,
-    const c10::optional<at::Tensor> descale_S, const int descale_S_offset,
-    const c10::optional<at::Tensor> scale_S, const int scale_S_offset,
-    const c10::optional<at::Tensor> scale_O, const int scale_O_offset,
-    c10::optional<at::Tensor> amax_S, const int amax_S_offset, c10::optional<at::Tensor> amax_O,
-    const int amax_O_offset, const c10::optional<at::Tensor> Bias,
-    const c10::optional<at::Generator> rng_gen, size_t rng_elts_per_thread);
-
-std::vector<at::Tensor> fused_attn_bwd(
-    size_t max_seqlen_q, size_t max_seqlen_kv, float attn_scale, float p_dropout, bool set_zero,
-    NVTE_QKV_Layout qkv_layout, NVTE_Bias_Type bias_type, NVTE_Mask_Type attn_mask_type,
-    const std::vector<int64_t> window_size, bool bottom_right_diagonal, bool deterministic,
-    const at::Tensor cu_seqlens_q, const at::Tensor cu_seqlens_kv, const at::Tensor Q,
-    const at::Tensor K, const at::Tensor V, const at::Tensor O, const at::Tensor dO,
-    const transformer_engine::DType qkv_type, const transformer_engine::DType dqkv_type,
-    const std::vector<at::Tensor> Aux_CTX_Tensors,
-    const c10::optional<at::Tensor> cu_seqlens_q_padded,
-    const c10::optional<at::Tensor> cu_seqlens_kv_padded,
-    const c10::optional<at::Tensor> descale_QKV, const c10::optional<at::Tensor> descale_S,
-    const c10::optional<at::Tensor> descale_O, const c10::optional<at::Tensor> descale_dO,
-    const c10::optional<at::Tensor> descale_dP, const c10::optional<at::Tensor> scale_S,
-    const c10::optional<at::Tensor> scale_dP, const c10::optional<at::Tensor> scale_dQKV,
-    c10::optional<at::Tensor> amax_dP, c10::optional<at::Tensor> amax_dQKV);
+    const std::optional<at::Tensor> cu_seqlens_q_padded,
+    const std::optional<at::Tensor> cu_seqlens_kv_padded, py::handle s_quantizer,
+    py::handle dp_quantizer, py::handle dqkv_quantizer, bool cuda_graph);
 
 at::Tensor fa_prepare_fwd(at::Tensor qkvi);
 at::Tensor fa_prepare_bwd(at::Tensor q, at::Tensor k, at::Tensor v);
+
+at::Tensor convert_thd_to_bshd(at::Tensor tensor, at::Tensor cu_seqlens, int b, int max_seq_len);
+at::Tensor convert_bshd_to_thd(at::Tensor tensor, at::Tensor cu_seqlens, int t);
+void copy_to_kv_cache(at::Tensor new_k, at::Tensor new_v, at::Tensor k_cache, at::Tensor v_cache,
+                      at::Tensor page_table, at::Tensor cu_new_lens, at::Tensor cu_cached_lens,
+                      NVTE_QKV_Format kv_format, int b, int max_ctx_len, int max_seq_len,
+                      int max_pages_per_seq, bool is_non_paged);
 
 /***************************************************************************************************
  * GEMM
  **************************************************************************************************/
 
-void te_gemm(at::Tensor A, at::Tensor A_scale_inverse, transformer_engine::DType A_type,
-             bool transa, at::Tensor B, at::Tensor B_scale_inverse,
-             transformer_engine::DType B_type, bool transb, at::Tensor D, at::Tensor D_scale,
-             transformer_engine::DType D_type, at::Tensor D_amax, at::Tensor bias,
-             transformer_engine::DType bias_type, at::Tensor pre_gelu_out, bool grad,
-             at::Tensor workspace, size_t workspaceSize, bool accumulate,
-             bool use_split_accumulator, int math_sm_count);
+using MaybeTensor = std::optional<at::Tensor>;
 
-void te_atomic_gemm(at::Tensor A, at::Tensor A_scale_inverse, transformer_engine::DType A_type,
-                    bool transa, at::Tensor B, at::Tensor B_scale_inverse,
-                    transformer_engine::DType B_type, bool transb, at::Tensor D, at::Tensor D_scale,
-                    transformer_engine::DType D_type, at::Tensor D_amax, at::Tensor bias,
-                    transformer_engine::DType bias_type, at::Tensor pre_gelu_out, bool grad,
+std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool transb, py::object D,
+                             py::handle quantizer, std::optional<DType> out_dtype, MaybeTensor bias,
+                             DType bias_type, bool gelu, MaybeTensor gelu_in, bool grad,
+                             at::Tensor workspace, size_t workspaceSize, bool accumulate,
+                             bool use_split_accumulator, CommOverlapCore *comm_overlap = nullptr,
+                             std::optional<CommOverlapType> comm_type = std::nullopt,
+                             MaybeTensor extra_output = std::nullopt, bool bulk_overlap = false,
+                             float alpha = 1.0f, std::optional<float> beta = std::nullopt);
+
+void te_atomic_gemm(at::Tensor A, at::Tensor A_scale_inverse, DType A_type,
+                    std::vector<int64_t> A_scaling_mode, bool transa, at::Tensor B,
+                    at::Tensor B_scale_inverse, DType B_type, std::vector<int64_t> B_scaling_mode,
+                    bool transb, at::Tensor D, at::Tensor D_scale, DType D_type, at::Tensor D_amax,
+                    at::Tensor bias, DType bias_type, at::Tensor pre_gelu_out, bool grad,
                     at::Tensor workspace, size_t workspaceSize, bool accumulate,
                     bool use_split_accumulator, int math_sm_count, int m_split, int n_split,
                     bool gemm_producer, at::Tensor counter);
 
-void te_grouped_gemm(std::vector<at::Tensor> A, at::Tensor A_scale_inverse, int A_offset,
-                     transformer_engine::DType A_type, bool transa, std::vector<at::Tensor> B,
-                     at::Tensor B_scale_inverse, int B_offset, transformer_engine::DType B_type,
-                     bool transb, std::vector<at::Tensor> D, int D_offset, at::Tensor D_scale,
-                     transformer_engine::DType D_type, at::Tensor D_amax,
-                     std::vector<at::Tensor> bias, transformer_engine::DType bias_type,
-                     std::vector<at::Tensor> pre_gelu_out, bool grad,
-                     std::vector<at::Tensor> workspace, size_t workspaceSize, bool accumulate,
-                     bool use_split_accumulator, int math_sm_count);
-
-void te_grouped_gemm_single_output(
-    std::vector<at::Tensor> A, std::vector<at::Tensor> A_scale_inverse, int A_offset,
-    transformer_engine::DType A_type, bool transa, std::vector<at::Tensor> B,
-    at::Tensor B_scale_inverse, int B_offset, transformer_engine::DType B_type, bool transb,
-    std::vector<int64_t> m_splits, at::Tensor D, int D_offset, at::Tensor D_scale,
-    transformer_engine::DType D_type, at::Tensor D_amax, std::vector<at::Tensor> bias,
-    transformer_engine::DType bias_type, std::vector<at::Tensor> pre_gelu_out, bool grad,
-    std::vector<at::Tensor> workspace, size_t workspaceSize, bool accumulate,
-    bool use_split_accumulator, int math_sm_count);
+std::optional<std::vector<at::Tensor>> te_general_grouped_gemm(
+    std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
+    std::optional<std::vector<at::Tensor>> D, DType D_type, std::vector<int64_t> m_splits,
+    std::vector<at::Tensor> bias, DType bias_type, bool single_output,
+    std::vector<at::Tensor> pre_gelu_out, bool grad, std::vector<at::Tensor> workspace,
+    size_t workspaceSize, bool accumulate, bool use_split_accumulator, int math_sm_count);
 
 /***************************************************************************************************
  * Transpose
  **************************************************************************************************/
 
-void fused_cast_transpose(at::Tensor input, at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-                          at::Tensor input_cast, at::Tensor input_transpose,
-                          transformer_engine::DType otype);
+at::Tensor fp8_transpose(at::Tensor input, DType otype,
+                         std::optional<at::Tensor> output = std::nullopt);
 
-void fused_cast_transpose_noop(at::Tensor input, at::Tensor noop, at::Tensor scale, at::Tensor amax,
-                               at::Tensor scale_inv, at::Tensor input_cast,
-                               at::Tensor input_transpose, transformer_engine::DType otype,
-                               int scale_offset = 0, int amax_offset = 0, int scale_inv_offset = 0);
-
-std::vector<at::Tensor> fused_cast_transpose_bgrad(at::Tensor grad_output, at::Tensor scale,
-                                                   at::Tensor amax, at::Tensor scale_inv,
-                                                   transformer_engine::DType otype,
-                                                   int scale_offset = 0, int amax_offset = 0,
-                                                   int scale_inv_offset = 0);
-
-std::vector<at::Tensor> fused_fp8_transpose_bgrad(at::Tensor grad_output, at::Tensor scale,
-                                                  at::Tensor amax, at::Tensor scale_inv,
-                                                  transformer_engine::DType otype,
-                                                  transformer_engine::DType grad_bias_type,
-                                                  int scale_offset = 0, int amax_offset = 0,
-                                                  int scale_inv_offset = 0);
-
-std::vector<at::Tensor> fused_cast_transpose_bgrad_dgelu(at::Tensor grad_output,
-                                                         at::Tensor gelu_input, at::Tensor scale,
-                                                         at::Tensor amax, at::Tensor scale_inv,
-                                                         transformer_engine::DType otype,
-                                                         int scale_offset = 0, int amax_offset = 0,
-                                                         int scale_inv_offset = 0);
-
-void fused_dswiglu_cast_transpose(at::Tensor grad_output, at::Tensor input, at::Tensor grad_input,
-                                  at::Tensor grad_input_transpose, at::Tensor scale,
-                                  at::Tensor amax, at::Tensor scale_inv,
-                                  transformer_engine::DType otype, int scale_offset = 0,
-                                  int amax_offset = 0, int scale_inv_offset = 0);
-
-void fused_multi_cast_transpose(std::vector<at::Tensor> input_list,
-                                std::vector<at::Tensor> scale_list,
-                                std::vector<at::Tensor> cast_output_list,
-                                std::vector<at::Tensor> transposed_output_list,
-                                std::vector<at::Tensor> amax_output_list,
-                                std::vector<at::Tensor> scale_inv_output_list,
-                                transformer_engine::DType otype);
-
-std::tuple<std::vector<at::Tensor>, std::vector<at::Tensor>> fused_multi_cast_transpose_alloc(
-    std::vector<at::Tensor> input_list, at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-    std::vector<int> scale_indices, std::vector<int> amax_indices,
-    std::vector<int> scale_inv_indices, transformer_engine::DType otype);
-
-at::Tensor fp8_transpose(at::Tensor input, transformer_engine::DType otype);
-
-void fp8_transpose_noalloc(at::Tensor input, at::Tensor output, transformer_engine::DType otype);
-
-void fp8_transpose_noalloc_noop(at::Tensor input, at::Tensor output, at::Tensor noop,
-                                transformer_engine::DType otype);
+at::Tensor swap_first_dims(at::Tensor tensor, std::optional<at::Tensor> out = std::nullopt);
 
 /***************************************************************************************************
  * Activations
  **************************************************************************************************/
 
-at::Tensor gelu(at::Tensor input, at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-                transformer_engine::DType otype);
+/* GELU and variants*/
+py::object gelu(const at::Tensor &input, py::handle quantizer);
 
-at::Tensor relu(at::Tensor input, at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-                transformer_engine::DType otype);
+py::object dgelu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
-at::Tensor geglu(at::Tensor input, at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-                 transformer_engine::DType otype);
+py::object geglu(const at::Tensor &input, py::handle quantizer);
 
-at::Tensor reglu(at::Tensor input, at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-                 transformer_engine::DType otype);
+py::object dgeglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
-at::Tensor swiglu(at::Tensor input, at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-                  transformer_engine::DType otype);
+py::object qgelu(const at::Tensor &input, py::handle quantizer);
 
-at::Tensor qgelu(at::Tensor input, at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-                 transformer_engine::DType otype);
+py::object dqgelu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
-at::Tensor srelu(at::Tensor input, at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-                 transformer_engine::DType otype);
+py::object qgeglu(const at::Tensor &input, py::handle quantizer);
 
-at::Tensor dgelu(at::Tensor grad, at::Tensor input, transformer_engine::DType otype);
+py::object dqgeglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
-at::Tensor drelu(at::Tensor grad, at::Tensor input, transformer_engine::DType otype);
+/* ReLU and variants*/
+py::object relu(const at::Tensor &input, py::handle quantizer);
 
-at::Tensor dgeglu(at::Tensor grad, at::Tensor input, transformer_engine::DType otype);
+py::object drelu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
-at::Tensor dreglu(at::Tensor grad, at::Tensor input, transformer_engine::DType otype);
+py::object reglu(const at::Tensor &input, py::handle quantizer);
 
-at::Tensor dswiglu(at::Tensor grad, at::Tensor input, transformer_engine::DType otype);
+py::object dreglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
-at::Tensor dqgelu(at::Tensor grad, at::Tensor input, transformer_engine::DType otype);
+py::object srelu(const at::Tensor &input, py::handle quantizer);
 
-at::Tensor dsrelu(at::Tensor grad, at::Tensor input, transformer_engine::DType otype);
+py::object dsrelu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
 
+py::object sreglu(const at::Tensor &input, py::handle quantizer);
+
+py::object dsreglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
+
+/* Silu and variants*/
+py::object silu(const at::Tensor &input, py::handle quantizer);
+
+py::object dsilu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
+
+py::object swiglu(const at::Tensor &input, py::handle quantizer);
+
+py::object dswiglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer);
+
+py::object clamped_swiglu(const at::Tensor &input, py::handle quantizer, float limit, float alpha);
+
+py::object clamped_dswiglu(const at::Tensor &grad, const at::Tensor &input, py::handle quantizer,
+                           float limit, float alpha);
 /***************************************************************************************************
  * LayerNorm
  **************************************************************************************************/
 
-std::vector<at::Tensor> layernorm_bwd(const at::Tensor &dz, const at::Tensor &x,
+std::vector<py::object> layernorm_bwd(const at::Tensor &dz, const at::Tensor &x,
                                       const at::Tensor &mu, const at::Tensor &rsigma,
                                       const at::Tensor &gamma, const int sm_margin,
                                       const bool zero_centered_gamma);
 
-std::vector<at::Tensor> layernorm_fwd_fp8(const at::Tensor &input, const at::Tensor &weight,
-                                          const at::Tensor &bias, float eps, at::Tensor scale,
-                                          at::Tensor amax, at::Tensor scale_inv,
-                                          transformer_engine::DType otype, const int sm_margin,
-                                          const bool zero_centered_gamma,
-                                          const int scale_offset = 0, const int amax_offset = 0,
-                                          const int scale_inv_offset = 0);
-
-std::vector<at::Tensor> layernorm_fwd_fp8_noalloc(
-    const at::Tensor &input, const at::Tensor &weight, const at::Tensor &bias, float eps,
-    at::Tensor scale, at::Tensor ln_out, at::Tensor amax, at::Tensor scale_inv,
-    transformer_engine::DType otype, const int sm_margin, const bool zero_centered_gamma,
-    const int scale_offset = 0, const int amax_offset = 0, const int scale_inv_offset = 0);
-
-at::Tensor layernorm_fwd_fp8_inf(const at::Tensor &input, const at::Tensor &weight,
-                                 const at::Tensor &bias, float eps, at::Tensor scale,
-                                 at::Tensor amax, at::Tensor scale_inv,
-                                 transformer_engine::DType otype, const int sm_margin,
-                                 const bool zero_centered_gamma, const int scale_offset = 0,
-                                 const int amax_offset = 0, const int scale_inv_offset = 0);
-
-std::vector<at::Tensor> layernorm_fwd(const at::Tensor &input, const at::Tensor &weight,
-                                      const at::Tensor &bias, float eps, const int sm_margin,
+std::vector<py::object> layernorm_fwd(py::handle input, py::handle weight, MaybeTensor bias,
+                                      float eps, py::object ln_out, py::handle quantizer,
+                                      DType out_dtype, const int sm_margin,
                                       const bool zero_centered_gamma);
-
-std::vector<at::Tensor> layernorm_fwd_noalloc(const at::Tensor &input, const at::Tensor &weight,
-                                              const at::Tensor &bias, at::Tensor ln_out, float eps,
-                                              const int sm_margin, const bool zero_centered_gamma);
-
-at::Tensor layernorm_fwd_inf(const at::Tensor &input, const at::Tensor &weight,
-                             const at::Tensor &bias, float eps, const int sm_margin,
-                             const bool zero_centered_gamma);
 
 /***************************************************************************************************
  * RMSNorm
  **************************************************************************************************/
 
-std::vector<at::Tensor> rmsnorm_bwd(const at::Tensor &dz, const at::Tensor &x,
+std::vector<py::object> rmsnorm_bwd(const at::Tensor &dz, const at::Tensor &x,
                                     const at::Tensor &rsigma, const at::Tensor &gamma,
                                     const int sm_margin, const bool zero_centered_gamma);
 
-std::vector<at::Tensor> rmsnorm_fwd_fp8(const at::Tensor &input, const at::Tensor &weight,
-                                        float eps, at::Tensor scale, at::Tensor amax,
-                                        at::Tensor scale_inv, transformer_engine::DType otype,
-                                        const int sm_margin, const bool zero_centered_gamma,
-                                        const int scale_offset = 0, const int amax_offset = 0,
-                                        const int scale_inv_offset = 0);
+std::vector<py::object> rmsnorm_bwd_add(const at::Tensor &dz, const at::Tensor &x,
+                                        const at::Tensor &add, const at::Tensor &rsigma,
+                                        const at::Tensor &gamma, const int sm_margin,
+                                        const bool zero_centered_gamma);
 
-std::vector<at::Tensor> rmsnorm_fwd_fp8_noalloc(
-    const at::Tensor &input, const at::Tensor &weight, float eps, at::Tensor scale,
-    at::Tensor ln_out, at::Tensor amax, at::Tensor scale_inv, transformer_engine::DType otype,
-    const int sm_margin, const bool zero_centered_gamma, const int scale_offset = 0,
-    const int amax_offset = 0, const int scale_inv_offset = 0);
-
-at::Tensor rmsnorm_fwd_fp8_inf(const at::Tensor &input, const at::Tensor &weight, float eps,
-                               at::Tensor scale, at::Tensor amax, at::Tensor scale_inv,
-                               transformer_engine::DType otype, const int sm_margin,
-                               const bool zero_centered_gamma, const int scale_offset = 0,
-                               const int amax_offset = 0, const int scale_inv_offset = 0);
-
-std::vector<at::Tensor> rmsnorm_fwd(const at::Tensor &input, const at::Tensor &weight, float eps,
+std::vector<py::object> rmsnorm_fwd(const py::handle &input, const py::handle &weight, float eps,
+                                    py::object ln_out, py::handle quantizer, DType otype,
                                     const int sm_margin, const bool zero_centered_gamma);
-
-std::vector<at::Tensor> rmsnorm_fwd_noalloc(const at::Tensor &input, const at::Tensor &weight,
-                                            at::Tensor ln_out, float eps, const int sm_margin,
-                                            const bool zero_centered_gamma);
-
-at::Tensor rmsnorm_fwd_inf(const at::Tensor &input, const at::Tensor &weight, float eps,
-                           const int sm_margin, const bool zero_centered_gamma);
 
 /***************************************************************************************************
  * Cast
  **************************************************************************************************/
 
-at::Tensor cast_to_fp8(const at::Tensor &input, const at::Tensor &scale, at::Tensor amax,
-                       at::Tensor scale_inv, transformer_engine::DType otype,
-                       const int scale_offset = 0, const int amax_offset = 0,
-                       const int scale_inv_offset = 0);
+py::object quantize(const at::Tensor &tensor, py::handle quantizer, const py::object &output,
+                    std::optional<at::Tensor> noop_flag);
 
-void cast_to_fp8_noalloc(const at::Tensor &input, const at::Tensor &scale, at::Tensor output,
-                         at::Tensor amax, at::Tensor scale_inv, transformer_engine::DType otype,
-                         const int scale_offset = 0, const int amax_offset = 0,
-                         const int scale_inv_offset = 0);
+py::object dequantize(const py::handle &input, DType otype);
 
-at::Tensor cast_from_fp8(const at::Tensor &input, const at::Tensor &scale_inv,
-                         transformer_engine::DType itype, transformer_engine::DType otype,
-                         const int scale_inv_offset = 0);
+std::vector<py::object> multi_tensor_quantize(const std::vector<at::Tensor> &tensor_list,
+                                              std::vector<py::handle> quantizer_list);
+
+std::vector<py::object> split_quantize(const at::Tensor &tensor,
+                                       const std::vector<int> &split_sections,
+                                       std::vector<py::handle> quantizer_list);
+
+/***************************************************************************************************
+ * Bias gradient fusions
+ **************************************************************************************************/
+
+std::vector<py::object> bgrad_quantize(const at::Tensor &input, py::handle py_quantizer);
+
+std::vector<py::object> dbias_dgelu(const at::Tensor &grad_output, const at::Tensor &act_input,
+                                    py::handle quantizer);
+
+std::vector<py::object> dbias_dsilu(const at::Tensor &grad_output, const at::Tensor &act_input,
+                                    py::handle quantizer);
+
+std::vector<py::object> dbias_drelu(const at::Tensor &grad_output, const at::Tensor &act_input,
+                                    py::handle quantizer);
+
+std::vector<py::object> dbias_dqgelu(const at::Tensor &grad_output, const at::Tensor &act_input,
+                                     py::handle quantizer);
+
+std::vector<py::object> dbias_dsrelu(const at::Tensor &grad_output, const at::Tensor &act_input,
+                                     py::handle quantizer);
+
+/***************************************************************************************************
+ * Dropout
+ **************************************************************************************************/
+
+std::vector<py::object> dropout_fwd(const py::handle &input, const float dropout_probability,
+                                    std::optional<at::Tensor> out = std::nullopt);
+
+py::object dropout_bwd(const at::Tensor &grad_output, const at::Tensor &mask,
+                       const float dropout_probability,
+                       std::optional<at::Tensor> grad_input = std::nullopt);
 
 /***************************************************************************************************
  * Softmax
@@ -405,28 +318,50 @@ at::Tensor scaled_aligned_causal_masked_softmax_backward(at::Tensor output_grads
  * FP8 recipe
  **************************************************************************************************/
 
+void compute_amax(const at::Tensor &tensor, at::Tensor &amax);
+
 void fused_amax_and_scale_update_after_reduction(const at::Tensor &amax_reduction_buffer,
                                                  std::vector<at::Tensor> amax_histories,
                                                  std::vector<at::Tensor> scales,
-                                                 std::vector<at::Tensor> scale_invs,
                                                  const std::string &amax_compute_algo,
-                                                 transformer_engine::DType fp8_dtype, float margin);
+                                                 DType fp8_dtype, float margin);
+
+// Note that the start_offset is the logical offset along the tensor dimension.
+// The offset in bytes is start_offset * sizeof(tensor.dtype)
+void fp8_block_scaling_compute_partial_amax(const at::Tensor &tensor, at::Tensor amax, size_t h,
+                                            size_t w, size_t start_offset, size_t block_len);
+
+void fp8_block_scaling_partial_cast(const at::Tensor &inp, at::Tensor out, const at::Tensor &scale,
+                                    size_t h, size_t w, size_t start_offset, size_t block_len,
+                                    const DType out_dtype);
 
 /***************************************************************************************************
  * Rotary positional embedding
  **************************************************************************************************/
 
 at::Tensor fused_rope_forward(const at::Tensor &input, const at::Tensor &freqs,
-                              const bool transpose_output_memory);
+                              const std::optional<at::Tensor> start_positions,
+                              const NVTE_QKV_Format qkv_format, const bool interleaved,
+                              const std::optional<at::Tensor> cu_seqlens, const int cp_size,
+                              const int cp_rank);
 
 at::Tensor fused_rope_backward(const at::Tensor &output_grads, const at::Tensor &freqs,
-                               const bool transpose_output_memory);
+                               const std::optional<at::Tensor> start_positions,
+                               const NVTE_QKV_Format qkv_format, const bool interleaved,
+                               const std::optional<at::Tensor> cu_seqlens, const int cp_size,
+                               const int cp_rank);
 
-at::Tensor fused_rope_thd_forward(const at::Tensor &input, const at::Tensor &cu_seqlens,
-                                  const at::Tensor &freqs, const int cp_size, const int cp_rank);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qkv_rope_forward(
+    const at::Tensor &qkv_input, const at::Tensor &q_freqs, const at::Tensor &k_freqs,
+    const std::optional<at::Tensor> start_positions, const std::vector<int> &qkv_split_arg_list,
+    const NVTE_QKV_Format qkv_format, const bool interleaved, const int cp_size, const int cp_rank);
 
-at::Tensor fused_rope_thd_backward(const at::Tensor &output_grads, const at::Tensor &cu_seqlens,
-                                   const at::Tensor &freqs, const int cp_size, const int cp_rank);
+at::Tensor fused_qkv_rope_backward(const at::Tensor &q_grad_out, const at::Tensor &k_grad_out,
+                                   const at::Tensor &v_grad_out, const at::Tensor &q_freqs,
+                                   const at::Tensor &k_freqs,
+                                   const std::vector<int> &qkv_split_arg_list,
+                                   const NVTE_QKV_Format qkv_format, const bool interleaved,
+                                   const int cp_size, const int cp_rank);
 
 /***************************************************************************************************
  * Miscellaneous
@@ -447,7 +382,7 @@ void thd_second_half_lse_correction(at::Tensor lse, const at::Tensor &lse_per_st
                                     const at::Tensor &cu_seqlens, bool lse_packed);
 
 at::Tensor thd_read_second_half_lse(const at::Tensor &lse, const at::Tensor &cu_seqlens,
-                                    bool lse_packed);
+                                    bool lse_packed, int second_half_lse_seqlen);
 
 void thd_out_correction(at::Tensor out, const at::Tensor &out_per_step, const at::Tensor &lse,
                         const at::Tensor &lse_per_step, const at::Tensor &cu_seqlens,
@@ -475,12 +410,17 @@ std::tuple<at::Tensor, at::Tensor> multi_tensor_unscale_l2norm_cuda(
     int chunk_size, at::Tensor noop_flag, std::vector<std::vector<at::Tensor>> tensor_lists,
     at::Tensor inv_scale, at::optional<bool> per_tensor_python);
 
-using transformer_engine::DType;
 void multi_tensor_adam_cuda(int chunk_size, at::Tensor noop_flag,
                             std::vector<std::vector<at::Tensor>> tensor_lists, const float lr,
                             const float beta1, const float beta2, const float epsilon,
                             const int step, const int mode, const int bias_correction,
                             const float weight_decay);
+
+void multi_tensor_adam_param_remainder_cuda(int chunk_size, at::Tensor noop_flag,
+                                            std::vector<std::vector<at::Tensor>> tensor_lists,
+                                            const float lr, const float beta1, const float beta2,
+                                            const float epsilon, const int step, const int mode,
+                                            const int bias_correction, const float weight_decay);
 
 void multi_tensor_adam_fp8_cuda(int chunk_size, at::Tensor noop_flag,
                                 std::vector<std::vector<at::Tensor>> tensor_lists, const float lr,
@@ -507,6 +447,10 @@ void multi_tensor_sgd_cuda(int chunk_size, at::Tensor noop_flag,
                            float momentum, float dampening, float lr, bool nesterov, bool first_run,
                            bool wd_after_momentum, float scale);
 
+void multi_tensor_compute_scale_and_scale_inv_cuda(
+    int chunk_size, at::Tensor noop_flag, std::vector<std::vector<at::Tensor>> tensor_lists,
+    float max_fp8, bool force_pow_2_scales, float epsilon);
+
 /***************************************************************************************************
  * padding
  **************************************************************************************************/
@@ -514,6 +458,32 @@ void multi_tensor_sgd_cuda(int chunk_size, at::Tensor noop_flag,
 void fused_multi_row_padding(at::Tensor input, at::Tensor output,
                              std::vector<size_t> input_row_list,
                              std::vector<size_t> padded_input_row_list);
+
+void fused_multi_row_unpadding(at::Tensor input, at::Tensor output,
+                               std::vector<size_t> input_row_list,
+                               std::vector<size_t> unpadded_input_row_list);
+/***************************************************************************************************
+ * NVSHMEM APIs
+ **************************************************************************************************/
+
+void init_nvshmem_backend(c10d::ProcessGroup *process_group);
+
+at::Tensor create_nvshmem_tensor(const std::vector<int64_t> &shape, c10::ScalarType dtype);
+
+void nvshmem_send_on_current_stream(at::Tensor src, at::Tensor dst, int peer, at::Tensor signal);
+
+void nvshmem_wait_on_current_stream(at::Tensor signal, const std::string &wait_kind);
+
+void nvshmem_finalize();
+
+/***************************************************************************************************
+ * Comm+GEMM Overlap Wrappers
+ **************************************************************************************************/
+
+void bulk_overlap_ag_with_external_gemm(CommOverlap &allgather_communicator, at::Stream send_stream,
+                                        at::Stream recv_stream);
+
+}  // namespace transformer_engine::pytorch
 
 /***************************************************************************************************
  * Comm+GEMM Overlap Wrappers
@@ -536,8 +506,7 @@ class CommOverlapHelper : torch::CustomClassHolder {
   CommOverlapHelper();
 
   CommOverlapHelper(c10d::ProcessGroup *world_group,
-                    std::optional<c10d::ProcessGroup *> intra_node_group,
-                    std::optional<c10d::ProcessGroup *> inter_node_group);
+                    std::optional<c10d::ProcessGroup *> intra_node_group);
 
   ~CommOverlapHelper();
 
@@ -548,151 +517,44 @@ class CommOverlapHelper : torch::CustomClassHolder {
 };
 
 class CommOverlap : torch::CustomClassHolder, public transformer_engine::CommOverlapBase {
- private:
-  torch::Tensor _ubuf_torch;
-  torch::Tensor _ubuf_counter;
-
  public:
   CommOverlap(const std::vector<size_t> &buffer_shape, at::ScalarType buffer_dtype,
               CommOverlapHelper *helper, int tp_size, int num_splits = 3,
               int num_max_streams = NVTE_COMM_OVERLAP_MAX_STREAMS, int comm_cga_size = 2,
-              int num_comm_sm = 16, bool set_sm_margin = true, bool atomic_gemm = false);
+              int gemm_priority = 0, int comm_priority = 0, int num_comm_sm = 16,
+              bool set_sm_margin = true, bool atomic_gemm = false,
+              bool rs_overlap_first_gemm = false);
 
-  void set_ubuf_scale_inv(torch::Tensor scale_inv) {
-    assert(scale_inv.numel());
-    assert(scale_inv.scalar_type() == torch::kFloat32);
-    transformer_engine::CommOverlapBase::set_ubuf_scale_inv(
-        reinterpret_cast<float *>(scale_inv.data_ptr()));
-  }
+  ~CommOverlap() {}
 
-  void copy_input_to_ubuf(torch::Tensor input, int comm_type);
+  void copy_into_buffer(const at::Tensor &input, bool local_chunk = false);
 
-  torch::Tensor get_ubuf_output(int comm_type);
+  at::Tensor get_buffer(bool local_chunk = false,
+                        std::optional<std::vector<int64_t>> shape = std::nullopt);
 
-  /*
-  ** Bulk GEMM + COMM
-  ** This function assumes the communication input is pre-copied to _ubuf
-  */
-  std::vector<at::Tensor> bulk_overlap(
-      at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
-      transformer_engine::DType A_type, bool transa, at::Tensor B, at::Tensor B_scale_inverse,
-      int64_t B_fp8_tensor, transformer_engine::DType B_type, bool transb, at::Tensor D,
-      at::Tensor D_scale, transformer_engine::DType D_type, at::Tensor D_amax, at::Tensor bias,
-      transformer_engine::DType bias_type, at::Tensor pre_gelu_out, bool grad, at::Tensor workspace,
-      size_t workspaceSize, bool accumulate, bool use_split_accumulator,
-      transformer_engine::CommOverlapType comm_type, at::Tensor rs_output);
+  std::pair<at::Stream, at::Stream> get_communication_stream();
 
-  /*
-  ** Split FPROP GEMM + ReduceScatter
-  */
-  void atomic_gemm_overlap_rs(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
-                              transformer_engine::DType A_type, bool transa, at::Tensor B,
-                              at::Tensor B_scale_inverse, int64_t B_fp8_tensor,
-                              transformer_engine::DType B_type, bool transb, at::Tensor D,
-                              at::Tensor D_scale, transformer_engine::DType D_type,
-                              at::Tensor D_amax, at::Tensor bias,
-                              transformer_engine::DType bias_type, at::Tensor pre_gelu_out,
-                              bool grad, at::Tensor workspace, size_t workspaceSize,
-                              bool accumulate, bool use_split_accumulator, bool gemm_overlap,
-                              at::Tensor rs_output);
-
-  /*
-  ** Split FPROP GEMM + ReduceScatter
-  */
-  void split_overlap_rs(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
-                        transformer_engine::DType A_type, bool transa, at::Tensor B,
-                        at::Tensor B_scale_inverse, int64_t B_fp8_tensor,
-                        transformer_engine::DType B_type, bool transb, at::Tensor D,
-                        at::Tensor D_scale, transformer_engine::DType D_type, at::Tensor D_amax,
-                        at::Tensor bias, transformer_engine::DType bias_type,
-                        at::Tensor pre_gelu_out, bool grad, at::Tensor workspace,
-                        size_t workspaceSize, bool accumulate, bool use_split_accumulator,
-                        bool gemm_overlap, at::Tensor rs_output);
 };  // CommOverlap
 
 class CommOverlapP2P : torch::CustomClassHolder, public transformer_engine::CommOverlapP2PBase {
- private:
-  torch::Tensor _ubuf_torch;
-  torch::Tensor _ubuf_counter;
-
  public:
   CommOverlapP2P(const std::vector<size_t> &buffer_shape, at::ScalarType buffer_dtype,
                  CommOverlapHelper *helper, int tp_size,
                  transformer_engine::CommOverlapType comm_type,
                  int num_max_streams = NVTE_COMM_OVERLAP_MAX_STREAMS, int comm_cga_size = 2,
-                 int num_comm_sm = 3, bool set_sm_margin = true, bool atomic_gemm = false,
-                 bool use_ce = true, bool aggregate = false);
+                 int gemm_priority = 0, int comm_priority = 0, int num_comm_sm = 3,
+                 bool set_sm_margin = true, bool atomic_gemm = false, bool use_ce = true,
+                 bool aggregate = false);
 
-  void set_ubuf_scale_inv(torch::Tensor scale_inv) {
-    assert(scale_inv.numel());
-    assert(scale_inv.scalar_type() == torch::kFloat32);
-    transformer_engine::CommOverlapP2PBase::set_ubuf_scale_inv(
-        reinterpret_cast<float *>(scale_inv.data_ptr()));
-  }
+  ~CommOverlapP2P() {}
 
-  void copy_input_to_ubuf(torch::Tensor input, bool chunk);
+  void copy_into_buffer(const at::Tensor &input, bool local_chunk = false);
 
-  torch::Tensor get_ubuf_output(int comm_type);
+  at::Tensor get_buffer(bool local_chunk = false,
+                        std::optional<std::vector<int64_t>> shape = std::nullopt);
 
-  /*
-  ** Split AllGather + AtomicGEMM using P2P communication
-  ** This function assumes the input_b is pre-copied to _ubufs[rank_id]. This is
-  *needed to have AG outputs
-  ** in each rank to be in the contiguous memory space after all ring exchange
-  *phases.
-  */
-  void atomic_gemm_overlap_ag(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
-                              transformer_engine::DType A_type, bool transa, at::Tensor B,
-                              at::Tensor B_scale_inverse, int64_t B_fp8_tensor,
-                              transformer_engine::DType B_type, bool transb, at::Tensor D,
-                              at::Tensor D_scale, transformer_engine::DType D_type,
-                              at::Tensor D_amax, at::Tensor bias,
-                              transformer_engine::DType bias_type, at::Tensor pre_gelu_out,
-                              bool grad, at::Tensor workspace, size_t workspaceSize,
-                              bool accumulate, bool use_split_accumulator, at::Tensor B_copy);
+  std::pair<at::Stream, at::Stream> get_communication_stream();
 
-  /*
-  ** Split AllGather + GEMM using P2P communication
-  ** This function assumes the input_b is pre-copied to _ubufs[rank_id]. This is
-  *needed to have AG outputs
-  ** in each rank to be in the contiguous memory space after all ring exchange
-  *phases.
-  */
-  void split_overlap_ag(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
-                        transformer_engine::DType A_type, bool transa, at::Tensor B,
-                        at::Tensor B_scale_inverse, int64_t B_fp8_tensor,
-                        transformer_engine::DType B_type, bool transb, at::Tensor D,
-                        at::Tensor D_scale, transformer_engine::DType D_type, at::Tensor D_amax,
-                        at::Tensor bias, transformer_engine::DType bias_type,
-                        at::Tensor pre_gelu_out, bool grad, at::Tensor workspace,
-                        size_t workspaceSize, bool accumulate, bool use_split_accumulator,
-                        at::Tensor B_copy);
-
-  /*
-  ** Split ReduceScatter + GEMM using P2P communication
-  */
-  void atomic_gemm_overlap_rs(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
-                              transformer_engine::DType A_type, bool transa, at::Tensor B,
-                              at::Tensor B_scale_inverse, int64_t B_fp8_tensor,
-                              transformer_engine::DType B_type, bool transb, at::Tensor D,
-                              at::Tensor D_scale, transformer_engine::DType D_type,
-                              at::Tensor D_amax, at::Tensor bias,
-                              transformer_engine::DType bias_type, at::Tensor pre_gelu_out,
-                              bool grad, at::Tensor workspace, size_t workspaceSize,
-                              bool accumulate, bool use_split_accumulator, at::Tensor rs_output);
-
-  /*
-  ** Split ReduceScatter + GEMM using P2P communication
-  */
-  void split_overlap_rs(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
-                        transformer_engine::DType A_type, bool transa, at::Tensor B,
-                        at::Tensor B_scale_inverse, int64_t B_fp8_tensor,
-                        transformer_engine::DType B_type, bool transb, at::Tensor D,
-                        at::Tensor D_scale, transformer_engine::DType D_type, at::Tensor D_amax,
-                        at::Tensor bias, transformer_engine::DType bias_type,
-                        at::Tensor pre_gelu_out, bool grad, at::Tensor workspace,
-                        size_t workspaceSize, bool accumulate, bool use_split_accumulator,
-                        at::Tensor rs_output);
 };  // CommOverlapP2P
 
 #endif  // TRANSFORMER_ENGINE_PYTORCH_CSRC_EXTENSIONS_H_

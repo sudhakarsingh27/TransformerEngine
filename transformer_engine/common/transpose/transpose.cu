@@ -205,17 +205,8 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
   NVTE_CHECK(output.data.dptr != nullptr, "Output is not allocated.");
   NVTE_CHECK(input.data.dtype == output.data.dtype, "Input and output type must match.");
 
-  // Number of elements in tensor
-  auto numel = [](const Tensor &tensor) -> size_t {
-    size_t acc = 1;
-    for (const auto &dim : tensor.data.shape) {
-      acc *= dim;
-    }
-    return acc;
-  };
-
   if (noop.data.dptr != nullptr) {
-    NVTE_CHECK(numel(noop) == 1, "Expected 1 element, ", "but found ", numel(noop), ".");
+    NVTE_CHECK(noop.numel() == 1, "Expected 1 element, ", "but found ", noop.numel(), ".");
     NVTE_CHECK(noop.data.dtype == DType::kFloat32);
     NVTE_CHECK(noop.data.dptr != nullptr);
   }
@@ -288,6 +279,7 @@ void transpose(const Tensor &input, const Tensor &noop, Tensor *output_, cudaStr
                                                     static_cast<const fp32 *>(noop.data.dptr),
                                                     static_cast<Type *>(output.data.dptr),
                                                     row_length, num_rows);
+        NVTE_CHECK_CUDA(cudaGetLastError());
       });  // NOLINT(*)
 }
 
@@ -297,14 +289,13 @@ void nvte_transpose(const NVTETensor input, NVTETensor output, cudaStream_t stre
   NVTE_API_CALL(nvte_transpose);
   using namespace transformer_engine;
   auto noop = Tensor();
-  transpose(*reinterpret_cast<const Tensor *>(input), noop, reinterpret_cast<Tensor *>(output),
-            stream);
+  transpose(*convertNVTETensorCheck(input), noop, convertNVTETensor(output), stream);
 }
 
 void nvte_transpose_with_noop(const NVTETensor input, const NVTETensor noop, NVTETensor output,
                               cudaStream_t stream) {
   NVTE_API_CALL(nvte_transpose_with_noop);
   using namespace transformer_engine;
-  transpose(*reinterpret_cast<const Tensor *>(input), *reinterpret_cast<const Tensor *>(noop),
-            reinterpret_cast<Tensor *>(output), stream);
+  transpose(*convertNVTETensorCheck(input), *convertNVTETensorCheck(noop),
+            convertNVTETensor(output), stream);
 }

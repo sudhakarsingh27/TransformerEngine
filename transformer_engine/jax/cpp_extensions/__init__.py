@@ -3,8 +3,9 @@
 # See LICENSE for license information.
 """Python interface for c++ extensions"""
 from .activation import *
+from .amax import *
 from .attention import *
 from .normalization import *
 from .quantization import *
 from .softmax import *
-from .transpose import *
+from .gemm import *
