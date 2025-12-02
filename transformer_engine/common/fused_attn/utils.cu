@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * See LICENSE for license information.
  ************************************************************************/
@@ -117,6 +117,7 @@ void generateMatrixStrides(int64_t b, int64_t h, int64_t s_q, int64_t s_kv, int6
       }
       break;
     case NVTE_QKV_Layout::NVTE_SBHD_SBHD_SBHD:
+    case NVTE_QKV_Layout::NVTE_Paged_KV_SBHD_SBHD_SBHD:
       if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix) ||
           (matrix == NVTE_QKV_Matrix::NVTE_K_Matrix) ||
           (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix) ||
@@ -223,6 +224,9 @@ void generateMatrixStrides(int64_t b, int64_t h, int64_t s_q, int64_t s_kv, int6
       break;
     case NVTE_QKV_Layout::NVTE_BSHD_BSHD_BSHD:
     case NVTE_QKV_Layout::NVTE_THD_THD_THD:
+    case NVTE_QKV_Layout::NVTE_THD_BSHD_BSHD:
+    case NVTE_QKV_Layout::NVTE_Paged_KV_BSHD_BSHD_BSHD:
+    case NVTE_QKV_Layout::NVTE_Paged_KV_THD_BSHD_BSHD:
       if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix) ||
           (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix)) {
         strideA[batch_dim_idx] = s_q * h * d;
@@ -241,6 +245,52 @@ void generateMatrixStrides(int64_t b, int64_t h, int64_t s_q, int64_t s_kv, int6
         strideA[head_dim_idx] = d;
         strideA[seqlen_transpose_dim_idx] = h * d;
         strideA[hidden_transpose_dim_idx] = 1;
+      }
+      break;
+    case NVTE_QKV_Layout::NVTE_SBHD_BSHD_BSHD:
+    case NVTE_QKV_Layout::NVTE_Paged_KV_SBHD_BSHD_BSHD:
+      if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix) ||
+          (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+        strideA[batch_dim_idx] = s_kv * h * d;
+        strideA[head_dim_idx] = d;
+        strideA[seqlen_dim_idx] = h * d;
+        strideA[hidden_dim_idx] = 1;
+      } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose) ||
+                 (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+        strideA[batch_dim_idx] = s_kv * h * d;
+        strideA[head_dim_idx] = d;
+        strideA[seqlen_transpose_dim_idx] = h * d;
+        strideA[hidden_transpose_dim_idx] = 1;
+      } else if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix) ||
+                 (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix)) {
+        strideA[batch_dim_idx] = h * d;
+        strideA[head_dim_idx] = d;
+        strideA[seqlen_dim_idx] = b * h * d;
+        strideA[hidden_dim_idx] = 1;
+      }
+      break;
+    case NVTE_QKV_Layout::NVTE_BSHD_SBHD_SBHD:
+    case NVTE_QKV_Layout::NVTE_THD_SBHD_SBHD:
+    case NVTE_QKV_Layout::NVTE_Paged_KV_BSHD_SBHD_SBHD:
+    case NVTE_QKV_Layout::NVTE_Paged_KV_THD_SBHD_SBHD:
+      if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix) ||
+          (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix)) {
+        strideA[batch_dim_idx] = h * d;
+        strideA[head_dim_idx] = d;
+        strideA[seqlen_dim_idx] = b * h * d;
+        strideA[hidden_dim_idx] = 1;
+      } else if ((matrix == NVTE_QKV_Matrix::NVTE_K_Matrix_Transpose) ||
+                 (matrix == NVTE_QKV_Matrix::NVTE_V_Matrix_Transpose)) {
+        strideA[batch_dim_idx] = h * d;
+        strideA[head_dim_idx] = d;
+        strideA[seqlen_transpose_dim_idx] = b * h * d;
+        strideA[hidden_transpose_dim_idx] = 1;
+      } else if ((matrix == NVTE_QKV_Matrix::NVTE_Q_Matrix) ||
+                 (matrix == NVTE_QKV_Matrix::NVTE_O_Matrix)) {
+        strideA[batch_dim_idx] = s_q * h * d;
+        strideA[head_dim_idx] = d;
+        strideA[seqlen_dim_idx] = h * d;
+        strideA[hidden_dim_idx] = 1;
       }
       break;
   }
@@ -379,28 +429,44 @@ __device__ void cu_seqlens_padded_to_offsets_impl(
   size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   auto cu_seqlens_id = min(tid, actual_b);
   if (tid <= max_b) {
-    offsets_o[tid] = h * d_v * cu_seqlens_q_padded[cu_seqlens_id];
     if (offsets_s != nullptr) {
       offsets_s[tid] = h * cu_seqlens_q_padded[cu_seqlens_id];
     }
-    switch (layout_group) {
-      case NVTE_QKV_Layout_Group::NVTE_HD_HD_HD:
-        offsets_q[tid] = h * d_qk * cu_seqlens_q_padded[cu_seqlens_id];
-        offsets_k[tid] = hg * d_qk * cu_seqlens_kv_padded[cu_seqlens_id];
-        offsets_v[tid] = hg * d_v * cu_seqlens_kv_padded[cu_seqlens_id];
-        break;
-      case NVTE_QKV_Layout_Group::NVTE_3HD:
-      case NVTE_QKV_Layout_Group::NVTE_H3D:
-        offsets_q[tid] = 3 * h * d_qk * cu_seqlens_q_padded[cu_seqlens_id];
-        offsets_k[tid] = offsets_q[cu_seqlens_id];
-        offsets_v[tid] = offsets_q[cu_seqlens_id];
-        break;
-      case NVTE_QKV_Layout_Group::NVTE_HD_2HD:
-      case NVTE_QKV_Layout_Group::NVTE_HD_H2D:
-        offsets_q[tid] = h * d_qk * cu_seqlens_q_padded[cu_seqlens_id];
-        offsets_k[tid] = 2 * hg * d_qk * cu_seqlens_kv_padded[cu_seqlens_id];
-        offsets_v[tid] = offsets_k[cu_seqlens_id];
-        break;
+    if (offsets_q != nullptr && offsets_o != nullptr) {
+      offsets_o[tid] = h * d_v * cu_seqlens_q_padded[cu_seqlens_id];
+      switch (layout_group) {
+        case NVTE_QKV_Layout_Group::NVTE_HD_HD_HD:
+        case NVTE_QKV_Layout_Group::NVTE_Paged_KV_HD_HD_HD:
+          offsets_q[tid] = h * d_qk * cu_seqlens_q_padded[cu_seqlens_id];
+          break;
+        case NVTE_QKV_Layout_Group::NVTE_3HD:
+        case NVTE_QKV_Layout_Group::NVTE_H3D:
+          offsets_q[tid] = 3 * h * d_qk * cu_seqlens_q_padded[cu_seqlens_id];
+          break;
+        case NVTE_QKV_Layout_Group::NVTE_HD_2HD:
+        case NVTE_QKV_Layout_Group::NVTE_HD_H2D:
+          offsets_q[tid] = h * d_qk * cu_seqlens_q_padded[cu_seqlens_id];
+          break;
+      }
+    }
+    if (offsets_k != nullptr && offsets_v != nullptr) {
+      switch (layout_group) {
+        case NVTE_QKV_Layout_Group::NVTE_HD_HD_HD:
+        case NVTE_QKV_Layout_Group::NVTE_Paged_KV_HD_HD_HD:
+          offsets_k[tid] = hg * d_qk * cu_seqlens_kv_padded[cu_seqlens_id];
+          offsets_v[tid] = hg * d_v * cu_seqlens_kv_padded[cu_seqlens_id];
+          break;
+        case NVTE_QKV_Layout_Group::NVTE_3HD:
+        case NVTE_QKV_Layout_Group::NVTE_H3D:
+          offsets_k[tid] = 3 * h * d_qk * cu_seqlens_q_padded[cu_seqlens_id];
+          offsets_v[tid] = offsets_k[cu_seqlens_id];
+          break;
+        case NVTE_QKV_Layout_Group::NVTE_HD_2HD:
+        case NVTE_QKV_Layout_Group::NVTE_HD_H2D:
+          offsets_k[tid] = 2 * hg * d_qk * cu_seqlens_kv_padded[cu_seqlens_id];
+          offsets_v[tid] = offsets_k[cu_seqlens_id];
+          break;
+      }
     }
   }
 }
@@ -433,6 +499,7 @@ DType get_ragged_offset_dtype(NVTE_QKV_Layout_Group layout_group, int64_t num_at
   std::array<int64_t, 4> offsets_qkvo{};
   switch (layout_group) {
     case NVTE_QKV_Layout_Group::NVTE_HD_HD_HD:
+    case NVTE_QKV_Layout_Group::NVTE_Paged_KV_HD_HD_HD:
       offsets_qkvo[0] = num_attn_heads * head_dim_qk * max_seqlen_q;
       offsets_qkvo[1] = num_gqa_groups * head_dim_qk * max_seqlen_kv;
       offsets_qkvo[2] = num_gqa_groups * head_dim_v * max_seqlen_kv;
@@ -495,5 +562,77 @@ size_t get_max_tokens(size_t num_tokens) {
   return max_t;
 }
 
+__global__ void populate_rng_state_kernel(int64_t *rng_state_dst, const int64_t *const seed,
+                                          int64_t offset) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid > 0) return;
+  rng_state_dst[0] = seed[0];
+  rng_state_dst[1] = offset;
+}
+
+__global__ void get_runtime_num_segments_kernel(int32_t *cu_seqlen, size_t len, uint32_t *out) {
+  int tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid >= len) return;
+
+  if (cu_seqlen[tid] > 0) {
+    // atomicAdd only support 32 bits dtype
+    atomicAdd(out, 1);
+  }
+}
+
+void PopulateRngStateAsync(void *rng_state_dst, const void *seed, size_t q_max_seqlen,
+                           size_t kv_max_seqlen, NVTE_Fused_Attn_Backend backend,
+                           cudaStream_t stream) {
+  size_t increment = 0;
+  if (backend == NVTE_Fused_Attn_Backend::NVTE_F16_arbitrary_seqlen) {
+    increment = 16;
+  } else {
+    constexpr int threads_per_cta = 128;
+    increment = (q_max_seqlen * kv_max_seqlen + threads_per_cta - 1) / threads_per_cta;
+  }
+  auto offset = FusedAttnOffsetManager::Instance().GetAndUpdateOffset(increment);
+  populate_rng_state_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<int64_t *>(rng_state_dst),
+                                                 reinterpret_cast<const int64_t *>(seed), offset);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}
+
+uint32_t GetRuntimeNumSegments(void *cu_seqlen, void *workspace, size_t len, cudaStream_t stream) {
+  // workspace size requires 4 bytes
+  uint32_t *dout = static_cast<uint32_t *>(workspace);
+  uint32_t hout{};
+  NVTE_CHECK_CUDA(cudaMemsetAsync(dout, 0, sizeof(uint32_t), stream));
+  constexpr int threads = 128;
+  const int blocks = (len - 1) / threads + 1;
+  get_runtime_num_segments_kernel<<<blocks, threads, 0, stream>>>(static_cast<int32_t *>(cu_seqlen),
+                                                                  len, dout);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+  NVTE_CHECK_CUDA(cudaMemcpyAsync(&hout, dout, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+  NVTE_CHECK_CUDA(cudaStreamSynchronize(stream));
+  return hout;
+}
+
+__global__ void extract_seed_and_offset(int64_t *rng_state_ptr, bool captured, int64_t *seed_ptr,
+                                        uint64_t seed_val, int64_t *offset_ptr, uint64_t offset_val,
+                                        uint32_t offset_intragraph) {
+  if (captured) {
+    rng_state_ptr[0] = *seed_ptr;
+    rng_state_ptr[1] = static_cast<int64_t>(*offset_ptr + static_cast<int64_t>(offset_intragraph));
+  } else {
+    rng_state_ptr[0] = static_cast<int64_t>(seed_val);
+    rng_state_ptr[1] = static_cast<int64_t>(offset_val);
+  }
+}
+
 }  // namespace fused_attn
 }  // namespace transformer_engine
+
+void nvte_extract_seed_and_offset(int64_t *rng_state_ptr, int captured, int64_t *seed_ptr,
+                                  uint64_t seed_val, int64_t *offset_ptr, uint64_t offset_val,
+                                  uint32_t offset_intragraph, cudaStream_t stream) {
+  NVTE_API_CALL(nvte_extract_seed_and_offset);
+  using namespace transformer_engine;
+
+  fused_attn::extract_seed_and_offset<<<1, 1, 0, stream>>>(
+      rng_state_ptr, captured, seed_ptr, seed_val, offset_ptr, offset_val, offset_intragraph);
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}

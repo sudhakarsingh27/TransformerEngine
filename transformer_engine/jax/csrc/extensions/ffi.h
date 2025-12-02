@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * See LICENSE for license information.
  ************************************************************************/
@@ -24,6 +24,7 @@ using FFI_Stream_Type = xla::ffi::PlatformStream<cudaStream_t>;
 using Dictionary = xla::ffi::Dictionary;
 
 constexpr auto FFI_Prepare = xla::ffi::ExecutionStage::kPrepare;
+constexpr auto FFI_Initialize = xla::ffi::ExecutionStage::kInitialize;
 constexpr auto FFI_CudaGraph_Traits = {xla::ffi::Traits::kCmdBufferCompatible};
 
 DType convert_ffi_datatype_to_te_dtype(const xla::ffi::DataType& type);
@@ -79,6 +80,47 @@ inline size_t product(const xla::ffi::Span<const int64_t>& data, size_t start_id
   end_idx = (end_idx == 0) ? data.size() : end_idx;
   return std::accumulate(data.begin() + start_idx, data.begin() + end_idx, size_t(1),
                          std::multiplies<size_t>());
+}
+
+inline static size_t te_dtype_bytes(const DType& type) {
+  switch (type) {
+    case DType::kByte:
+      return 1;
+    case DType::kInt32:
+      return 4;
+    case DType::kInt64:
+      return 8;
+    case DType::kFloat32:
+      return 4;
+    case DType::kFloat16:
+      return 2;
+    case DType::kBFloat16:
+      return 2;
+    case DType::kFloat8E5M2:
+      return 1;
+    case DType::kFloat8E4M3:
+      return 1;
+    case DType::kFloat8E8M0:
+      return 1;
+    case DType::kFloat4E2M1:
+      return 1;
+    default:
+      NVTE_ERROR("Unsupported DType: ", static_cast<int>(type));
+  }
+}
+
+template <typename... Args>
+Error_Type wrapInStreamCapture(std::function<Error_Type(cudaStream_t, Args...)> func,
+                               cudaStream_t stream, Args... args) {
+  cudaGraph_t graph{};
+  NVTE_CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+
+  Error_Type error = func(stream, std::forward<Args>(args)...);
+
+  NVTE_CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+  NVTE_CHECK_CUDA(cudaGraphDestroy(graph));
+
+  return error;
 }
 
 }  // namespace jax

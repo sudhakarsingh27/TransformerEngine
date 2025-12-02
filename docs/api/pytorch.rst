@@ -1,5 +1,5 @@
 ..
-    Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
     See LICENSE for license information.
 
@@ -31,7 +31,8 @@ pyTorch
 .. autoapiclass:: transformer_engine.pytorch.TransformerLayer(hidden_size, ffn_hidden_size, num_attention_heads, **kwargs)
   :members: forward, set_context_parallel_group, set_tensor_parallel_group
 
-.. autoapiclass:: transformer_engine.pytorch.InferenceParams(max_batch_size, max_sequence_length)
+.. autoapiclass:: transformer_engine.pytorch.dot_product_attention.inference.InferenceParams(max_batch_size, max_sequence_length)
+  :members: reset, allocate_memory, pre_step, get_seqlens_pre_step, convert_paged_to_nonpaged, step
 
 .. autoapiclass:: transformer_engine.pytorch.CudaRNGStatesTracker()
   :members: reset, get_states, set_states, add, fork
@@ -40,9 +41,27 @@ pyTorch
 
 .. autoapifunction:: transformer_engine.pytorch.fp8_model_init
 
+.. autoapifunction:: transformer_engine.pytorch.autocast
+
+.. autoapifunction:: transformer_engine.pytorch.quantized_model_init
+
 .. autoapifunction:: transformer_engine.pytorch.checkpoint
 
-.. autoapifunction:: transformer_engine.pytorch.onnx_export
+.. autoapifunction:: transformer_engine.pytorch.is_fp8_available
+
+.. autoapifunction:: transformer_engine.pytorch.is_mxfp8_available
+
+.. autoapifunction:: transformer_engine.pytorch.is_fp8_block_scaling_available
+
+.. autoapifunction:: transformer_engine.pytorch.is_nvfp4_available
+
+.. autoapifunction:: transformer_engine.pytorch.is_bf16_available
+
+.. autoapifunction:: transformer_engine.pytorch.get_cudnn_version
+
+.. autoapifunction:: transformer_engine.pytorch.get_device_compute_capability
+
+.. autoapifunction:: transformer_engine.pytorch.get_default_recipe
 
 .. autoapifunction:: transformer_engine.pytorch.make_graphed_callables
 
@@ -50,8 +69,19 @@ pyTorch
 
 .. autoapifunction:: transformer_engine.pytorch.moe_permute
 
+.. autoapifunction:: transformer_engine.pytorch.moe_permute_with_probs
+
 .. autoapifunction:: transformer_engine.pytorch.moe_unpermute
+
+.. autoapifunction:: transformer_engine.pytorch.moe_sort_chunks_by_index
+
+.. autoapifunction:: transformer_engine.pytorch.parallel_cross_entropy
+
+.. autoapifunction:: transformer_engine.pytorch.moe_sort_chunks_by_index_with_probs
 
 .. autoapifunction:: transformer_engine.pytorch.initialize_ub
 
 .. autoapifunction:: transformer_engine.pytorch.destroy_ub
+
+.. autoapiclass:: transformer_engine.pytorch.UserBufferQuantizationMode
+  :members: FP8, NONE

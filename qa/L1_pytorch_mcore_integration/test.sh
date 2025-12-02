@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -17,7 +17,7 @@ fi
 # Download Megatron-LM if needed
 if [ ! -d "${MCORE_PATH}" ]; then
     pushd $(dirname ${MCORE_PATH})
-    git clone -b core_r0.9.0 https://github.com/NVIDIA/Megatron-LM.git Megatron-LM
+    git clone -b core_r0.12.0 https://github.com/NVIDIA/Megatron-LM.git Megatron-LM
     popd
 fi
 
@@ -40,7 +40,7 @@ CUDA_DEVICE_MAX_CONNECTIONS=1
 NVTE_BIAS_GELU_NVFUSION=0
 NVTE_BIAS_DROPOUT_FUSION=0
 
-python
+python3
 -m torch.distributed.launch
 --use_env
 --nnodes=1
