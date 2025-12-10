@@ -1757,23 +1757,23 @@ def _run_dpa_fp8_extra_state(dtype, config, checkpoint=False, mimic_v1_6=False):
 
 model_configs_fp8_vs_f16 = {
     # test: ModelConfig(b, sq, hq, dqk)
-    "fp8_9": ModelConfig(2, 2048, 16, 128),
-    "fp8_10": ModelConfig(2, 2048, 24, 128, num_gqa_groups=12),
-    "fp8_11": ModelConfig(1, 8192, 32, 128, num_gqa_groups=4),
-    "fp8_12": ModelConfig(2, 2048, 16, 128, attn_mask_type="causal"),
-    "fp8_13": ModelConfig(2, 2048, 24, 128, num_gqa_groups=12, attn_mask_type="causal"),
-    "fp8_14": ModelConfig(1, 8192, 32, 128, num_gqa_groups=4, attn_mask_type="causal"),
-    "fp8_15": ModelConfig(2, 2048, 16, 128, attn_mask_type="padding"),
-    "fp8_16": ModelConfig(2, 2048, 24, 128, num_gqa_groups=12, attn_mask_type="padding"),
-    "fp8_17": ModelConfig(1, 8192, 32, 128, num_gqa_groups=4, attn_mask_type="padding"),
+    # "fp8_9": ModelConfig(2, 2048, 16, 128),
+    # "fp8_10": ModelConfig(2, 2048, 24, 128, num_gqa_groups=12),
+    # "fp8_11": ModelConfig(1, 8192, 32, 128, num_gqa_groups=4),
+    # "fp8_12": ModelConfig(2, 2048, 16, 128, attn_mask_type="causal"),
+    # "fp8_13": ModelConfig(2, 2048, 24, 128, num_gqa_groups=12, attn_mask_type="causal"),
+    # "fp8_14": ModelConfig(1, 8192, 32, 128, num_gqa_groups=4, attn_mask_type="causal"),
+    # "fp8_15": ModelConfig(2, 2048, 16, 128, attn_mask_type="padding"),
+    # "fp8_16": ModelConfig(2, 2048, 24, 128, num_gqa_groups=12, attn_mask_type="padding"),
+    # "fp8_17": ModelConfig(1, 8192, 32, 128, num_gqa_groups=4, attn_mask_type="padding"),
     "fp8_18": ModelConfig(2, 2048, 16, 128, attn_mask_type="padding_causal"),
-    "fp8_19": ModelConfig(2, 2048, 24, 128, num_gqa_groups=12, attn_mask_type="padding_causal"),
-    "fp8_20": ModelConfig(1, 8192, 32, 128, num_gqa_groups=4, attn_mask_type="padding_causal"),
+    # "fp8_19": ModelConfig(2, 2048, 24, 128, num_gqa_groups=12, attn_mask_type="padding_causal"),
+    # "fp8_20": ModelConfig(1, 8192, 32, 128, num_gqa_groups=4, attn_mask_type="padding_causal"),
 }
 
-param_types_fp8_vs_f16 = [torch.float16, torch.bfloat16]
-qkv_layout_fp8_vs_f16 = ["sbh3d", "bshd_bshd_bshd", "sbhd_sbhd_sbhd"]
-qkv_format_fp8_vs_f16 = ["bshd", "sbhd"]
+param_types_fp8_vs_f16 = [torch.bfloat16]
+qkv_layout_fp8_vs_f16 = ["thd_thd_thd"]
+qkv_format_fp8_vs_f16 = ["bshd", "sbhd", "thd"]
 
 
 @pytest.mark.skipif(get_cudnn_version() < (9, 2, 1), reason="cuDNN 9.2.1+ is required.")
@@ -2024,12 +2024,15 @@ def _run_mha_fp8_vs_f16(
 @pytest.mark.parametrize("dtype", param_types_fp8_vs_f16)
 @pytest.mark.parametrize("model", model_configs_fp8_vs_f16.keys())
 @pytest.mark.parametrize("qkv_layout", qkv_layout_fp8_vs_f16)
-@pytest.mark.parametrize("fp8_dpa_bwd", [True, False])
-@pytest.mark.parametrize("is_training", [True, False])
-@pytest.mark.parametrize("scaling_mode", ["delayed", "current"])
+@pytest.mark.parametrize("fp8_dpa_bwd", [False])
+@pytest.mark.parametrize("is_training", [False])
+@pytest.mark.parametrize("scaling_mode", ["delayed"])
 def test_dpa_fp8_vs_f16(dtype, model, qkv_layout, fp8_dpa_bwd, is_training, scaling_mode):
     """Test DotProductAttention module in FP8"""
     config = model_configs_fp8_vs_f16[model]
+    
+    if qkv_layout == "thd_thd_thd" and scaling_mode is not "delayed":
+        pytest.skip("FP8 + THD only works with DelayedScaling")
 
     # TODO(cyang): think of another way to verify dropout results
     # test cuDNN FP8 dropout

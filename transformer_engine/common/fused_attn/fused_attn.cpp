@@ -252,7 +252,6 @@ NVTE_Fused_Attn_Backend nvte_get_fused_attn_backend(
          attn_mask_type == NVTE_Mask_Type::NVTE_CAUSAL_MASK ||
          attn_mask_type == NVTE_Mask_Type::NVTE_PADDING_MASK ||
          attn_mask_type == NVTE_Mask_Type::NVTE_PADDING_CAUSAL_MASK))) &&
-      (qkv_format == NVTE_QKV_Format::NVTE_BSHD || qkv_format == NVTE_QKV_Format::NVTE_SBHD) &&
       !requires_64bit_ragged_offset && (softmax_type == NVTE_Softmax_Type::NVTE_VANILLA_SOFTMAX) &&
       // 9.10.0: known bugs with SDPA FP8
       (cudnn_runtime_version != 91000) && !return_max_logit) {
