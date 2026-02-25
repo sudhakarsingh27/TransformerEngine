@@ -1332,10 +1332,10 @@ class DotProductAttention(TransformerEngineBaseModule):
                 if qkv_format == "thd":
                     pad_between_seqs = (
                         cu_seqlens_q_padded is not None
-                        and not torch.equal(cu_seqlens_q_padded[:-1], cu_seqlens_q[:-1])
+                        and not torch.equal(cu_seqlens_q_padded, cu_seqlens_q)
                     ) or (
                         cu_seqlens_kv_padded is not None
-                        and not torch.equal(cu_seqlens_kv_padded[:-1], cu_seqlens_kv[:-1])
+                        and not torch.equal(cu_seqlens_kv_padded, cu_seqlens_kv)
                     )
                 else:
                     pad_between_seqs = False
@@ -1473,6 +1473,9 @@ class DotProductAttention(TransformerEngineBaseModule):
                     flash_attention_backend=flash_attention_backend,
                     fp8_output=fp8_output,
                     num_splits=num_splits,
+                    cu_seqlens_q_padded=cu_seqlens_q_padded,
+                    cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+                    pad_between_seqs=pad_between_seqs,
                 )
 
             if use_fused_attention:

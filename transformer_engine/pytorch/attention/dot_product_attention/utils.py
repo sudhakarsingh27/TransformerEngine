@@ -686,10 +686,10 @@ def get_attention_backend(
                 use_flash_attention_3 and FlashAttentionUtils.v3_is_installed
             ):
                 logger.debug(
-                    "Disabling FlashAttention for qkv_format = thd when there is "
-                    "padding between sequences, i.e. [a, a, PAD, b, b, b, PAD, c, PAD]"
+                    "NOTE: Allowing FlashAttention for qkv_format = thd with "
+                    "padding between sequences (WIP exploration)"
                 )
-            use_flash_attention = False
+            # use_flash_attention = False  # WIP: bypassing to probe next barrier
         if device_compute_capability == (12, 0):
             if use_fused_attention:
                 logger.debug(

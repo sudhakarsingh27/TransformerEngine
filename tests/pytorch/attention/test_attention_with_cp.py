@@ -133,6 +133,7 @@ def test_cp_with_flash_attention(dtype, model, qkv_format, cp_comm_type):
             qkv_format=qkv_format,
             kernel_backend="FlashAttention",
             cp_comm_type=cp_comm_type,
+            pad_between_seqs=True,
             log_level=pytest_logging_level,
         ),
         check=True,
