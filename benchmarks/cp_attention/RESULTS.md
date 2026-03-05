@@ -10,9 +10,9 @@
 
 ## JAX vs PyTorch Head-to-Head (CP runs only)
 
-### BSHD + DualChunkSwap — CP Latency (ms) and TFLOPS
+### BSHD + DualChunkSwap — CP Fwd+Bwd Time (ms) and TFLOPS
 
-| GPUs | SeqLen | JAX-BSHD (ms) | PT-BSHD (ms) | JAX TFLOPS | PT TFLOPS |
+| GPUs | SeqLen | JAX-BSHD fwd+bwd (ms) | PT-BSHD fwd+bwd (ms) | JAX TFLOPS | PT TFLOPS |
 |------|--------|--------------|-------------|------------|-----------|
 | 2 | 32K | 28.27 | 29.47 | 1089 | 1045 |
 | 2 | 64K | 107.75 | 115.09 | 1143 | 1070 |
@@ -24,10 +24,10 @@
 | 8 | 64K | 35.08 | **31.82** | 3510 | **3870** |
 | 8 | 128K | **118.29** | 120.28 | **4164** | 4095 |
 
-### THD — CP Latency (ms) and TFLOPS
+### THD — CP Fwd+Bwd Time (ms) and TFLOPS
 *(JAX uses Striped reordering; PyTorch uses DualChunkSwap)*
 
-| GPUs | SeqLen | JAX-THD (ms) | PT-THD (ms) | JAX TFLOPS | PT TFLOPS |
+| GPUs | SeqLen | JAX-THD fwd+bwd (ms) | PT-THD fwd+bwd (ms) | JAX TFLOPS | PT TFLOPS |
 |------|--------|-------------|------------|------------|-----------|
 | 2 | 32K | 30.20 | 31.88 | 1019 | 966 |
 | 2 | 64K | 113.73 | 122.09 | 1083 | 1009 |
