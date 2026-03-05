@@ -68,8 +68,13 @@ def parse_args():
                         help="THD (Striped) or BSHD (DualChunkSwap)")
     parser.add_argument("--stripe_size", type=int, default=1,
                         help="Stripe size for Striped reordering (THD only)")
+    parser.add_argument("--cp_strategy", type=str, default="ring",
+                        choices=["ring", "all_gather"],
+                        help="CP communication strategy")
     parser.add_argument("--baseline", action="store_true",
                         help="Also run a no-CP single-device baseline for comparison")
+    parser.add_argument("--profile", action="store_true",
+                        help="Reduce iters for nsys profiling (nsys wraps externally)")
     return parser.parse_args()
 
 
@@ -95,7 +100,7 @@ def setup_mesh_no_cp():
     return mesh, mesh_resource
 
 
-def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size):
+def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strategy):
     """Build a wrapper around fused_attn with the right static kwargs."""
     scaling_factor = 1.0 / sqrt(head_dim)
 
@@ -120,7 +125,7 @@ def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size):
             dropout_probability=0.0,
             is_training=True,
             max_segments_per_seq=1,
-            context_parallel_strategy=CPStrategy.RING,
+            context_parallel_strategy=cp_strategy,
             context_parallel_causal_load_balanced=cp_load_balanced,
             stripe_size=stripe_size if layout == "thd" else None,
         ).astype(q.dtype)
@@ -340,11 +345,21 @@ def main():
     num_heads, num_gqa_groups, head_dim = MODEL_CONFIGS[args.config]
     dtype = jnp.bfloat16
 
+    strategy_map = {"ring": CPStrategy.RING, "all_gather": CPStrategy.ALL_GATHER}
+    cp_strategy = strategy_map[args.cp_strategy]
+    strategy_label = args.cp_strategy.upper()
+
+    if args.profile:
+        args.iters = min(args.iters, 3)
+        args.warmup = min(args.warmup, 2)
+
     print(f"Config: {args.config} | Layout: {args.layout} | "
           f"B={args.batch_size}, S={args.seq_len}, H={num_heads}, "
           f"KV_groups={num_gqa_groups}, D={head_dim}")
-    print(f"Devices: {[str(d) for d in jax.devices()]} | Baseline: {args.baseline}")
-    print(f"Warmup: {args.warmup} | Timed iters: {args.iters}")
+    print(f"Devices: {[str(d) for d in jax.devices()]} | "
+          f"CP strategy: {strategy_label} | Baseline: {args.baseline}")
+    print(f"Warmup: {args.warmup} | Timed iters: {args.iters}"
+          f"{' | Profile: ON' if args.profile else ''}")
 
     results = []
 
@@ -399,7 +414,7 @@ def main():
 
     # ---- CP run ----
     mesh, mesh_resource, cp_size = setup_mesh()
-    print(f"\n--- CP (RING, {args.layout}, {cp_size} devices) ---")
+    print(f"\n--- CP ({strategy_label}, {args.layout}, {cp_size} devices) ---")
 
     if args.layout == "thd":
         q, k, v, seq_desc = make_inputs_thd(
@@ -430,6 +445,7 @@ def main():
         args.layout, head_dim,
         cp_load_balanced=True,
         stripe_size=args.stripe_size,
+        cp_strategy=cp_strategy,
     )
 
     def loss_fn(q, k, v, seq_desc):
@@ -446,7 +462,7 @@ def main():
         mesh, mesh_resource, args.warmup, args.iters,
     )
     results.append(report_results(
-        f"CP-RING ({args.layout})", cp_times,
+        f"CP-{strategy_label} ({args.layout})", cp_times,
         args.batch_size, args.seq_len, num_heads, head_dim,
     ))
 

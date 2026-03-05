@@ -55,6 +55,8 @@ def parse_args():
                         help="Also run a no-CP single-GPU baseline for comparison")
     parser.add_argument("--verify", action="store_true",
                         help="Verify CP output matches no-CP output (correctness check)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable cudaProfiler capture range around timed iters (for nsys)")
     return parser.parse_args()
 
 
@@ -205,7 +207,7 @@ def compute_flops(batch_size, seq_len, num_heads, head_dim):
 
 
 def benchmark_attn(core_attn, q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pad,
-                   warmup, iters):
+                   warmup, iters, profile=False):
     """Run warmup + timed iterations, return list of times in ms."""
     for _ in range(warmup):
         if q.grad is not None:
@@ -221,6 +223,9 @@ def benchmark_attn(core_attn, q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pa
         )
         out.backward(dout)
         torch.cuda.synchronize()
+
+    if profile:
+        torch.cuda.cudart().cudaProfilerStart()
 
     times_ms = []
     for _ in range(iters):
@@ -244,6 +249,9 @@ def benchmark_attn(core_attn, q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pa
         end.record()
         torch.cuda.synchronize()
         times_ms.append(start.elapsed_time(end))
+
+    if profile:
+        torch.cuda.cudart().cudaProfilerStop()
 
     return times_ms
 
@@ -456,12 +464,17 @@ def main():
     else:
         attn_mask_type = "causal"
 
+    if args.profile:
+        args.iters = min(args.iters, 3)
+        args.warmup = min(args.warmup, 2)
+
     if rank == 0:
         print(f"Config: {args.config} | Format: {args.qkv_format} | "
               f"B={args.batch_size}, S={args.seq_len}, H={num_heads}, "
               f"KV_groups={num_gqa_groups}, D={head_dim}")
         print(f"CP size: {world_size} | Baseline: {args.baseline} | Verify: {args.verify}")
-        print(f"Warmup: {args.warmup} | Timed iters: {args.iters}")
+        print(f"Warmup: {args.warmup} | Timed iters: {args.iters}"
+              f"{' | Profile: ON' if args.profile else ''}")
 
     # ---- Verification ----
     if args.verify:
@@ -501,7 +514,7 @@ def main():
         baseline_times = benchmark_attn(
             baseline_attn, bq, bk, bv, bdout,
             bcu_sq, bcu_skv, bcu_sq_pad, bcu_skv_pad,
-            args.warmup, args.iters,
+            args.warmup, args.iters, profile=args.profile,
         )
         results.append(report_results(
             f"no-CP ({args.qkv_format})", baseline_times,
@@ -549,7 +562,7 @@ def main():
     cp_times = benchmark_attn(
         core_attn, q, k, v, dout,
         cu_sq, cu_skv, cu_sq_pad, cu_skv_pad,
-        args.warmup, args.iters,
+        args.warmup, args.iters, profile=args.profile,
     )
     results.append(report_results(
         f"CP-p2p ({args.qkv_format})", cp_times,
