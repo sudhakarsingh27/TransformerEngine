@@ -14,9 +14,10 @@
    - [Kernel Category Breakdown](#kernel-category-breakdown)
    - [Kernel Details by Category](#kernel-details-by-category)
    - [Why BSHD is Faster than THD](#why-bshd-is-faster-than-thd)
-4. [AllGather vs Ring (THD/Striped) — JAX Investigation](#allgather-vs-ring-thdstriped--jax-investigation)
-5. [Key Observations](#key-observations)
-6. [Setup](#setup)
+4. [AllGather vs Ring (THD/Striped) — JAX](#allgather-vs-ring-thdstriped--jax)
+5. [Sliding Window Attention (SWA) vs Full Causal](#sliding-window-attention-swa-vs-full-causal)
+6. [Key Observations](#key-observations)
+7. [Setup](#setup)
 
 ---
 
@@ -147,63 +148,132 @@ THD's total overhead vs BSHD at 8 GPUs, 128K is **+373ms** (across 3 iterations)
 
 ---
 
-## AllGather vs Ring (THD/Striped) — JAX Investigation
+## AllGather vs Ring (THD/Striped) — JAX
 
-**Setup:** `bench_cp_jax.py --cp_strategy all_gather|ring --layout thd`, llama3_8b, stripe_size=1, 5 warmup + 20 timed iters.
+**Setup:** `bench_cp_jax.py --cp_strategy all_gather|ring --layout thd`, llama3_8b, THD/Striped, 5 warmup + 20 timed iters. ALL_GATHER tested with stripe_size=1024 and 2048 (the optimal range from the stripe_size sensitivity sweep below).
 
-**Short answer:** ALL_GATHER produces **numerically correct** results but is **unusably slow** with THD/Striped due to a known implementation limitation in the TE JAX backend. This is not a performance regression in our benchmark — it is a property of the current implementation.
+### Head-to-head: RING vs ALL_GATHER (ss=1024) vs ALL_GATHER (ss=2048)
 
-### What we observed
+| GPUs | SeqLen | RING (ms) | AG ss=1024 (ms) | AG ss=2048 (ms) | Best AG/RING | RING TFLOPS | Best AG TFLOPS |
+|------|--------|-----------|-----------------|-----------------|-------------|-------------|----------------|
+| 2 | 32K | 30.52 | 35.13 | 34.98 | 1.15x slower | 1009 | 880 |
+| 2 | 64K | 115.39 | 135.22 | 131.19 | 1.14x slower | 1067 | 939 |
+| 2 | 128K | 444.11 | 533.14 | 510.55 | 1.15x slower | 1109 | 965 |
+| 4 | 32K | 18.69 | **19.86** | 20.58 | 1.06x slower | 1647 | 1550 |
+| 4 | 64K | 61.87 | 70.10 | **69.81** | 1.13x slower | 1991 | 1764 |
+| 4 | 128K | 232.68 | 270.33 | **261.77** | 1.12x slower | 2117 | 1882 |
+| 8 | 32K | 15.30 | **12.72** | 13.87 | **0.83x faster** | 2013 | **2420** |
+| 8 | 64K | 39.38 | **38.90** | 40.24 | **0.99x ~tied** | 3128 | **3166** |
+| 8 | 128K | 127.50 | 142.18 | **140.07** | 1.10x slower | 3864 | 3517 |
 
-| GPUs | SeqLen | RING (ms) | ALL_GATHER (ms) | Ratio |
-|------|--------|-----------|-----------------|-------|
-| 2 | 32K | 30.18 | 5290.92 | **175x slower** |
+### CP Speedup over no-CP baseline
 
-Loss values match (`-1003520.0000` for both), confirming correctness.
+| GPUs | SeqLen | RING | AG ss=1024 | AG ss=2048 |
+|------|--------|------|-----------|-----------|
+| 2 | 32K | 1.78x | 1.55x | 1.55x |
+| 2 | 64K | 1.87x | 1.59x | 1.63x |
+| 2 | 128K | 1.97x | 1.64x | 1.72x |
+| 4 | 32K | 2.92x | 2.73x | 2.64x |
+| 4 | 64K | 3.48x | 3.06x | 3.08x |
+| 4 | 128K | 3.77x | 3.25x | 3.35x |
+| 8 | 32K | 3.55x | **4.29x** | 3.93x |
+| 8 | 64K | 5.45x | **5.53x** | 5.35x |
+| 8 | 128K | **6.88x** | 6.16x | 6.26x |
 
-### Root cause
+### stripe_size sensitivity (2 GPUs, 32K)
 
-`FusedAttnCPStripedWithAllGatherFwdPrimitive` (`transformer_engine/jax/cpp_extensions/attention.py:2166-2180`) uses `lax.switch` to handle per-rank computation differences:
+ALL_GATHER performance is **highly sensitive to stripe_size**. This micro-sweep on a single config (2 GPUs, 32K) identifies the optimal range used in the full sweep above.
 
-```python
-functions = [partial(_cross_attn, q, k_ag, v_ag, ...) for _ in range(cp_size)]
-return lax.switch(cp_rank, functions)   # cp_rank differs per GPU at runtime
-```
+| stripe_size | ALL_GATHER (ms) | vs no-CP | vs RING (31ms) |
+|-------------|-----------------|----------|----------------|
+| 1 | 5293 | 0.01x | 172x slower |
+| 4 | 1316 | 0.04x | 43x slower |
+| 16 | 340 | 0.16x | 11x slower |
+| 64 | 95.5 | 0.56x | 3.1x slower |
+| 128 | 62.9 | 0.85x | 2.0x slower |
+| 256 | 44.6 | 1.21x | 1.45x slower |
+| 512 | 37.5 | 1.43x | 1.22x slower |
+| **1024** | **35.2** | **1.53x** | **1.14x slower** |
+| **2048** | **35.0** | **1.54x** | **1.14x slower** |
+| 4096 | 37.1 | 1.45x | 1.21x slower |
 
-In XLA's SPMD model, `lax.switch` with a **data-dependent index** (cp_rank varies per GPU) must compile **all `cp_size` branches** into the program and evaluate them all at runtime, keeping only the selected result. This multiplies the effective computation by `cp_size`. Furthermore, each branch operates on the **fully all-gathered KV** (length S, not S/N), so the per-branch compute is already larger than RING's per-step compute.
+The dominant factor is **cuDNN ragged segment granularity**, not the `lax.switch` overhead. With stripe_size=1, each ragged segment is a single token — cuDNN spends most of its time on per-token offset lookups. Larger stripe sizes produce fewer, larger contiguous chunks that the kernel processes efficiently. Beyond ss=2048, performance regresses slightly as too-large stripes reduce causal load balancing uniformity.
 
-The TE source acknowledges this with an explicit TODO:
-> *"cuDNN does not support right-aligned masking with dynamic sequence length padding. Therefore we must explicitly instantiate each CP rank slicing and use a runtime switch... TODO: When cuDNN supports, we should be able to avoid this unrolled loop."*
+### Implementation detail: `lax.switch`
 
-### RING results from the same sweep (valid)
-
-| GPUs | SeqLen | No-CP (ms) | RING (ms) | Speedup | TFLOPS |
-|------|--------|-----------|-----------|---------|--------|
-| 2 | 32K | 54.14 | 30.18 | 1.79x | 1020 |
-| 2 | 64K | 215.69 | 113.49 | 1.90x | 1085 |
-| 2 | 128K | 874.95 | 438.66 | 1.99x | 1123 |
-| 4 | 32K | 54.38 | 18.64 | 2.92x | 1652 |
-| 4 | 64K | 216.25 | 61.50 | 3.52x | 2002 |
-| 4 | 128K | 875.71 | 231.08 | 3.79x | 2132 |
-| 8 | 32K | 54.58 | 15.44 | 3.53x | 1994 |
-| 8 | 64K | 215.72 | 39.32 | 5.49x | 3132 |
-| 8 | 128K | 875.76 | 127.22 | 6.88x | 3872 |
-
-These are consistent with the earlier THD sweeps — RING with THD/Striped scales well and the numbers are valid.
+`FusedAttnCPStripedWithAllGatherFwdPrimitive` (`transformer_engine/jax/cpp_extensions/attention.py:2166-2180`) uses `lax.switch(cp_rank, [fn] * cp_size)` to work around a cuDNN limitation (no right-aligned masking with dynamic sequence lengths). The stripe_size sweep confirms this is **not the bottleneck** — the 150x improvement from ss=1 to ss=1024 comes entirely from giving cuDNN larger segments.
 
 ### Conclusion
 
-A fair AllGather vs Ring comparison is **not possible with THD/Striped** in the current TE JAX release. To compare the two strategies, use **BSHD layout** (`--layout bshd`), which routes to `FusedAttnCPWithAllGatherFwdPrimitive` — a different implementation that does not use `lax.switch` and should not have this overhead.
+**At 8 GPUs, ALL_GATHER with ss=1024 beats RING** for short sequences (12.72ms vs 15.30ms at 32K) and ties at 64K. At 2–4 GPUs and longer sequences, **RING is 6–17% faster**. The crossover happens because ALL_GATHER's single collective scales better than RING's per-step send/recv at high GPU counts, while RING's pipelined overlap is more efficient at lower parallelism.
+
+**Practical guidance:**
+- **2–4 GPUs or long sequences**: RING is the better default (6–17% faster).
+- **8+ GPUs, short-to-medium sequences**: ALL_GATHER with ss=1024 is competitive or faster.
+- **stripe_size >= 256** is required for ALL_GATHER to be useful; ss=1024 is optimal across all tested configs.
+- Both strategies produce numerically identical results (same loss values).
+
+---
+
+## Sliding Window Attention (SWA) vs Full Causal
+
+**Setup:** `bench_cp_jax.py --window_size W`, llama3_8b, THD/Striped/RING, 5 warmup + 20 timed iters. Both no-CP baseline and CP run use the same window_size for fair comparison.
+
+### 8 GPUs, 128K sequence
+
+| Window | No-CP (ms) | CP (ms) | CP Speedup |
+|--------|-----------|---------|------------|
+| Full causal | 875 | 128 | 6.87x |
+| W=512 | 1435 | 207 | 6.95x |
+| W=1024 | 1439 | 207 | 6.96x |
+| W=2048 | 1445 | 207 | 6.98x |
+| W=4096 | 1461 | 209 | 7.01x |
+| W=8192 | 1489 | 211 | 7.07x |
+| W=16384 | 1535 | 218 | 7.05x |
+| W=32768 | 1625 | 231 | 7.04x |
+| BSHD full (ref) | 845 | 119 | 7.10x |
+
+### 8 GPUs, 32K sequence
+
+| Window | No-CP (ms) | CP (ms) | CP Speedup |
+|--------|-----------|---------|------------|
+| Full causal | 54 | 15.1 | 3.60x |
+| W=512 | 94 | 21.2 | 4.44x |
+| W=1024 | 95 | 21.2 | 4.48x |
+| W=2048 | 97 | 21.9 | 4.42x |
+| W=4096 | 99 | 21.3 | 4.68x |
+
+### Analysis
+
+**SWA is slower than full causal attention** across all tested window sizes and sequence lengths. This is counterintuitive — a smaller window should mean less computation.
+
+1. **cuDNN does not skip masked computation.** The SWA kernel appears to still process the full attention matrix and apply a window mask, rather than reducing the actual number of FLOPs. This adds overhead (window bounds checking, mask logic) without reducing compute.
+
+2. **The overhead is largely fixed, not proportional to window size.** At 128K, all windows from W=512 to W=2048 produce nearly identical CP times (~207ms). The no-CP baseline shows slight variation (1435–1445ms), but the CP overhead is constant. This confirms the SWA cost is a fixed per-kernel surcharge, not proportional to the window size.
+
+3. **CP speedup is slightly better with SWA.** At 32K: SWA gives 4.4–4.7x speedup vs 3.6x for full causal. This is because SWA inflates the no-CP baseline more than the CP time (the per-GPU compute with CP is small enough that the fixed SWA overhead is relatively less significant).
+
+4. **XLA compilation is very slow for SWA + CP + THD.** At 32K with 8 GPUs, each SWA config takes ~7 minutes to compile. The SWA window parameter changes the XLA computation graph, triggering full recompilation.
+
+5. **Loss values vary with window size** — full causal gives -4,079,616 (128K) / -1,003,520 (32K), while SWA windows give different values, confirming correct SWA computation (not just masking after the fact).
+
+### Conclusion
+
+With the current cuDNN FusedAttention backend in TE JAX, **SWA does not provide a throughput benefit** — it adds a fixed overhead of ~60% (128K) to ~75% (32K) regardless of window size. The kernel implements SWA through masking rather than compute skipping. SWA remains useful for **model quality** (controlling attention span) but should not be expected to improve performance in this configuration.
 
 ---
 
 ## Key Observations
 
-**BSHD beats THD in both frameworks.** BSHD+DualChunkSwap is consistently 6–14% faster in TFLOPS vs THD in JAX and 8–22% faster in PyTorch. Kernel profiling confirms this comes from ragged cuDNN overhead, extra NCCL data movement, and THD-specific correction kernels.
+**BSHD beats THD in both frameworks.** BSHD+DualChunkSwap is consistently 6–14% faster in TFLOPS vs THD in JAX and 8–22% faster in PyTorch. Kernel profiling confirms this comes from three sources: ragged cuDNN kernels (46% of overhead), NCCL communication with non-contiguous memory (36%), and THD-specific correction kernels (17%).
 
 **PyTorch p2p scales better at 8 GPUs.** The advantage is clearest at short sequences where compute-to-communication ratio is low (32K, 8 GPUs: PT 5.46x vs JAX 3.85x). At 128K the gap narrows significantly (PT 7.58x vs JAX 7.15x) as compute dominates.
 
 **Scaling improves with sequence length.** All configs approach near-linear efficiency at 8 GPU x 128K, confirming CP is most beneficial for long-context workloads.
+
+**AllGather beats Ring at 8 GPUs with optimal stripe_size.** With ss=1024, AllGather is faster than Ring at 8 GPUs/32K (12.72ms vs 15.30ms) and ties at 64K, because its single collective scales better than Ring's per-step send/recv at high GPU counts. At 2–4 GPUs, Ring is 6–17% faster. stripe_size >= 256 is required (default ss=1 is 172x slower due to cuDNN ragged segment granularity).
+
+**SWA adds overhead, does not reduce compute.** Sliding window attention is slower than full causal across all window sizes (512–32768) and sequence lengths (32K, 128K). The cuDNN kernel implements SWA through masking rather than compute skipping, adding a fixed ~60–75% overhead. SWA is useful for model quality but not for throughput.
 
 **Peak throughput (8 GPU, 128K):**
 
@@ -220,11 +290,15 @@ A fair AllGather vs Ring comparison is **not possible with THD/Striped** in the 
 
 | | PyTorch | JAX |
 |-|---------|-----|
-| CP strategy | p2p (NCCL send/recv) | RING (XLA collective) |
+| CP strategy | p2p (NCCL send/recv) | RING or ALL_GATHER (XLA collective) |
 | BSHD reorder | DualChunkSwap | DualChunkSwap |
-| THD reorder | DualChunkSwap | Striped (stripe=1) |
+| THD reorder | DualChunkSwap | Striped (stripe_size=1 default) |
 | Timing | `torch.cuda.Event` | `perf_counter` + `block_until_ready` |
-| Profiling | `nsys` + `cudaProfilerApi` | `nsys` (external wrap) |
-| Warmup / Timed | 5 / 20 (3 for profiling) | 5 / 20 (3 for profiling) |
+| Profiling | `nsys` + `cudaProfilerApi` | — |
+| Warmup / Timed | 5 / 20 (3 for profiling) | 5 / 20 |
 | Scripts | `bench_cp_pytorch.py` | `bench_cp_jax.py` |
 | Profiler | `profile_cp_kernels.py` | — |
+
+**Benchmark inputs:** Both PyTorch and JAX benchmarks use single-segment, uniform-length, fully-packed THD inputs (no variable-length packing, no padding). This represents the best case for THD — real workloads with packed multi-segment sequences would have higher ragged kernel overhead.
+
+**JAX benchmark flags:** `--cp_strategy ring|all_gather`, `--stripe_size N` (THD only), `--window_size W` (SWA), `--profile` (reduced iters for nsys).

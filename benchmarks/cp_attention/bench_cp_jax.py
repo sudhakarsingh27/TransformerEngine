@@ -71,6 +71,8 @@ def parse_args():
     parser.add_argument("--cp_strategy", type=str, default="ring",
                         choices=["ring", "all_gather"],
                         help="CP communication strategy")
+    parser.add_argument("--window_size", type=int, default=None,
+                        help="Sliding window size (symmetric). None = full causal attention")
     parser.add_argument("--baseline", action="store_true",
                         help="Also run a no-CP single-device baseline for comparison")
     parser.add_argument("--profile", action="store_true",
@@ -100,7 +102,8 @@ def setup_mesh_no_cp():
     return mesh, mesh_resource
 
 
-def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strategy):
+def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strategy,
+                       window_size=None):
     """Build a wrapper around fused_attn with the right static kwargs."""
     scaling_factor = 1.0 / sqrt(head_dim)
 
@@ -125,6 +128,7 @@ def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strat
             dropout_probability=0.0,
             is_training=True,
             max_segments_per_seq=1,
+            window_size=window_size,
             context_parallel_strategy=cp_strategy,
             context_parallel_causal_load_balanced=cp_load_balanced,
             stripe_size=stripe_size if layout == "thd" else None,
@@ -133,7 +137,7 @@ def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strat
     return attn_fn
 
 
-def make_fused_attn_fn_no_cp(layout, head_dim):
+def make_fused_attn_fn_no_cp(layout, head_dim, window_size=None):
     """Build fused_attn wrapper with no CP (single device baseline)."""
     scaling_factor = 1.0 / sqrt(head_dim)
 
@@ -158,6 +162,7 @@ def make_fused_attn_fn_no_cp(layout, head_dim):
             dropout_probability=0.0,
             is_training=True,
             max_segments_per_seq=1,
+            window_size=window_size,
             context_parallel_strategy=CPStrategy.DEFAULT,
             context_parallel_causal_load_balanced=False,
         ).astype(q.dtype)
@@ -348,6 +353,8 @@ def main():
     strategy_map = {"ring": CPStrategy.RING, "all_gather": CPStrategy.ALL_GATHER}
     cp_strategy = strategy_map[args.cp_strategy]
     strategy_label = args.cp_strategy.upper()
+    window_size = (args.window_size, args.window_size) if args.window_size else None
+    window_label = f"W={args.window_size}" if args.window_size else "full"
 
     if args.profile:
         args.iters = min(args.iters, 3)
@@ -357,7 +364,7 @@ def main():
           f"B={args.batch_size}, S={args.seq_len}, H={num_heads}, "
           f"KV_groups={num_gqa_groups}, D={head_dim}")
     print(f"Devices: {[str(d) for d in jax.devices()]} | "
-          f"CP strategy: {strategy_label} | Baseline: {args.baseline}")
+          f"CP strategy: {strategy_label} | Window: {window_label} | Baseline: {args.baseline}")
     print(f"Warmup: {args.warmup} | Timed iters: {args.iters}"
           f"{' | Profile: ON' if args.profile else ''}")
 
@@ -387,7 +394,7 @@ def main():
         bv = jax.device_put(bv, qkvo_sharding_nocp)
         bseq_desc = jax.device_put(bseq_desc, seq_desc_sharding_nocp)
 
-        attn_fn_nocp = make_fused_attn_fn_no_cp(args.layout, head_dim)
+        attn_fn_nocp = make_fused_attn_fn_no_cp(args.layout, head_dim, window_size=window_size)
 
         def loss_fn_nocp(q, k, v, seq_desc):
             return attn_fn_nocp(q, k, v, seq_desc, None).sum()
@@ -414,7 +421,7 @@ def main():
 
     # ---- CP run ----
     mesh, mesh_resource, cp_size = setup_mesh()
-    print(f"\n--- CP ({strategy_label}, {args.layout}, {cp_size} devices) ---")
+    print(f"\n--- CP ({strategy_label}, {args.layout}, {cp_size} devices, {window_label}) ---")
 
     if args.layout == "thd":
         q, k, v, seq_desc = make_inputs_thd(
@@ -446,6 +453,7 @@ def main():
         cp_load_balanced=True,
         stripe_size=args.stripe_size,
         cp_strategy=cp_strategy,
+        window_size=window_size,
     )
 
     def loss_fn(q, k, v, seq_desc):
