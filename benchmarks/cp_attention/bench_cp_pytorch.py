@@ -18,6 +18,7 @@ import os
 import argparse
 import statistics
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -51,6 +52,15 @@ def parse_args():
     parser.add_argument("--qkv_format", type=str, default="bshd",
                         choices=["bshd", "thd"],
                         help="QKV format: bshd (DualChunkSwap) or thd")
+    parser.add_argument("--cp_comm_type", type=str, default="p2p",
+                        choices=["p2p", "all_gather", "a2a"],
+                        help="CP communication type")
+    parser.add_argument("--num_segments", type=int, default=1,
+                        help="Number of packed segments per batch entry (THD only). "
+                             "1 = single uniform segment (default). >1 = packed multi-segment.")
+    parser.add_argument("--packing_eff", type=float, default=0.9,
+                        help="Fraction of seq_len filled with active tokens (default 0.9). "
+                             "Only used when --num_segments > 1.")
     parser.add_argument("--baseline", action="store_true",
                         help="Also run a no-CP single-GPU baseline for comparison")
     parser.add_argument("--verify", action="store_true",
@@ -198,6 +208,100 @@ def make_inputs_no_cp_thd(batch_size, seq_len, num_heads, num_gqa_groups, head_d
     return q, k, v, dout, cu_seqlens, cu_seqlens, cu_seqlens, cu_seqlens
 
 
+def generate_packed_segment_lengths(batch_size, seq_len, num_segments, packing_eff=0.9, seed=42):
+    """Generate variable-length segment lengths matching JAX benchmark's distribution.
+
+    Segment lengths ~ Uniform(0.5, 1.5) * mean_length, giving ~2.5:1 max/min ratio.
+    Uses the same RNG seed as the JAX benchmark for reproducibility.
+    """
+    rng = np.random.default_rng(seed=seed)
+    target_tokens = int(seq_len * packing_eff)
+    all_seg_lens = []
+    for _ in range(batch_size):
+        raw = rng.uniform(0.5, 1.5, size=num_segments)
+        raw = raw / raw.sum() * target_tokens
+        seg_lens = np.maximum(np.round(raw).astype(int), 1)
+        seg_lens[-1] += target_tokens - seg_lens.sum()
+        seg_lens[-1] = max(seg_lens[-1], 1)
+        all_seg_lens.append(seg_lens)
+    return all_seg_lens
+
+
+def make_inputs_packed_thd(batch_size, seq_len, num_heads, num_gqa_groups, head_dim,
+                           world_size, rank, dtype, num_segments, packing_eff=0.9):
+    """Generate per-rank Q/K/V/dout for packed multi-segment THD format."""
+    all_seg_lens = generate_packed_segment_lengths(
+        batch_size, seq_len, num_segments, packing_eff)
+
+    # Flatten segment lengths across batch entries
+    seqlens = torch.tensor(
+        [s for seg_lens in all_seg_lens for s in seg_lens], dtype=torch.int32)
+    seqlens_padded = (seqlens + 2 * world_size - 1) // (world_size * 2) * (world_size * 2)
+    cu_seqlens_padded = torch.cat([
+        torch.zeros([1], dtype=torch.int32),
+        seqlens_padded.cumsum(0, dtype=torch.int32),
+    ]).cuda()
+    cu_seqlens = torch.clone(cu_seqlens_padded)
+    cu_seqlens[1:] = seqlens.cumsum(0, dtype=torch.int32).cuda()
+
+    total_tokens = int(cu_seqlens_padded[-1].item())
+
+    if rank == 0:
+        seg_lens_flat = [s for seg_lens in all_seg_lens for s in seg_lens]
+        print(f"  Packing: {num_segments} segments, efficiency={packing_eff:.0%}, "
+              f"seg_lens=[{min(seg_lens_flat)}..{max(seg_lens_flat)}], "
+              f"mean={np.mean(seg_lens_flat):.0f}, total_tokens(padded)={total_tokens}")
+
+    q_full = torch.randn(total_tokens, num_heads, head_dim, dtype=dtype, device="cuda")
+    k_full = torch.randn(total_tokens, num_gqa_groups, head_dim, dtype=dtype, device="cuda")
+    v_full = torch.randn(total_tokens, num_gqa_groups, head_dim, dtype=dtype, device="cuda")
+    dout_full = torch.randn(total_tokens, num_heads, head_dim, dtype=dtype, device="cuda")
+
+    seq_idx = tex.thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, world_size, rank)
+    q = q_full.index_select(0, seq_idx).contiguous().requires_grad_(True)
+    k = k_full.index_select(0, seq_idx).contiguous().requires_grad_(True)
+    v = v_full.index_select(0, seq_idx).contiguous().requires_grad_(True)
+    dout_local = dout_full.index_select(0, seq_idx).contiguous()
+    dout = dout_local.reshape(-1, num_heads * head_dim)
+
+    return (q, k, v, dout, cu_seqlens, cu_seqlens, cu_seqlens_padded, cu_seqlens_padded,
+            q_full, k_full, v_full, dout_full)
+
+
+def make_inputs_no_cp_packed_thd(batch_size, seq_len, num_heads, num_gqa_groups, head_dim,
+                                 dtype, num_segments, packing_eff=0.9):
+    """Generate Q/K/V/dout for single-GPU no-CP baseline with packed multi-segment THD."""
+    all_seg_lens = generate_packed_segment_lengths(
+        batch_size, seq_len, num_segments, packing_eff)
+
+    seqlens = torch.tensor(
+        [s for seg_lens in all_seg_lens for s in seg_lens], dtype=torch.int32)
+    cu_seqlens = torch.cat([
+        torch.zeros([1], dtype=torch.int32),
+        seqlens.cumsum(0, dtype=torch.int32),
+    ]).cuda()
+
+    total_tokens = int(cu_seqlens[-1].item())
+
+    q = torch.randn(total_tokens, num_heads, head_dim, dtype=dtype,
+                    device="cuda").requires_grad_(True)
+    k = torch.randn(total_tokens, num_gqa_groups, head_dim, dtype=dtype,
+                    device="cuda").requires_grad_(True)
+    v = torch.randn(total_tokens, num_gqa_groups, head_dim, dtype=dtype,
+                    device="cuda").requires_grad_(True)
+    dout = torch.randn(total_tokens, num_heads * head_dim, dtype=dtype, device="cuda")
+    return q, k, v, dout, cu_seqlens, cu_seqlens, cu_seqlens, cu_seqlens
+
+
+def compute_flops_packed(batch_size, num_heads, head_dim, seg_lens_list):
+    """Compute causal fwd+bwd FLOPs for packed multi-segment sequences."""
+    total_sq = sum(s * s for seg_lens in seg_lens_list for s in seg_lens)
+    fwd_flops = 4 * num_heads * head_dim * total_sq
+    fwd_bwd_flops = 3.5 * fwd_flops
+    causal_flops = 0.5 * fwd_bwd_flops
+    return causal_flops
+
+
 def compute_flops(batch_size, seq_len, num_heads, head_dim):
     """Compute causal fwd+bwd FLOPs."""
     fwd_flops = 4 * batch_size * num_heads * seq_len * seq_len * head_dim
@@ -209,11 +313,15 @@ def compute_flops(batch_size, seq_len, num_heads, head_dim):
 def benchmark_attn(core_attn, q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pad,
                    warmup, iters, profile=False):
     """Run warmup + timed iterations, return list of times in ms."""
-    for _ in range(warmup):
+    nvtx = torch.cuda.nvtx
+
+    for i in range(warmup):
         if q.grad is not None:
             q.grad = None
             k.grad = None
             v.grad = None
+        if profile:
+            nvtx.range_push(f"warmup_{i}")
         out = core_attn(
             q, k, v,
             cu_seqlens_q=cu_sq,
@@ -222,13 +330,15 @@ def benchmark_attn(core_attn, q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pa
             cu_seqlens_kv_padded=cu_skv_pad,
         )
         out.backward(dout)
+        if profile:
+            nvtx.range_pop()
         torch.cuda.synchronize()
 
     if profile:
         torch.cuda.cudart().cudaProfilerStart()
 
     times_ms = []
-    for _ in range(iters):
+    for i in range(iters):
         if q.grad is not None:
             q.grad = None
             k.grad = None
@@ -237,7 +347,13 @@ def benchmark_attn(core_attn, q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pa
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
+        if profile:
+            nvtx.range_push(f"iter_{i}")
+
         start.record()
+
+        if profile:
+            nvtx.range_push("forward")
         out = core_attn(
             q, k, v,
             cu_seqlens_q=cu_sq,
@@ -245,8 +361,18 @@ def benchmark_attn(core_attn, q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pa
             cu_seqlens_q_padded=cu_sq_pad,
             cu_seqlens_kv_padded=cu_skv_pad,
         )
+        if profile:
+            nvtx.range_pop()
+
+        if profile:
+            nvtx.range_push("backward")
         out.backward(dout)
+        if profile:
+            nvtx.range_pop()
+
         end.record()
+        if profile:
+            nvtx.range_pop()
         torch.cuda.synchronize()
         times_ms.append(start.elapsed_time(end))
 
@@ -258,7 +384,8 @@ def benchmark_attn(core_attn, q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pa
 
 def verify_cp_correctness(rank, world_size, cp_group, cp_ranks,
                           num_heads, num_gqa_groups, head_dim,
-                          batch_size, seq_len, qkv_format, dtype):
+                          batch_size, seq_len, qkv_format, dtype,
+                          cp_comm_type="p2p"):
     """Run no-CP on rank 0 with full data, then CP with same data, compare outputs."""
     if rank == 0:
         print(f"\n{'='*60}")
@@ -333,7 +460,7 @@ def verify_cp_correctness(rank, world_size, cp_group, cp_ranks,
         qkv_format=qkv_format,
         attn_mask_type=attn_mask_type,
     ).cuda()
-    cp_attn.set_context_parallel_group(cp_group, cp_ranks, torch.cuda.Stream(), "p2p")
+    cp_attn.set_context_parallel_group(cp_group, cp_ranks, torch.cuda.Stream(), cp_comm_type)
 
     out_cp = cp_attn(
         q_cp, k_cp, v_cp,
@@ -411,12 +538,13 @@ def verify_cp_correctness(rank, world_size, cp_group, cp_ranks,
     torch.cuda.empty_cache()
 
 
-def report_results(label, times_ms, batch_size, seq_len, num_heads, head_dim):
+def report_results(label, times_ms, batch_size, seq_len, num_heads, head_dim, flops=None):
     """Compute and return a dict of metrics."""
     median_ms = statistics.median(times_ms)
     mean_ms = statistics.mean(times_ms)
     std_ms = statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0
-    flops = compute_flops(batch_size, seq_len, num_heads, head_dim)
+    if flops is None:
+        flops = compute_flops(batch_size, seq_len, num_heads, head_dim)
     tflops = flops / (median_ms / 1000.0) / 1e12
     tokens_per_sec = batch_size * seq_len / (median_ms / 1000.0)
     return {
@@ -458,21 +586,34 @@ def main():
 
     num_heads, num_gqa_groups, head_dim = MODEL_CONFIGS[args.config]
     dtype = torch.bfloat16
+    num_segments = args.num_segments
+    is_packed = args.qkv_format == "thd" and num_segments > 1
 
     if args.qkv_format == "thd":
         attn_mask_type = "padding_causal"
     else:
         attn_mask_type = "causal"
 
+    # Precompute packed FLOPS if needed
+    packed_flops = None
+    if is_packed:
+        all_seg_lens = generate_packed_segment_lengths(
+            args.batch_size, args.seq_len, num_segments, args.packing_eff)
+        packed_flops = compute_flops_packed(
+            args.batch_size, num_heads, head_dim, all_seg_lens)
+
     if args.profile:
-        args.iters = min(args.iters, 3)
+        args.iters = min(args.iters, 5)
         args.warmup = min(args.warmup, 2)
 
     if rank == 0:
-        print(f"Config: {args.config} | Format: {args.qkv_format} | "
+        packing_label = (f" | Packed({num_segments}seg, {args.packing_eff:.0%})"
+                         if is_packed else "")
+        print(f"Config: {args.config} | Format: {args.qkv_format}{packing_label} | "
               f"B={args.batch_size}, S={args.seq_len}, H={num_heads}, "
               f"KV_groups={num_gqa_groups}, D={head_dim}")
-        print(f"CP size: {world_size} | Baseline: {args.baseline} | Verify: {args.verify}")
+        print(f"CP size: {world_size} | Comm: {args.cp_comm_type} | "
+              f"Baseline: {args.baseline} | Verify: {args.verify}")
         print(f"Warmup: {args.warmup} | Timed iters: {args.iters}"
               f"{' | Profile: ON' if args.profile else ''}")
 
@@ -482,6 +623,7 @@ def main():
             rank, world_size, cp_group, cp_ranks,
             num_heads, num_gqa_groups, head_dim,
             args.batch_size, args.seq_len, args.qkv_format, dtype,
+            cp_comm_type=args.cp_comm_type,
         )
 
     results = []
@@ -505,6 +647,12 @@ def main():
                 make_inputs_no_cp_bshd(
                     args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim, dtype,
                 )
+        elif is_packed:
+            bq, bk, bv, bdout, bcu_sq, bcu_skv, bcu_sq_pad, bcu_skv_pad = \
+                make_inputs_no_cp_packed_thd(
+                    args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim, dtype,
+                    num_segments, args.packing_eff,
+                )
         else:
             bq, bk, bv, bdout, bcu_sq, bcu_skv, bcu_sq_pad, bcu_skv_pad = \
                 make_inputs_no_cp_thd(
@@ -519,6 +667,7 @@ def main():
         results.append(report_results(
             f"no-CP ({args.qkv_format})", baseline_times,
             args.batch_size, args.seq_len, num_heads, head_dim,
+            flops=packed_flops,
         ))
 
         # Free baseline tensors
@@ -527,7 +676,7 @@ def main():
 
     # ---- CP run ----
     if rank == 0:
-        print(f"\n--- CP (p2p, {args.qkv_format}, {world_size} GPUs) ---")
+        print(f"\n--- CP ({args.cp_comm_type}, {args.qkv_format}, {world_size} GPUs) ---")
 
     core_attn = DotProductAttention(
         num_heads,
@@ -542,7 +691,7 @@ def main():
         cp_group,
         cp_ranks,
         torch.cuda.Stream(),
-        "p2p",
+        args.cp_comm_type,
     )
 
     if args.qkv_format == "bshd":
@@ -550,6 +699,12 @@ def main():
             args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim,
             world_size, rank, dtype,
         )
+    elif is_packed:
+        q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pad, _, _, _, _ = \
+            make_inputs_packed_thd(
+                args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim,
+                world_size, rank, dtype, num_segments, args.packing_eff,
+            )
     else:
         q, k, v, dout, cu_sq, cu_skv, cu_sq_pad, cu_skv_pad, _, _, _, _ = make_inputs_thd(
             args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim,
@@ -565,8 +720,9 @@ def main():
         args.warmup, args.iters, profile=args.profile,
     )
     results.append(report_results(
-        f"CP-p2p ({args.qkv_format})", cp_times,
+        f"CP-{args.cp_comm_type} ({args.qkv_format})", cp_times,
         args.batch_size, args.seq_len, num_heads, head_dim,
+        flops=packed_flops,
     ))
 
     # ---- Print comparison ----

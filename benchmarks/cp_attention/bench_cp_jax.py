@@ -73,6 +73,13 @@ def parse_args():
                         help="CP communication strategy")
     parser.add_argument("--window_size", type=int, default=None,
                         help="Sliding window size (symmetric). None = full causal attention")
+    parser.add_argument("--num_segments", type=int, default=1,
+                        help="Number of packed segments per sequence (THD only). "
+                             "1 = single uniform segment (default, fake THD). "
+                             ">1 = true packed multi-segment THD.")
+    parser.add_argument("--packing_eff", type=float, default=0.9,
+                        help="Fraction of seq_len filled with active tokens (default 0.9). "
+                             "Remaining tokens are trailing padding (segment_id=0).")
     parser.add_argument("--baseline", action="store_true",
                         help="Also run a no-CP single-device baseline for comparison")
     parser.add_argument("--profile", action="store_true",
@@ -102,8 +109,78 @@ def setup_mesh_no_cp():
     return mesh, mesh_resource
 
 
+def generate_packed_segment_ids(batch_size, seq_len, num_segments, packing_eff=0.9, seed=42):
+    """Generate packed multi-segment IDs and positions with realistic lengths.
+
+    Segment lengths are drawn from Uniform(0.5, 1.5) * mean_length, giving a
+    ~3:1 max/min ratio. Trailing positions (1 - packing_eff fraction) are
+    padding with segment_id=0.
+
+    Example with seq_len=10, num_segments=3, packing_eff=0.9:
+      target_tokens = 9
+      seg_lens ~ [3, 2, 4]  (variable, sum=9)
+      segment_ids: [1, 1, 1, 2, 2, 3, 3, 3, 3, 0]
+      segment_pos: [0, 1, 2, 0, 1, 0, 1, 2, 3, 0]
+    """
+    rng = np.random.default_rng(seed=seed)
+    segment_ids = np.zeros((batch_size, seq_len), dtype=np.int32)
+    segment_pos = np.zeros((batch_size, seq_len), dtype=np.int32)
+
+    target_tokens = int(seq_len * packing_eff)
+    for i in range(batch_size):
+        raw = rng.uniform(0.5, 1.5, size=num_segments)
+        raw = raw / raw.sum() * target_tokens
+        seg_lens = np.maximum(np.round(raw).astype(int), 1)
+        seg_lens[-1] += target_tokens - seg_lens.sum()  # fix rounding
+        seg_lens[-1] = max(seg_lens[-1], 1)
+
+        current_pos = 0
+        for seg, slen in enumerate(seg_lens):
+            segment_ids[i, current_pos:current_pos + slen] = seg + 1
+            segment_pos[i, current_pos:current_pos + slen] = np.arange(slen)
+            current_pos += slen
+
+    segment_ids = jnp.asarray(segment_ids)
+    segment_pos = jnp.asarray(segment_pos)
+
+    # Compute packing stats
+    active_tokens = int(jnp.sum(segment_ids > 0))
+    total_tokens = batch_size * seq_len
+    packing_efficiency = active_tokens / total_tokens
+    seg_lengths = []
+    for i in range(batch_size):
+        ids = np.array(segment_ids[i])
+        for s in range(1, num_segments + 1):
+            slen = int(np.sum(ids == s))
+            if slen > 0:
+                seg_lengths.append(slen)
+    print(f"  Packing: {num_segments} segments, efficiency={packing_efficiency:.1%}, "
+          f"seg_lens=[{min(seg_lengths)}..{max(seg_lengths)}], "
+          f"mean={np.mean(seg_lengths):.0f}")
+
+    return segment_ids, segment_pos
+
+
+def compute_flops_packed(batch_size, num_heads, head_dim, segment_ids):
+    """Compute causal fwd+bwd FLOPs for packed multi-segment sequences.
+
+    Each segment has independent causal attention, so total FLOPs is
+    sum(s_i^2) across all segments, not S^2.
+    """
+    ids_np = np.array(segment_ids)
+    total_sq = 0
+    for i in range(batch_size):
+        for seg_id in range(1, int(ids_np[i].max()) + 1):
+            seg_len = int(np.sum(ids_np[i] == seg_id))
+            total_sq += seg_len * seg_len
+    fwd_flops = 4 * num_heads * head_dim * total_sq
+    fwd_bwd_flops = 3.5 * fwd_flops
+    causal_flops = 0.5 * fwd_bwd_flops
+    return causal_flops
+
+
 def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strategy,
-                       window_size=None):
+                       window_size=None, max_segments_per_seq=1):
     """Build a wrapper around fused_attn with the right static kwargs."""
     scaling_factor = 1.0 / sqrt(head_dim)
 
@@ -127,7 +204,7 @@ def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strat
             scaling_factor=scaling_factor,
             dropout_probability=0.0,
             is_training=True,
-            max_segments_per_seq=1,
+            max_segments_per_seq=max_segments_per_seq,
             window_size=window_size,
             context_parallel_strategy=cp_strategy,
             context_parallel_causal_load_balanced=cp_load_balanced,
@@ -137,7 +214,7 @@ def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strat
     return attn_fn
 
 
-def make_fused_attn_fn_no_cp(layout, head_dim, window_size=None):
+def make_fused_attn_fn_no_cp(layout, head_dim, window_size=None, max_segments_per_seq=1):
     """Build fused_attn wrapper with no CP (single device baseline)."""
     scaling_factor = 1.0 / sqrt(head_dim)
 
@@ -161,7 +238,7 @@ def make_fused_attn_fn_no_cp(layout, head_dim, window_size=None):
             scaling_factor=scaling_factor,
             dropout_probability=0.0,
             is_training=True,
-            max_segments_per_seq=1,
+            max_segments_per_seq=max_segments_per_seq,
             window_size=window_size,
             context_parallel_strategy=CPStrategy.DEFAULT,
             context_parallel_causal_load_balanced=False,
@@ -171,7 +248,7 @@ def make_fused_attn_fn_no_cp(layout, head_dim, window_size=None):
 
 
 def make_inputs_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, cp_size,
-                    stripe_size, dtype):
+                    stripe_size, dtype, num_segments=1, packing_eff=0.9):
     """Generate Q/K/V and SequenceDescriptor for THD + Striped layout."""
     key = jax.random.PRNGKey(0)
     q_key, k_key, v_key = jax.random.split(key, 3)
@@ -180,8 +257,15 @@ def make_inputs_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, cp
     k = jax.random.uniform(k_key, (batch_size, seq_len, num_heads_kv, head_dim), dtype, -1.0)
     v = jax.random.uniform(v_key, (batch_size, seq_len, num_heads_kv, head_dim), dtype, -1.0)
 
-    segment_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
-    segment_pos = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32), (batch_size, seq_len))
+    if num_segments == 1:
+        segment_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+        segment_pos = jnp.broadcast_to(
+            jnp.arange(seq_len, dtype=jnp.int32), (batch_size, seq_len),
+        )
+    else:
+        segment_ids, segment_pos = generate_packed_segment_ids(
+            batch_size, seq_len, num_segments, packing_eff=packing_eff,
+        )
 
     reorder_fn = partial(
         reorder_causal_load_balancing,
@@ -203,7 +287,7 @@ def make_inputs_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, cp
         is_segment_ids_reordered=True,
     )
 
-    return q, k, v, seq_desc
+    return q, k, v, seq_desc, segment_ids
 
 
 def make_inputs_bshd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, cp_size, dtype):
@@ -231,7 +315,8 @@ def make_inputs_bshd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, c
     return q, k, v, seq_desc
 
 
-def make_inputs_no_cp_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, dtype):
+def make_inputs_no_cp_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, dtype,
+                          num_segments=1, packing_eff=0.9):
     """Generate Q/K/V and SequenceDescriptor for THD, no CP."""
     key = jax.random.PRNGKey(0)
     q_key, k_key, v_key = jax.random.split(key, 3)
@@ -240,8 +325,15 @@ def make_inputs_no_cp_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_d
     k = jax.random.uniform(k_key, (batch_size, seq_len, num_heads_kv, head_dim), dtype, -1.0)
     v = jax.random.uniform(v_key, (batch_size, seq_len, num_heads_kv, head_dim), dtype, -1.0)
 
-    segment_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
-    segment_pos = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32), (batch_size, seq_len))
+    if num_segments == 1:
+        segment_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+        segment_pos = jnp.broadcast_to(
+            jnp.arange(seq_len, dtype=jnp.int32), (batch_size, seq_len),
+        )
+    else:
+        segment_ids, segment_pos = generate_packed_segment_ids(
+            batch_size, seq_len, num_segments, packing_eff=packing_eff,
+        )
 
     seq_desc = SequenceDescriptor.from_segment_ids_and_pos(
         (segment_ids, segment_ids),
@@ -250,7 +342,7 @@ def make_inputs_no_cp_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_d
         is_segment_ids_reordered=False,
     )
 
-    return q, k, v, seq_desc
+    return q, k, v, seq_desc, segment_ids
 
 
 def make_inputs_no_cp_bshd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, dtype):
@@ -308,12 +400,15 @@ def compute_flops(batch_size, seq_len, num_heads, head_dim):
     return causal_flops
 
 
-def report_results(label, times_ms, batch_size, seq_len, num_heads, head_dim):
+def report_results(label, times_ms, batch_size, seq_len, num_heads, head_dim,
+                   flops_override=None):
     """Compute and return a dict of metrics."""
     median_ms = statistics.median(times_ms)
     mean_ms = statistics.mean(times_ms)
     std_ms = statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0
-    flops = compute_flops(batch_size, seq_len, num_heads, head_dim)
+    flops = flops_override if flops_override is not None else compute_flops(
+        batch_size, seq_len, num_heads, head_dim,
+    )
     tflops = flops / (median_ms / 1000.0) / 1e12
     tokens_per_sec = batch_size * seq_len / (median_ms / 1000.0)
     return {
@@ -355,16 +450,20 @@ def main():
     strategy_label = args.cp_strategy.upper()
     window_size = (args.window_size, args.window_size) if args.window_size else None
     window_label = f"W={args.window_size}" if args.window_size else "full"
+    num_segments = args.num_segments
+    max_segments_per_seq = num_segments + 1 if num_segments > 1 else 1
+    packing_label = f"packed({num_segments}seg)" if num_segments > 1 else "uniform"
 
     if args.profile:
-        args.iters = min(args.iters, 3)
+        args.iters = min(args.iters, 5)
         args.warmup = min(args.warmup, 2)
 
     print(f"Config: {args.config} | Layout: {args.layout} | "
           f"B={args.batch_size}, S={args.seq_len}, H={num_heads}, "
           f"KV_groups={num_gqa_groups}, D={head_dim}")
     print(f"Devices: {[str(d) for d in jax.devices()]} | "
-          f"CP strategy: {strategy_label} | Window: {window_label} | Baseline: {args.baseline}")
+          f"CP strategy: {strategy_label} | Window: {window_label} | "
+          f"Packing: {packing_label} | Baseline: {args.baseline}")
     print(f"Warmup: {args.warmup} | Timed iters: {args.iters}"
           f"{' | Profile: ON' if args.profile else ''}")
 
@@ -376,13 +475,15 @@ def main():
         mesh_nocp, mr_nocp = setup_mesh_no_cp()
 
         if args.layout == "thd":
-            bq, bk, bv, bseq_desc = make_inputs_no_cp_thd(
+            bq, bk, bv, bseq_desc, b_seg_ids = make_inputs_no_cp_thd(
                 args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim, dtype,
+                num_segments=num_segments, packing_eff=args.packing_eff,
             )
         else:
             bq, bk, bv, bseq_desc = make_inputs_no_cp_bshd(
                 args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim, dtype,
             )
+            b_seg_ids = None
 
         qkvo_sharding_nocp = NamedSharding(mesh_nocp, PartitionSpec(
             mr_nocp.dp_resource, mr_nocp.cp_resource, mr_nocp.tpsp_resource, None,
@@ -394,7 +495,10 @@ def main():
         bv = jax.device_put(bv, qkvo_sharding_nocp)
         bseq_desc = jax.device_put(bseq_desc, seq_desc_sharding_nocp)
 
-        attn_fn_nocp = make_fused_attn_fn_no_cp(args.layout, head_dim, window_size=window_size)
+        attn_fn_nocp = make_fused_attn_fn_no_cp(
+            args.layout, head_dim, window_size=window_size,
+            max_segments_per_seq=max_segments_per_seq,
+        )
 
         def loss_fn_nocp(q, k, v, seq_desc):
             return attn_fn_nocp(q, k, v, seq_desc, None).sum()
@@ -412,9 +516,15 @@ def main():
             grad_fn_nocp_jit, bq, bk, bv, bseq_desc,
             mesh_nocp, mr_nocp, args.warmup, args.iters,
         )
+        baseline_flops = (
+            compute_flops_packed(args.batch_size, num_heads, head_dim, b_seg_ids)
+            if num_segments > 1 and b_seg_ids is not None
+            else None
+        )
         results.append(report_results(
             f"no-CP ({args.layout})", baseline_times,
             args.batch_size, args.seq_len, num_heads, head_dim,
+            flops_override=baseline_flops,
         ))
 
         del bq, bk, bv, bseq_desc, grad_fn_nocp_jit
@@ -424,15 +534,17 @@ def main():
     print(f"\n--- CP ({strategy_label}, {args.layout}, {cp_size} devices, {window_label}) ---")
 
     if args.layout == "thd":
-        q, k, v, seq_desc = make_inputs_thd(
+        q, k, v, seq_desc, cp_seg_ids = make_inputs_thd(
             args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim,
-            cp_size, args.stripe_size, dtype,
+            cp_size, args.stripe_size, dtype, num_segments=num_segments,
+            packing_eff=args.packing_eff,
         )
     else:
         q, k, v, seq_desc = make_inputs_bshd(
             args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim,
             cp_size, dtype,
         )
+        cp_seg_ids = None
 
     qkvo_pspec = PartitionSpec(
         mesh_resource.dp_resource,
@@ -454,6 +566,7 @@ def main():
         stripe_size=args.stripe_size,
         cp_strategy=cp_strategy,
         window_size=window_size,
+        max_segments_per_seq=max_segments_per_seq,
     )
 
     def loss_fn(q, k, v, seq_desc):
@@ -469,9 +582,15 @@ def main():
         grad_fn_jit, q, k, v, seq_desc,
         mesh, mesh_resource, args.warmup, args.iters,
     )
+    cp_flops = (
+        compute_flops_packed(args.batch_size, num_heads, head_dim, cp_seg_ids)
+        if num_segments > 1 and cp_seg_ids is not None
+        else None
+    )
     results.append(report_results(
         f"CP-{strategy_label} ({args.layout})", cp_times,
         args.batch_size, args.seq_len, num_heads, head_dim,
+        flops_override=cp_flops,
     ))
 
     # ---- Print comparison ----
