@@ -23,8 +23,9 @@
 5. [Sliding Window Attention (SWA) vs Full Causal](#sliding-window-attention-swa-vs-full-causal)
    - [A. Uniform THD SWA](#a-uniform-thd-single-segment)
    - [B. Packed THD SWA](#b-packed-thd-8-segments-90-packing)
-6. [Key Observations](#key-observations)
-7. [Setup](#setup)
+6. [Variable-Length THD: Reorder Strategy x CP Strategy](#variable-length-thd-reorder-strategy-x-cp-strategy)
+7. [Key Observations](#key-observations)
+8. [Setup](#setup)
 
 ---
 
@@ -356,6 +357,60 @@ With the current cuDNN FusedAttention backend in TE JAX, **SWA does not reduce a
 
 ---
 
+## Variable-Length THD: Reorder Strategy x CP Strategy
+
+**Setup:** `bench_cp_jax.py --seqlens 1024,2048,8192 --layout thd --baseline`, llama3_8b, cp_size=4, 5 warmup + 20 timed iters. Three variable-length sequences (1K, 2K, 8K tokens) packed as separate batch elements in a single THD tensor padded to 8192. FLOPS computed per-sequence using sum(s_i^2).
+
+**Date:** 2026-03-06
+
+This sweep tests all valid combinations of {causal, SWA(1024,0)} x {RING, ALL_GATHER} x {DualChunkSwap, Striped} for THD layout.
+
+### Supported combinations
+
+| # | Attn | CP Strategy | Reorder | stripe_size | Status |
+|---|------|-------------|---------|-------------|--------|
+| 1 | causal | RING | DualChunkSwap | — | OK |
+| 2 | causal | RING | Striped | 1 | OK |
+| 3 | causal | AG | DualChunkSwap | — | **BLOCKED** |
+| 4 | causal | AG | Striped | 1024 | OK |
+| 5 | SWA(1024,0) | RING | DualChunkSwap | — | OK |
+| 6 | SWA(1024,0) | RING | Striped | 1 | OK |
+| 7 | SWA(1024,0) | AG | DualChunkSwap | — | **BLOCKED** |
+| 8 | SWA(1024,0) | AG | Striped | 1024 | OK |
+
+> **Configs 3 and 7 fail** with `ValueError: Context parallel fused attention only supports Dual Chunk load balancing with BSHD layouts and Striped load balancing with THD layouts`. This is a TE/cuDNN restriction — DualChunkSwap is only allowed with BSHD, Striped only with THD, when using ALL_GATHER. RING does not enforce this constraint.
+
+### Results: Causal Attention
+
+| # | Reorder | CP Strategy | no-CP (ms) | CP (ms) | Speedup | CP TFLOPS |
+|---|---------|-------------|------------|---------|---------|-----------|
+| 1 | DualChunkSwap | RING | 4.69 | 4.18 | **1.12x** | 496 |
+| 2 | Striped(ss=1) | RING | 4.70 | 4.36 | 1.08x | 476 |
+| 4 | Striped(ss=1024) | AG | 4.70 | **3.57** | **1.32x** | **580** |
+
+### Results: SWA(1024,0)
+
+| # | Reorder | CP Strategy | no-CP (ms) | CP (ms) | Speedup | CP TFLOPS |
+|---|---------|-------------|------------|---------|---------|-----------|
+| 5 | DualChunkSwap | RING | 2.53 | 4.22 | 0.60x | 491 |
+| 6 | Striped(ss=1) | RING | 2.53 | 4.34 | 0.58x | 478 |
+| 8 | Striped(ss=1024) | AG | 2.53 | **3.39** | **0.75x** | **612** |
+
+### Analysis
+
+**Causal — AG+Striped wins convincingly.** AG with ss=1024 is the fastest config at 3.57ms (1.32x speedup), beating both RING variants. DualChunkSwap+RING (1.12x) edges out Striped+RING (1.08x). The DualChunkSwap advantage with RING is consistent with its better load balancing for variable-length inputs — it pairs early and late chunks rather than interleaving individual tokens.
+
+**SWA — all configs slower than no-CP.** With window_size=(1024,0) the per-sequence compute is very small (max 8K tokens with a 1K window). The no-CP baseline drops from ~4.7ms (causal) to ~2.5ms (SWA), leaving almost nothing to parallelize. AG+Striped is least bad at 0.75x. SWA + CP with these short sequences is not practical — the sequences need to be much longer for the communication overhead to be amortized.
+
+**DualChunkSwap works with RING+THD.** While AG enforces Striped-only for THD, RING allows both reorder strategies. DualChunkSwap with RING is slightly better than Striped with RING, suggesting DualChunkSwap's chunk-pairing produces better load balance for this variable-length workload.
+
+**Practical takeaway for variable-length THD at cp_size=4:**
+- **Causal:** Use AG + Striped(ss=1024) for best throughput.
+- **SWA with short sequences:** CP is not beneficial; run on fewer GPUs.
+- **DualChunkSwap + AG is not an option** for THD in current TE — this is a hard restriction.
+
+---
+
 ## Key Observations
 
 **BSHD beats THD in both frameworks.** BSHD+DualChunkSwap is consistently 6–14% faster in TFLOPS vs THD in JAX and 8–22% faster in PyTorch. Kernel profiling confirms this comes from three sources: ragged cuDNN kernels (46% of overhead), NCCL communication with non-contiguous memory (36%), and THD-specific correction kernels (17%).
@@ -366,7 +421,9 @@ With the current cuDNN FusedAttention backend in TE JAX, **SWA does not reduce a
 
 **AllGather dominates Ring for packed THD at 4+ GPUs.** With realistic multi-segment packing (8 segments, 90% efficiency), AG ss=1024 is up to 2.3x faster than RING at 8 GPUs. RING even drops below 1.0x speedup (slower than no-CP) at 8 GPUs/32K packed. For uniform single-segment THD, RING still leads at 2–4 GPUs but AG wins at 8 GPUs. stripe_size >= 256 is required (default ss=1 is 172x slower due to cuDNN ragged segment granularity).
 
-**SWA adds overhead but can improve CP ratio.** Sliding window attention is slower than full causal across all window sizes — cuDNN implements SWA through masking rather than compute skipping. However, SWA inflates single-GPU time more than multi-GPU time, which *improves* the CP speedup ratio. With packed THD at 8 GPUs/32K, SWA flips RING CP from a net loss (0.73x) to a net win (1.35–1.54x). SWA is primarily useful for model quality, but has this indirect throughput benefit for packed workloads at high parallelism.
+**SWA adds overhead but can improve CP ratio.** Sliding window attention is slower than full causal across all window sizes — cuDNN implements SWA through masking rather than compute skipping. However, SWA inflates single-GPU time more than multi-GPU time, which *improves* the CP speedup ratio. With packed THD at 8 GPUs/32K, SWA flips RING CP from a net loss (0.73x) to a net win (1.35–1.54x). SWA is primarily useful for model quality, but has this indirect throughput benefit for packed workloads at high parallelism. With very short variable-length sequences (1K–8K), SWA+CP is a net loss across all strategies — sequences need to be long enough for communication to be amortized.
+
+**DualChunkSwap+THD works with RING but not AG.** TE enforces a hard restriction: ALL_GATHER requires Striped for THD (and DualChunkSwap for BSHD). RING has no such constraint. With RING, DualChunkSwap+THD slightly outperforms Striped+THD for variable-length inputs (1.12x vs 1.08x speedup at cp_size=4), suggesting DualChunkSwap's chunk-pairing produces better load balance than Striped interleaving for heterogeneous sequence lengths.
 
 **Peak throughput (8 GPU, 128K):**
 
@@ -388,7 +445,7 @@ With the current cuDNN FusedAttention backend in TE JAX, **SWA does not reduce a
 |-|---------|-----|
 | CP strategy | p2p (NCCL send/recv) | RING or ALL_GATHER (XLA collective) |
 | BSHD reorder | DualChunkSwap | DualChunkSwap |
-| THD reorder | DualChunkSwap | Striped (stripe_size=1 default) |
+| THD reorder | DualChunkSwap | Striped (default) or DualChunkSwap (RING only) |
 | Timing | `torch.cuda.Event` | `perf_counter` + `block_until_ready` |
 | Profiling | `nsys` + `cudaProfilerApi` | — |
 | Warmup / Timed | 5 / 20 (3 for profiling) | 5 / 20 |
@@ -417,4 +474,6 @@ Trailing padding: 3277 tokens (10%, segment_id=0)
 - Each segment has **independent causal attention** — no cross-segment attention.
 - FLOPS are computed as `sum(s_i^2)`, not `S^2`, for accurate TFLOPS reporting.
 
-**JAX benchmark flags:** `--cp_strategy ring|all_gather`, `--stripe_size N` (THD only), `--num_segments N` + `--packing_eff F` (packed THD), `--window_size W` (SWA), `--profile` (reduced iters for nsys).
+**Variable-length THD** (`--seqlens 1024,2048,8192`): Three sequences of different lengths batched together. Each batch element has segment_id=1 for active tokens and segment_id=0 for padding up to the max length (8192). This simulates realistic inference/training with heterogeneous sequence lengths. FLOPS computed as sum(s_i^2) across all sequences.
+
+**JAX benchmark flags:** `--cp_strategy ring|all_gather`, `--stripe_size N` (THD only), `--reorder_strategy striped|dualchunkswap` (override default), `--seqlens L1,L2,...` (variable-length THD), `--num_segments N` + `--packing_eff F` (packed THD), `--window_size W1 [W2]` (SWA, one or two values), `--profile` (reduced iters for nsys).

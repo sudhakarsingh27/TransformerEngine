@@ -71,8 +71,16 @@ def parse_args():
     parser.add_argument("--cp_strategy", type=str, default="ring",
                         choices=["ring", "all_gather"],
                         help="CP communication strategy")
-    parser.add_argument("--window_size", type=int, default=None,
-                        help="Sliding window size (symmetric). None = full causal attention")
+    parser.add_argument("--reorder_strategy", type=str, default=None,
+                        choices=["striped", "dualchunkswap"],
+                        help="Reorder strategy override. Default: striped for THD, "
+                             "dualchunkswap for BSHD")
+    parser.add_argument("--window_size", type=int, nargs="*", default=None,
+                        help="Sliding window size. Single value = symmetric (left, left). "
+                             "Two values = (left, right). None = full causal attention")
+    parser.add_argument("--seqlens", type=str, default=None,
+                        help="Comma-separated per-sequence lengths for variable-length THD, "
+                             "e.g. '1024,2048,8192'. Sets batch_size = number of sequences.")
     parser.add_argument("--num_segments", type=int, default=1,
                         help="Number of packed segments per sequence (THD only). "
                              "1 = single uniform segment (default, fake THD). "
@@ -180,7 +188,8 @@ def compute_flops_packed(batch_size, num_heads, head_dim, segment_ids):
 
 
 def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strategy,
-                       window_size=None, max_segments_per_seq=1):
+                       window_size=None, max_segments_per_seq=1,
+                       reorder_strategy=ReorderStrategy.Striped):
     """Build a wrapper around fused_attn with the right static kwargs."""
     scaling_factor = 1.0 / sqrt(head_dim)
 
@@ -190,6 +199,11 @@ def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strat
     else:
         qkv_layout = QKVLayout.BSHD_BSHD_BSHD
         attn_mask_type = AttnMaskType.CAUSAL_MASK
+
+    # Only pass stripe_size for THD + Striped reordering
+    effective_stripe_size = (stripe_size
+                             if layout == "thd" and reorder_strategy == ReorderStrategy.Striped
+                             else None)
 
     def attn_fn(q, k, v, seq_desc, dropout_rng):
         return fused_attn(
@@ -208,7 +222,7 @@ def make_fused_attn_fn(layout, head_dim, cp_load_balanced, stripe_size, cp_strat
             window_size=window_size,
             context_parallel_strategy=cp_strategy,
             context_parallel_causal_load_balanced=cp_load_balanced,
-            stripe_size=stripe_size if layout == "thd" else None,
+            stripe_size=effective_stripe_size,
         ).astype(q.dtype)
 
     return attn_fn
@@ -248,8 +262,15 @@ def make_fused_attn_fn_no_cp(layout, head_dim, window_size=None, max_segments_pe
 
 
 def make_inputs_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, cp_size,
-                    stripe_size, dtype, num_segments=1, packing_eff=0.9):
-    """Generate Q/K/V and SequenceDescriptor for THD + Striped layout."""
+                    stripe_size, dtype, num_segments=1, packing_eff=0.9,
+                    reorder_strategy=ReorderStrategy.Striped, per_seq_lens=None):
+    """Generate Q/K/V and SequenceDescriptor for THD layout.
+
+    Args:
+        per_seq_lens: list of ints for variable-length sequences. If provided,
+            batch_size = len(per_seq_lens), seq_len = max(per_seq_lens),
+            and each sequence gets its own length with trailing padding.
+    """
     key = jax.random.PRNGKey(0)
     q_key, k_key, v_key = jax.random.split(key, 3)
 
@@ -257,7 +278,18 @@ def make_inputs_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, cp
     k = jax.random.uniform(k_key, (batch_size, seq_len, num_heads_kv, head_dim), dtype, -1.0)
     v = jax.random.uniform(v_key, (batch_size, seq_len, num_heads_kv, head_dim), dtype, -1.0)
 
-    if num_segments == 1:
+    if per_seq_lens is not None:
+        # Variable-length: each batch element has a different seq length.
+        # segment_id=1 for active tokens, segment_id=0 for padding.
+        segment_ids = np.zeros((batch_size, seq_len), dtype=np.int32)
+        segment_pos = np.zeros((batch_size, seq_len), dtype=np.int32)
+        for i, slen in enumerate(per_seq_lens):
+            segment_ids[i, :slen] = 1
+            segment_pos[i, :slen] = np.arange(slen)
+        segment_ids = jnp.asarray(segment_ids)
+        segment_pos = jnp.asarray(segment_pos)
+        print(f"  Variable-length seqs: {per_seq_lens}, padded to {seq_len}")
+    elif num_segments == 1:
         segment_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
         segment_pos = jnp.broadcast_to(
             jnp.arange(seq_len, dtype=jnp.int32), (batch_size, seq_len),
@@ -267,13 +299,16 @@ def make_inputs_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, cp
             batch_size, seq_len, num_segments, packing_eff=packing_eff,
         )
 
-    reorder_fn = partial(
-        reorder_causal_load_balancing,
-        strategy=ReorderStrategy.Striped,
+    reorder_kwargs = dict(
+        strategy=reorder_strategy,
         cp_size=cp_size,
         seq_dim=1,
-        stripe_size=stripe_size,
     )
+    if reorder_strategy == ReorderStrategy.Striped:
+        reorder_kwargs["stripe_size"] = stripe_size
+    # DualChunkSwap must NOT pass stripe_size
+
+    reorder_fn = partial(reorder_causal_load_balancing, **reorder_kwargs)
     q = reorder_fn(q)
     k = reorder_fn(k)
     v = reorder_fn(v)
@@ -316,7 +351,7 @@ def make_inputs_bshd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, c
 
 
 def make_inputs_no_cp_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_dim, dtype,
-                          num_segments=1, packing_eff=0.9):
+                          num_segments=1, packing_eff=0.9, per_seq_lens=None):
     """Generate Q/K/V and SequenceDescriptor for THD, no CP."""
     key = jax.random.PRNGKey(0)
     q_key, k_key, v_key = jax.random.split(key, 3)
@@ -325,7 +360,15 @@ def make_inputs_no_cp_thd(batch_size, seq_len, num_heads_q, num_heads_kv, head_d
     k = jax.random.uniform(k_key, (batch_size, seq_len, num_heads_kv, head_dim), dtype, -1.0)
     v = jax.random.uniform(v_key, (batch_size, seq_len, num_heads_kv, head_dim), dtype, -1.0)
 
-    if num_segments == 1:
+    if per_seq_lens is not None:
+        segment_ids = np.zeros((batch_size, seq_len), dtype=np.int32)
+        segment_pos = np.zeros((batch_size, seq_len), dtype=np.int32)
+        for i, slen in enumerate(per_seq_lens):
+            segment_ids[i, :slen] = 1
+            segment_pos[i, :slen] = np.arange(slen)
+        segment_ids = jnp.asarray(segment_ids)
+        segment_pos = jnp.asarray(segment_pos)
+    elif num_segments == 1:
         segment_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
         segment_pos = jnp.broadcast_to(
             jnp.arange(seq_len, dtype=jnp.int32), (batch_size, seq_len),
@@ -448,21 +491,58 @@ def main():
     strategy_map = {"ring": CPStrategy.RING, "all_gather": CPStrategy.ALL_GATHER}
     cp_strategy = strategy_map[args.cp_strategy]
     strategy_label = args.cp_strategy.upper()
-    window_size = (args.window_size, args.window_size) if args.window_size else None
-    window_label = f"W={args.window_size}" if args.window_size else "full"
+
+    # Window size: None, single int, or (left, right)
+    if args.window_size is None:
+        window_size = None
+        window_label = "full"
+    elif len(args.window_size) == 1:
+        window_size = (args.window_size[0], args.window_size[0])
+        window_label = f"W=({args.window_size[0]},{args.window_size[0]})"
+    else:
+        window_size = (args.window_size[0], args.window_size[1])
+        window_label = f"W=({args.window_size[0]},{args.window_size[1]})"
+
+    # Reorder strategy: default depends on layout
+    reorder_map = {"striped": ReorderStrategy.Striped, "dualchunkswap": ReorderStrategy.DualChunkSwap}
+    if args.reorder_strategy is not None:
+        reorder_strategy = reorder_map[args.reorder_strategy]
+    else:
+        reorder_strategy = (ReorderStrategy.Striped if args.layout == "thd"
+                            else ReorderStrategy.DualChunkSwap)
+    reorder_label = "Striped" if reorder_strategy == ReorderStrategy.Striped else "DualChunkSwap"
+
+    # Variable-length seqlens
+    per_seq_lens = None
+    if args.seqlens is not None:
+        per_seq_lens = [int(x) for x in args.seqlens.split(",")]
+        args.batch_size = len(per_seq_lens)
+        args.seq_len = max(per_seq_lens)
+
     num_segments = args.num_segments
-    max_segments_per_seq = num_segments + 1 if num_segments > 1 else 1
-    packing_label = f"packed({num_segments}seg)" if num_segments > 1 else "uniform"
+    if per_seq_lens is not None:
+        # Variable-length: 1 real segment + padding segment
+        max_segments_per_seq = 2
+        packing_label = f"varlen({len(per_seq_lens)}seqs)"
+    elif num_segments > 1:
+        max_segments_per_seq = num_segments + 1
+        packing_label = f"packed({num_segments}seg)"
+    else:
+        max_segments_per_seq = 1
+        packing_label = "uniform"
 
     if args.profile:
         args.iters = min(args.iters, 5)
         args.warmup = min(args.warmup, 2)
 
+    seqlens_label = (f"seqlens={per_seq_lens}" if per_seq_lens is not None
+                     else f"S={args.seq_len}")
     print(f"Config: {args.config} | Layout: {args.layout} | "
-          f"B={args.batch_size}, S={args.seq_len}, H={num_heads}, "
+          f"B={args.batch_size}, {seqlens_label}, H={num_heads}, "
           f"KV_groups={num_gqa_groups}, D={head_dim}")
     print(f"Devices: {[str(d) for d in jax.devices()]} | "
-          f"CP strategy: {strategy_label} | Window: {window_label} | "
+          f"CP strategy: {strategy_label} | Reorder: {reorder_label} | "
+          f"Window: {window_label} | "
           f"Packing: {packing_label} | Baseline: {args.baseline}")
     print(f"Warmup: {args.warmup} | Timed iters: {args.iters}"
           f"{' | Profile: ON' if args.profile else ''}")
@@ -478,6 +558,7 @@ def main():
             bq, bk, bv, bseq_desc, b_seg_ids = make_inputs_no_cp_thd(
                 args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim, dtype,
                 num_segments=num_segments, packing_eff=args.packing_eff,
+                per_seq_lens=per_seq_lens,
             )
         else:
             bq, bk, bv, bseq_desc = make_inputs_no_cp_bshd(
@@ -518,7 +599,7 @@ def main():
         )
         baseline_flops = (
             compute_flops_packed(args.batch_size, num_heads, head_dim, b_seg_ids)
-            if num_segments > 1 and b_seg_ids is not None
+            if (num_segments > 1 or per_seq_lens is not None) and b_seg_ids is not None
             else None
         )
         results.append(report_results(
@@ -537,7 +618,8 @@ def main():
         q, k, v, seq_desc, cp_seg_ids = make_inputs_thd(
             args.batch_size, args.seq_len, num_heads, num_gqa_groups, head_dim,
             cp_size, args.stripe_size, dtype, num_segments=num_segments,
-            packing_eff=args.packing_eff,
+            packing_eff=args.packing_eff, reorder_strategy=reorder_strategy,
+            per_seq_lens=per_seq_lens,
         )
     else:
         q, k, v, seq_desc = make_inputs_bshd(
@@ -567,6 +649,7 @@ def main():
         cp_strategy=cp_strategy,
         window_size=window_size,
         max_segments_per_seq=max_segments_per_seq,
+        reorder_strategy=reorder_strategy,
     )
 
     def loss_fn(q, k, v, seq_desc):
@@ -584,7 +667,7 @@ def main():
     )
     cp_flops = (
         compute_flops_packed(args.batch_size, num_heads, head_dim, cp_seg_ids)
-        if num_segments > 1 and cp_seg_ids is not None
+        if (num_segments > 1 or per_seq_lens is not None) and cp_seg_ids is not None
         else None
     )
     results.append(report_results(
