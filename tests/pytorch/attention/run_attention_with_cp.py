@@ -5,6 +5,7 @@
 import copy
 import os
 import sys
+import time
 import logging
 from contextlib import nullcontext
 import torch
@@ -16,6 +17,18 @@ from transformer_engine.pytorch.attention.dot_product_attention.utils import com
 import transformer_engine_torch as tex
 from transformer_engine.pytorch import DType
 from test_attention_with_cp import model_configs_flash_attn, model_configs_fused_attn
+
+# Merge in benchmark/stress configs from benchmark_cp.py if available so the worker
+# can resolve names like cp_thd_0, bench_8k, bariamis_8k, rl16k, etc.
+try:
+    from benchmark_cp import (
+        model_configs_fused_attn as _bench_cfgs_fused_attn,
+    )
+
+    for _k, _v in _bench_cfgs_fused_attn.items():
+        model_configs_fused_attn.setdefault(_k, _v)
+except ImportError:
+    pass
 from transformer_engine.pytorch import (
     autocast,
     DotProductAttention,
@@ -49,6 +62,7 @@ def generate_input_shapes(
     world_size: int,
     kernel_backend: str,
     fa_pad_between_seqs: str = "False",
+    thd_seqlen_pattern: str = "random",
 ):
     if qkv_format == "bshd":
         q_input_shape = (
@@ -107,7 +121,29 @@ def generate_input_shapes(
         cu_seqlens_q_padded = None
         cu_seqlens_kv_padded = None
     elif qkv_format == "thd":
-        seqlens_q = torch.randint(0, config.max_seqlen_q + 1, [config.batch_size]).to(torch.int32)
+        b, s = config.batch_size, config.max_seqlen_q
+        # Custom list: "24576,28672,30720,32768" -> explicit per-seq lengths
+        if "," in thd_seqlen_pattern:
+            seqlens_q = torch.tensor(
+                [int(x) for x in thd_seqlen_pattern.split(",")], dtype=torch.int32
+            )
+            b = len(seqlens_q)
+            s = int(seqlens_q.max())
+            config.batch_size = b
+            config.max_seqlen_q = s
+            config.max_seqlen_kv = s
+        elif thd_seqlen_pattern == "max":
+            seqlens_q = torch.full([b], s, dtype=torch.int32)
+        elif thd_seqlen_pattern == "half":
+            seqlens_q = torch.full([b], s // 2, dtype=torch.int32)
+        elif thd_seqlen_pattern == "linear":
+            seqlens_q = torch.linspace(1, s, b).to(torch.int32)
+        elif thd_seqlen_pattern == "alternating":
+            seqlens_q = torch.tensor(
+                [s if i % 2 == 0 else s // 4 for i in range(b)], dtype=torch.int32
+            )
+        else:  # "random"
+            seqlens_q = torch.randint(0, s + 1, [b]).to(torch.int32)
         seqlens_q_padded = (seqlens_q + 2 * world_size - 1) // (world_size * 2) * (world_size * 2)
         cu_seqlens_q_padded = torch.cat(
             [
@@ -204,8 +240,12 @@ def run_dpa_with_cp(
     fa_pad_between_seqs="False",
     deterministic="False",
     log_level=logging.WARNING,
+    benchmark="0",
+    thd_seqlen_pattern="random",
 ):
     """Test DotProductAttention module with context parallelism"""
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
     logging.root.setLevel(log_level)
     # When is_training is False, gradient outputs are None.
     is_training = is_training == "True"
@@ -320,13 +360,30 @@ def run_dpa_with_cp(
         cu_seqlens_kv,
         cu_seqlens_q_padded,
         cu_seqlens_kv_padded,
-    ) = generate_input_shapes(qkv_format, config, world_size, kernel_backend, fa_pad_between_seqs)
+    ) = generate_input_shapes(
+        qkv_format, config, world_size, kernel_backend, fa_pad_between_seqs, thd_seqlen_pattern
+    )
     q_orig = torch.clamp(torch.randn(q_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     k_orig = torch.clamp(torch.randn(k_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     v_orig = torch.clamp(torch.randn(v_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     dout_orig = torch.clamp(
         torch.randn(attn_output_shape, dtype=dtypes[dtype]), min=-1, max=1
     ).cuda()
+    # Save inputs for cross-backend comparison
+    _save_path = os.environ.get("CP_CROSS_BACKEND_SAVE_DIR")
+    if _save_path:
+        os.makedirs(_save_path, exist_ok=True)
+        torch.save(
+            {
+                "q": q_orig,
+                "k": k_orig,
+                "v": v_orig,
+                "dout": dout_orig,
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_q_padded": cu_seqlens_q_padded,
+            },
+            os.path.join(_save_path, f"inputs_rank{rank}.pt"),
+        )
     if scaling_mode == "delayed":
         qkv_quantizer = Float8Quantizer(
             fp8_dtype=DType.kFloat8E4M3,
@@ -551,6 +608,54 @@ def run_dpa_with_cp(
     else:
         dq_, dk_, dv_, dbias_ = None, None, None, None
         d_softmax_offset_ = None
+
+    if _save_path:
+        torch.save(
+            {
+                "out": out_.detach(),
+                "dq": dq_.detach() if dq_ is not None else None,
+                "dk": dk_.detach() if dk_ is not None else None,
+                "dv": dv_.detach() if dv_ is not None else None,
+            },
+            os.path.join(_save_path, f"outputs_{cp_comm_type}_rank{rank}.pt"),
+        )
+
+    # Benchmark: re-run forward+backward with timing
+    benchmark_iters = int(benchmark)
+    if benchmark_iters > 0:
+        warmup = 10
+        t0 = None
+        for it in range(warmup + benchmark_iters):
+            q_b, k_b, v_b = [x.clone().detach().requires_grad_() for x in [q_, k_, v_]]
+            torch.cuda.synchronize()
+            if it == warmup:
+                torch.cuda.cudart().cudaProfilerStart()
+                t0 = time.perf_counter()
+            with fp8_context:
+                out_b = core_attn(
+                    q_b,
+                    k_b,
+                    v_b,
+                    core_attention_bias_type=config.attn_bias_type,
+                    core_attention_bias=bias_,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_kv,
+                    cu_seqlens_q_padded=cu_seqlens_q_padded,
+                    cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+                    fp8_output=fp8_mha,
+                )
+                if isinstance(out_b, tuple):
+                    out_b = out_b[0]
+                if is_training:
+                    out_b.backward(dout_)
+            torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - t0) / benchmark_iters * 1000
+        torch.cuda.cudart().cudaProfilerStop()
+        print(
+            f"[Rank {rank}] {cp_comm_type} {qkv_format} {dtype}: {elapsed:.2f} ms/iter"
+            f" ({benchmark_iters} iters)",
+            flush=True,
+        )
 
     # get outputs
     tensors = [out, dq, dk, dv, dbias, out_, dq_, dk_, dv_, dbias_]
