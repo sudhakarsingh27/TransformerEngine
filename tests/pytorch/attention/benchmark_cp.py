@@ -90,7 +90,52 @@ _training_workloads = {
         ModelConfig(3, 131072, 32, 128, num_gqa_groups=8, attn_mask_type="causal"),
         "114688,122880,131072",
     ),
+    # SWA variants of mixed32k for cross-backend SWA correctness checks.
+    "mixed32k_swa512": (
+        ModelConfig(
+            8, 32768, 32, 128, num_gqa_groups=8,
+            attn_mask_type="causal", window_size=(512, 0),
+        ),
+        "16384,24576,32768,8192,28672,32768,20480,16384",
+    ),
+    "mixed32k_swa1024": (
+        ModelConfig(
+            8, 32768, 32, 128, num_gqa_groups=8,
+            attn_mask_type="causal", window_size=(1024, 0),
+        ),
+        "16384,24576,32768,8192,28672,32768,20480,16384",
+    ),
+    "mixed32k_swa2048": (
+        ModelConfig(
+            8, 32768, 32, 128, num_gqa_groups=8,
+            attn_mask_type="causal", window_size=(2048, 0),
+        ),
+        "16384,24576,32768,8192,28672,32768,20480,16384",
+    ),
 }
+
+# SWA variants of all 6 training workloads at windows 512/1024/2048.
+_swa_base = {
+    "bucket32k": (4, 32768, "24576,28672,30720,32768"),
+    "bucket64k": (4, 65536, "57344,61440,63488,65536"),
+    "mixed32k_full": (8, 32768, "16384,24576,32768,8192,28672,32768,20480,16384"),
+    "rl16k": (8, 16384, "4096,6144,6144,8192,8192,10240,12288,16384"),
+    "outlier64k": (4, 65536, "8192,8192,8192,65536"),
+    "bucket128k": (3, 131072, "114688,122880,131072"),
+}
+for _name, (_b, _s, _pat) in _swa_base.items():
+    for _w in (512, 1024, 2048):
+        # Use "_full" suffix dropped; keep mixed32k_swa* names matching above
+        if _name == "mixed32k_full":
+            continue  # already added with mixed32k_swa{512,1024,2048}
+        _key = f"{_name}_swa{_w}"
+        _training_workloads[_key] = (
+            ModelConfig(
+                _b, _s, 32, 128, num_gqa_groups=8,
+                attn_mask_type="causal", window_size=(_w, 0),
+            ),
+            _pat,
+        )
 for _name, (_cfg, _pat) in _training_workloads.items():
     _cfg.thd_seqlen_pattern = _pat
     model_configs_fused_attn[_name] = _cfg
