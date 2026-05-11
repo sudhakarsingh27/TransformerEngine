@@ -194,8 +194,10 @@ class DotProductAttention(TransformerEngineBaseModule):
 
         FlashAttention uses a non-deterministic algorithm for optimal performance. To observe
         deterministic behavior at the cost of performance, use FlashAttention version >= ``2.4.1``
-        and set the environment variable :attr:`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`. In order
-        to disable ``flash-attn`` entirely, set :attr:`NVTE_FLASH_ATTN=0`.
+        and set the environment variable :attr:`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`. To disable
+        ``flash-attn`` entirely, set :attr:`NVTE_FLASH_ATTN=0`. To pin to a specific FA major
+        version when multiple are installed, set :attr:`NVTE_FLASH_ATTN=2`, ``3``, or ``4``;
+        the default ``NVTE_FLASH_ATTN=1`` lets Transformer Engine auto-select.
 
     .. note::
 
@@ -1038,8 +1040,11 @@ class DotProductAttention(TransformerEngineBaseModule):
 
             Users can use environment variables :attr:`NVTE_FLASH_ATTN`, :attr:`NVTE_FUSED_ATTN`,
             and :attr:`NVTE_FUSED_ATTN_BACKEND` to control which DotProductAttention backend,
-            and FusedAttention backend if applicable, to use. Transformer Engine prioritizes
-            FlashAttention over FusedAttention and over UnfusedDotProductAttention.
+            and FusedAttention backend if applicable, to use. :attr:`NVTE_FLASH_ATTN` accepts
+            ``0`` (disable FlashAttention), ``1`` (auto, default), or ``2``/``3``/``4`` to pin
+            the FlashAttention path to that major version when multiple are installed.
+            Transformer Engine prioritizes FlashAttention over FusedAttention and over
+            UnfusedDotProductAttention.
             If FusedAttention is being used, users can also choose to switch to flash-attn's
             implementation for backward by setting :attr:`NVTE_FUSED_ATTN_USE_FAv2_BWD=1`
             (default: 0), because of the performance differences between various versions of

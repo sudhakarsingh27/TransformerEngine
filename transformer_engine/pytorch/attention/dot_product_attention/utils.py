@@ -63,7 +63,19 @@ from transformer_engine.pytorch.jit import jit_fuser
 _NVTE_DEBUG = int(os.getenv("NVTE_DEBUG", "0"))
 # NVTE_DEBUG_LEVEL = 0/1/2 # enables more and more verbose debug mode, default = 0
 _NVTE_DEBUG_LEVEL = int(os.getenv("NVTE_DEBUG_LEVEL", "0"))
-_NVTE_FLASH_ATTN = int(os.getenv("NVTE_FLASH_ATTN", "1"))
+# NVTE_FLASH_ATTN selects the FlashAttention path:
+#   0       -> disable FlashAttention entirely
+#   1       -> auto (default; any installed FA version is a candidate)
+#   2/3/4   -> pin to that major version (other FA versions are filtered out)
+_NVTE_FLASH_ATTN_RAW = os.getenv("NVTE_FLASH_ATTN", "1").strip()
+if _NVTE_FLASH_ATTN_RAW not in ("0", "1", "2", "3", "4"):
+    raise ValueError(
+        f"NVTE_FLASH_ATTN must be one of {{0, 1, 2, 3, 4}}; got {_NVTE_FLASH_ATTN_RAW!r}. "
+        "0 disables FlashAttention, 1 is auto-select, 2/3/4 pins to that major version."
+    )
+_NVTE_FLASH_ATTN = int(_NVTE_FLASH_ATTN_RAW)
+# When >=2, only that FA major version is allowed; None means auto (no pin).
+_NVTE_FLASH_ATTN_PIN = _NVTE_FLASH_ATTN if _NVTE_FLASH_ATTN >= 2 else None
 # print quantizer info for a particular layer on a particular rank
 _print_layer = int(os.getenv("NVTE_PRINT_LAYER_NUMBER", "1"))
 _print_rank = int(os.getenv("NVTE_PRINT_RANK", "0"))
@@ -149,6 +161,11 @@ class FlashAttentionUtils:
     v4_installation_steps = """\
 pip install flash-attn-4==4.0.0b8 nvidia-cutlass-dsl[cu13]"""
     v4_warning_printed = False
+
+    # Warn once when NVTE_FLASH_ATTN pins to a major version that can't run on this
+    # configuration (not installed, or wrong GPU). Hard-pin semantics mean no
+    # silent fallback to another FA version, so it's worth telling the user why.
+    pin_warning_printed = False
 
     @staticmethod
     def set_flash_attention_version():
@@ -435,19 +452,29 @@ def get_attention_backend(
     qkv_format, q_format, _ = get_qkv_format(qkv_layout, inference_params)
 
     # Filter: Environment variables
-    use_flash_attention = int(os.getenv("NVTE_FLASH_ATTN", "1"))
-    use_flash_attention_2 = use_flash_attention
-    use_flash_attention_3 = use_flash_attention
-    use_flash_attention_4 = use_flash_attention
+    # NVTE_FLASH_ATTN: 0=disable, 1=auto (any version), 2/3/4=pin to that major version.
+    # The pin filters per-version availability; the SM90 hardcoded FA3-over-FA4 preference
+    # block below still applies when the pin doesn't already eliminate the conflict.
+    use_flash_attention = int(_NVTE_FLASH_ATTN > 0)
+    _pin = _NVTE_FLASH_ATTN_PIN
+    use_flash_attention_2 = use_flash_attention and (_pin in (None, 2))
+    use_flash_attention_3 = use_flash_attention and (_pin in (None, 3))
+    use_flash_attention_4 = use_flash_attention and (_pin in (None, 4))
     flash_attention_backend = None
     use_fused_attention = int(os.getenv("NVTE_FUSED_ATTN", "1"))
     use_unfused_attention = int(os.getenv("NVTE_UNFUSED_ATTN", "1"))
+
+    def _fa_disable_reason(version: int) -> str:
+        if _NVTE_FLASH_ATTN == 0:
+            return "NVTE_FLASH_ATTN=0"
+        return f"NVTE_FLASH_ATTN={_NVTE_FLASH_ATTN} pins to FA{_NVTE_FLASH_ATTN}, not FA{version}"
+
     if not use_flash_attention_2 and FlashAttentionUtils.is_installed:
-        logger.debug("Disabling FlashAttention 2 due to NVTE_FLASH_ATTN=0")
+        logger.debug("Disabling FlashAttention 2 due to %s", _fa_disable_reason(2))
     if not use_flash_attention_3 and FlashAttentionUtils.v3_is_installed:
-        logger.debug("Disabling FlashAttention 3 due to NVTE_FLASH_ATTN=0")
+        logger.debug("Disabling FlashAttention 3 due to %s", _fa_disable_reason(3))
     if not use_flash_attention_4 and FlashAttentionUtils.v4_is_installed:
-        logger.debug("Disabling FlashAttention 4 due to NVTE_FLASH_ATTN=0")
+        logger.debug("Disabling FlashAttention 4 due to %s", _fa_disable_reason(4))
     if not use_fused_attention:
         logger.debug("Disabling FusedAttention due to NVTE_FUSED_ATTN=0")
     if not use_unfused_attention:
@@ -1411,6 +1438,54 @@ def get_attention_backend(
         selected_backend = f"FusedAttention (sub-backend {int(fused_attention_backend)})"
     elif use_unfused_attention:
         selected_backend = "UnfusedDotProductAttention"
+
+    # If NVTE_FLASH_ATTN pinned to a specific FA major version but the
+    # FlashAttention path ended up disabled, the user almost certainly wants to
+    # know why (hard-pin semantics mean we did *not* silently fall back to a
+    # different FA version). Diagnose and warn once per process.
+    if (
+        _NVTE_FLASH_ATTN_PIN is not None
+        and not use_flash_attention
+        and not FlashAttentionUtils.pin_warning_printed
+    ):
+        pin = _NVTE_FLASH_ATTN_PIN
+        installed_flag = {
+            2: FlashAttentionUtils.is_installed,
+            3: FlashAttentionUtils.v3_is_installed,
+            4: FlashAttentionUtils.v4_is_installed,
+        }[pin]
+        sm = f"sm{device_compute_capability[0]}{device_compute_capability[1]}"
+        gpu_ok = {
+            2: device_compute_capability >= (8, 0),
+            3: device_compute_capability == (9, 0),
+            # Per FlashAttention v4 upstream: Hopper (sm90) and Blackwell
+            # (sm100/sm120) only.  TE's own filter at the start of this function
+            # is more permissive (allows sm80+); the user-facing warning should
+            # reflect upstream-documented support so the message is honest.
+            4: device_compute_capability == (9, 0) or device_compute_capability >= (10, 0),
+        }[pin]
+        supported_gpus = {
+            2: "sm80 and newer",
+            3: "Hopper (sm90) only",
+            4: "Hopper (sm90) and Blackwell (sm100/sm120) only",
+        }[pin]
+        reasons = []
+        if not installed_flag:
+            reasons.append(f"FA{pin} is not installed")
+        if not gpu_ok:
+            reasons.append(f"FA{pin} requires {supported_gpus}, but device is {sm}")
+        if not reasons:
+            reasons.append(
+                f"FA{pin} was filtered out for this attention config "
+                "(see preceding debug logs for the specific reason)"
+            )
+        logger.warning(
+            "NVTE_FLASH_ATTN=%d pins to FA%d but the FlashAttention path is "
+            "unavailable: %s. Falling back to %s. Unset NVTE_FLASH_ATTN to let "
+            "Transformer Engine auto-select.",
+            pin, pin, "; ".join(reasons), selected_backend,
+        )
+        FlashAttentionUtils.pin_warning_printed = True
     logger.debug("Selected backend = %s.", selected_backend)
 
     return (
