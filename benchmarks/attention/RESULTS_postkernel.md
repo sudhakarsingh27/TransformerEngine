@@ -52,8 +52,18 @@ compute loop, so the cp_stream-vs-main per-step overlap is intact (unlike the ol
 |---|---|---:|---:|---:|---:|
 | rl16k | causal | 31.40 | 27.98 | 24.55 | 24.34 |
 | rl16k | W=512 | 27.13 | 10.39 | 9.89 | 10.19 |
+| mixed32k | causal | 163.65 | 139.95 | 120.46 | 120.33 |
+| mixed32k | W=512 | 133.68 | 24.58 | 22.47 | 24.78 |
 
-**Takeaways (rl16k cp2):** the fix makes **FA3 all_gather functional** (was crashing) and it is the **fastest AG path** — 24.55 ms causal vs FusedAttn AG 31.40 ms (FA3 -22%), and 9.89 vs 27.13 ms at W=512 (FA3 2.7x, since cuDNN AG SWA backward does not honor the window). a2a is competitive across backends. (mixed32k/larger workloads were not finished before the node time limit.)
+**Takeaways (cp2):** the fix makes **FA3 all_gather functional** (was crashing) and it is the
+**fastest AG path** at both workloads:
+- causal: FA3 AG vs FusedAttn AG — rl16k 24.55 vs 31.40 (−22%), mixed32k 120.46 vs 163.65 (−26%).
+- W=512: FA3 AG vs FusedAttn AG — rl16k 9.89 vs 27.13 (**2.7×**), mixed32k 22.47 vs 133.68 (**6.0×**).
+  FusedAttn AG barely speeds up under SWA (133.68 vs 163.65 causal) because cuDNN's AG SWA
+  backward does not honor the window; FA3 AG drops to ~the a2a level.
+- a2a is competitive across backends and is the best non-FA3 option for SWA.
+
+(bucket128k and cp8 were not reached before the node time limit; the resumable drivers remain.)
 
 
 ## 3. Status of the full sweep

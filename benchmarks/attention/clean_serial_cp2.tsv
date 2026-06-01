@@ -1,0 +1,16 @@
+FusedAttention	all_gather	rl16k	rl16k	2	31.40
+FusedAttention	a2a	rl16k	rl16k	2	27.98
+FlashAttention	all_gather	rl16k	rl16k	2	24.55
+FlashAttention	a2a	rl16k	rl16k	2	24.34
+FusedAttention	all_gather	rl16k	rl16k_swa512	2	27.13
+FusedAttention	a2a	rl16k	rl16k_swa512	2	10.39
+FlashAttention	all_gather	rl16k	rl16k_swa512	2	9.89
+FlashAttention	a2a	rl16k	rl16k_swa512	2	10.19
+FusedAttention	all_gather	mixed32k	mixed32k	2	163.65
+FusedAttention	a2a	mixed32k	mixed32k	2	139.95
+FlashAttention	all_gather	mixed32k	mixed32k	2	120.46
+FlashAttention	a2a	mixed32k	mixed32k	2	120.33
+FusedAttention	all_gather	mixed32k	mixed32k_swa512	2	133.68
+FusedAttention	a2a	mixed32k	mixed32k_swa512	2	24.58
+FlashAttention	all_gather	mixed32k	mixed32k_swa512	2	22.47
+FlashAttention	a2a	mixed32k	mixed32k_swa512	2	24.78
