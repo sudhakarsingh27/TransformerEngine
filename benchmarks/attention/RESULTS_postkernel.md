@@ -72,3 +72,32 @@ The full 288-run sweep (AG+a2a × {FusedAttn,FA3} × 6 workloads × 4 masks × c
 started but not completed this session (node time limits). Driver + partial data:
 `TransformerEngine/benchmark_results/run_postkernel_sweep.sh` and `postkernel/` (resumable via
 `done_postkernel.txt`). FA3 AG cells require the fix above to run crash-free.
+
+## 4. THD helper-kernel microbenchmarks
+
+Date: 2026-06-03. Script: `benchmarks/attention/thd_kernel_bench.py`. Shape:
+batch=16, seqlen=4096, heads=16, dim=64, bf16, 5 warmup + 20 timed iterations, single H100.
+Wall-clock timings include host overhead; this is intentional because the old `thd_valid_copy`
+reference contains `.item()` calls that synchronize the host with the device.
+
+| cp | path | legacy wall ms | kernel wall ms | speedup | kernel event ms |
+|---:|---|---:|---:|---:|---:|
+| 2 | `thd_reorder` contiguous->rank | 18.6232 | 0.1090 | 170.84x | 0.0948 |
+| 2 | `thd_reorder` rank->contiguous | 19.2267 | 0.1094 | 175.76x | 0.0951 |
+| 2 | `thd_valid_copy` | 9.4218 | 0.1052 | 89.59x | 0.0904 |
+| 4 | `thd_reorder` contiguous->rank | 37.4912 | 0.1083 | 346.08x | 0.0942 |
+| 4 | `thd_reorder` rank->contiguous | 11.0553 | 0.0966 | 114.43x | 0.0958 |
+| 4 | `thd_valid_copy` | 0.7070 | 0.0911 | 7.76x | 0.0904 |
+| 8 | `thd_reorder` contiguous->rank | 11.6829 | 0.0954 | 122.42x | 0.0944 |
+| 8 | `thd_reorder` rank->contiguous | 17.2532 | 0.0970 | 177.87x | 0.0962 |
+| 8 | `thd_valid_copy` | 0.7075 | 0.0911 | 7.76x | 0.0904 |
+
+Kernel-only helper timings from the same runs were small: `thd_read_half_tensor` was ~0.05 ms for
+`[t,h,d]` and ~0.09 ms for `[2,t,h,d]`, `thd_read_second_half_lse` was ~0.009-0.026 ms, and
+`thd_get_partitioned_indices` was ~0.005-0.017 ms depending on cp size.
+
+Reference policy: reorder and valid-copy use the older non-optimized Python implementations from
+the PR history (`89b1066d` and `24a95ab8^`). `thd_read_half_tensor` and
+`thd_read_second_half_lse` did not have a prior Python reference in the branch history, so the
+script reports kernel-only timings for those helpers and the unit tests use fixed semantic
+expected tensors.
