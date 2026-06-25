@@ -99,35 +99,57 @@ SWA variants: append `_swa512`, `_swa1024`, or `_swa2048` to any training worklo
 
 ## Benchmark Results
 
-Hardware: 8× H100 80GB HBM3 (full NV18 NVLink mesh), cuDNN 9.21, NCCL 2.29.7, bf16, FusedAttention.
-Iters: 50 timed (after 10 warmup). Values in ms/iter (fwd+bwd).
-cp=2 runs in serial; cp=4 and cp=8 used 2-wide / 1-wide GPU partitioning.
+bf16, FusedAttention, 50 timed iterations after 10 warmup. Values are ms/iter
+(fwd+bwd). Runs below were executed serially, one config at a time.
 
-### Full causal — training workloads
+### Full causal — H100
 
 | Workload | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| rl16k | **20.20** | 24.95 | 20.90 | 12.98 | 15.16 | **11.26** | 11.87 | 11.12 | **6.33** |
-| bucket32k | **38.31** | 46.32 | 39.41 | 22.46 | 24.90 | **20.57** | 15.01 | 14.93 | **10.91** |
-| mixed32k | **59.17** | 71.75 | 61.21 | 35.07 | 38.43 | **31.68** | 22.64 | 22.88 | **16.54** |
-| outlier64k | **125.09** | 151.13 | 127.00 | 68.29 | 76.22 | **65.03** | 40.01 | 41.04 | **33.48** |
-| bucket64k | **125.07** | 151.14 | 126.98 | 69.41 | 75.90 | **65.64** | 39.91 | 41.06 | **33.45** |
-| bucket128k | **263.77** | 323.10 | 267.57 | 139.93 | 156.81 | **136.45** | 77.15 | 81.32 | **69.50** |
+| rl16k | 26.15 | 30.47 | 27.72 | 16.17 | 16.99 | 14.41 | 12.73 | 11.02 | **7.79** |
+| bucket32k | 101.98 | 120.56 | 104.28 | 55.23 | 60.66 | 53.36 | 32.52 | 33.02 | **27.18** |
+| mixed32k | 137.62 | 162.24 | 140.76 | 75.12 | 81.97 | 72.16 | 44.59 | 45.39 | **36.82** |
+| outlier64k | 128.53 | 152.95 | 130.36 | 67.87 | 74.73 | 66.74 | 37.97 | 39.14 | **33.75** |
+| bucket64k | 428.08 | 512.41 | 436.26 | 224.03 | 247.81 | 219.89 | 120.60 | 127.15 | **111.34** |
+| bucket128k | 1232.55 | 1717.97 | 1279.64 | 631.15 | 713.87 | 640.01 | 330.05 | 356.20 | **322.68** |
 
-**Bold = fastest.** p2p wins at cp=2 (lowest comm cost). a2a wins at cp=4 and cp=8.
+### Full causal — B200
 
-### Scaling efficiency (cp=2 → cp=8, full causal)
+| Workload | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| rl16k | 14.69 | 14.41 | 15.80 | 9.38 | 8.76 | 8.37 | 8.88 | 6.18 | **4.79** |
+| bucket32k | 55.58 | 53.36 | 56.00 | 30.67 | 29.85 | 28.32 | 18.57 | 17.10 | **14.33** |
+| mixed32k | 75.28 | 72.48 | 75.01 | 41.84 | 40.45 | 38.28 | 24.97 | 23.62 | **19.49** |
+| outlier64k | 69.63 | 66.45 | 68.65 | 37.40 | 36.08 | 34.71 | 21.05 | 20.04 | **17.56** |
+| bucket64k | 246.87 | 223.89 | 226.78 | 122.98 | 120.00 | 113.55 | 66.64 | 64.65 | **56.36** |
+| bucket128k | 713.40 | 639.87 | 645.05 | 344.90 | 339.30 | 321.85 | 180.12 | 176.64 | **157.90** |
 
-Ideal would be 4×. a2a sustains the best scaling for every workload.
+**Bold = fastest.** a2a at cp=8 is the fastest point for every workload on
+both systems. The absolute timings are hardware- and environment-specific.
+
+### Scaling efficiency — H100
+
+Ideal would be 4× for cp=2 → cp=8.
 
 | Workload | p2p scale | AG scale | a2a scale |
 |---|---:|---:|---:|
-| rl16k | 1.70× | 2.24× | **3.30×** |
-| bucket32k | 2.55× | 3.10× | **3.61×** |
-| mixed32k | 2.61× | 3.14× | **3.70×** |
-| outlier64k | 3.13× | 3.68× | **3.79×** |
-| bucket64k | 3.13× | 3.68× | **3.80×** |
-| bucket128k | 3.42× | **3.97×** | 3.85× |
+| rl16k | 2.05× | 2.76× | **3.56×** |
+| bucket32k | 3.14× | 3.65× | **3.84×** |
+| mixed32k | 3.09× | 3.57× | **3.82×** |
+| outlier64k | 3.39× | **3.91×** | 3.86× |
+| bucket64k | 3.55× | **4.03×** | 3.92× |
+| bucket128k | 3.73× | **4.82×** | 3.97× |
+
+### Scaling efficiency — B200
+
+| Workload | p2p scale | AG scale | a2a scale |
+|---|---:|---:|---:|
+| rl16k | 1.65× | 2.33× | **3.30×** |
+| bucket32k | 2.99× | 3.12× | **3.91×** |
+| mixed32k | 3.01× | 3.07× | **3.85×** |
+| outlier64k | 3.31× | 3.32× | **3.91×** |
+| bucket64k | 3.70× | 3.46× | **4.02×** |
+| bucket128k | 3.96× | 3.62× | **4.09×** |
 
 ### SWA — training workloads (all_gather vs a2a)
 
