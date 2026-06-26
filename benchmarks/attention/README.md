@@ -99,10 +99,11 @@ SWA variants: append `_swa512`, `_swa1024`, or `_swa2048` to any training worklo
 
 ## Benchmark Results
 
-bf16, FusedAttention, 50 timed iterations after 10 warmup. Values are ms/iter
-(fwd+bwd). Runs below were executed serially, one config at a time.
+bf16, 50 timed iterations after 10 warmup. Values are ms/iter (fwd+bwd).
+Runs below were executed serially, one config at a time. Timings are
+hardware-, backend-, and environment-specific.
 
-### Full causal — H100
+### Full causal — FusedAttention — H100
 
 | Workload | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -113,7 +114,7 @@ bf16, FusedAttention, 50 timed iterations after 10 warmup. Values are ms/iter
 | bucket64k | 428.08 | 512.41 | 436.26 | 224.03 | 247.81 | 219.89 | 120.60 | 127.15 | **111.34** |
 | bucket128k | 1232.55 | 1717.97 | 1279.64 | 631.15 | 713.87 | 640.01 | 330.05 | 356.20 | **322.68** |
 
-### Full causal — B200
+### Full causal — FusedAttention — B200
 
 | Workload | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -127,7 +128,7 @@ bf16, FusedAttention, 50 timed iterations after 10 warmup. Values are ms/iter
 **Bold = fastest.** a2a at cp=8 is the fastest point for every workload on
 both systems. The absolute timings are hardware- and environment-specific.
 
-### Scaling efficiency — H100
+### Scaling efficiency — FusedAttention — H100
 
 Ideal would be 4× for cp=2 → cp=8.
 
@@ -140,7 +141,7 @@ Ideal would be 4× for cp=2 → cp=8.
 | bucket64k | 3.55× | **4.03×** | 3.92× |
 | bucket128k | 3.73× | **4.82×** | 3.97× |
 
-### Scaling efficiency — B200
+### Scaling efficiency — FusedAttention — B200
 
 | Workload | p2p scale | AG scale | a2a scale |
 |---|---:|---:|---:|
@@ -151,59 +152,137 @@ Ideal would be 4× for cp=2 → cp=8.
 | bucket64k | 3.70× | 3.46× | **4.02×** |
 | bucket128k | 3.96× | 3.62× | **4.09×** |
 
-### SWA — training workloads (all_gather vs a2a)
+### Full causal — FlashAttention — H100
+
+| Workload | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| rl16k | 23.06 | 24.14 | 24.27 | 14.55 | 14.96 | 12.53 | 11.74 | 11.02 | **6.74** |
+| bucket32k | 87.56 | 88.89 | 89.34 | 48.49 | 49.30 | 45.54 | 29.41 | 29.24 | **23.42** |
+| mixed32k | 118.71 | 120.55 | 121.01 | 66.36 | 67.36 | 62.30 | 40.57 | 40.74 | **31.90** |
+| outlier64k | 109.96 | 110.87 | 110.66 | 59.29 | 59.27 | 56.43 | 33.95 | 33.51 | **28.53** |
+| bucket64k | 367.18 | 368.55 | 368.57 | 194.66 | 193.22 | 186.38 | 106.79 | 106.89 | **94.95** |
+| bucket128k | 1057.24 | 1054.31 | 1052.07 | 545.23 | 540.03 | 528.22 | 289.27 | 284.24 | **267.81** |
+
+### SWA — FlashAttention — H100
+
+p2p does not support SWA, so only all_gather and a2a are shown.
 
 **cp=2**
 
 | Workload | W=512 AG | W=512 a2a | W=1024 AG | W=1024 a2a | W=2048 AG | W=2048 a2a |
 |---|---:|---:|---:|---:|---:|---:|
-| rl16k | 22.76 | **8.93** | 23.09 | **10.18** | 23.83 | **12.46** |
-| bucket32k | 39.43 | **9.33** | 39.57 | **10.73** | 40.22 | **13.39** |
-| mixed32k | 60.31 | **15.44** | 60.97 | **17.81** | 62.55 | **22.45** |
-| outlier64k | 121.29 | **14.98** | 121.88 | **17.36** | 123.41 | **22.11** |
-| bucket64k | 121.32 | **14.96** | 121.88 | **17.34** | 123.35 | **22.11** |
-| bucket128k | 253.68 | **19.71** | 254.55 | **23.05** | 256.89 | **30.42** |
+| rl16k | **9.57** | 10.17 | 11.02 | 11.33 | 13.89 | 13.59 |
+| bucket32k | **14.79** | 16.67 | 16.96 | 18.26 | 21.65 | 22.70 |
+| mixed32k | **22.29** | 24.77 | 25.65 | 27.41 | 33.05 | 34.21 |
+| outlier64k | **12.32** | 12.98 | 14.11 | 14.37 | 17.60 | 17.56 |
+| bucket64k | **31.36** | 33.78 | 35.90 | 37.39 | 45.67 | 47.54 |
+| bucket128k | **46.60** | 49.92 | 52.84 | 55.64 | 67.18 | 71.10 |
 
 **cp=4**
 
 | Workload | W=512 AG | W=512 a2a | W=1024 AG | W=1024 a2a | W=2048 AG | W=2048 a2a |
 |---|---:|---:|---:|---:|---:|---:|
-| rl16k | 14.29 | **5.38** | 14.59 | **6.01** | 15.07 | **7.15** |
-| bucket32k | 21.52 | **5.56** | 21.56 | **6.23** | 21.96 | **7.51** |
-| mixed32k | 33.16 | **8.91** | 33.60 | **10.11** | 34.24 | **12.38** |
-| outlier64k | 60.28 | **8.59** | 60.84 | **9.83** | 61.41 | **12.21** |
-| bucket64k | 60.35 | **8.57** | 60.65 | **9.83** | 61.37 | **12.16** |
-| bucket128k | 121.71 | **11.47** | 122.28 | **13.17** | 123.56 | **16.53** |
+| rl16k | 7.65 | **5.99** | 8.42 | 6.56 | 10.05 | 7.68 |
+| bucket32k | 11.69 | **9.59** | 12.85 | 10.51 | 15.20 | 12.52 |
+| mixed32k | 17.51 | **14.33** | 19.30 | 15.64 | 22.94 | 18.76 |
+| outlier64k | 9.54 | **7.53** | 10.51 | 8.23 | 12.32 | 9.84 |
+| bucket64k | 23.60 | **19.39** | 25.93 | 21.23 | 30.74 | 25.80 |
+| bucket128k | 35.19 | **28.32** | 38.77 | 30.89 | 45.71 | 38.23 |
 
 **cp=8**
 
 | Workload | W=512 AG | W=512 a2a | W=1024 AG | W=1024 a2a | W=2048 AG | W=2048 a2a |
 |---|---:|---:|---:|---:|---:|---:|
-| rl16k | 10.67 | **3.51** | 10.77 | **3.91** | 10.91 | **4.38** |
-| bucket32k | 13.80 | **3.71** | 13.99 | **4.00** | 14.17 | **4.65** |
-| mixed32k | 21.17 | **5.25** | 21.29 | **5.83** | 21.64 | **6.95** |
-| outlier64k | 33.36 | **5.14** | 33.87 | **5.69** | 33.89 | **6.86** |
-| bucket64k | 33.44 | **5.06** | 33.55 | **5.73** | 33.90 | **6.83** |
-| bucket128k | 64.09 | **6.61** | 64.40 | **7.39** | 64.65 | **9.11** |
+| rl16k | 6.78 | **3.60** | 7.21 | 3.91 | 8.07 | 4.48 |
+| bucket32k | 10.20 | **5.52** | 10.83 | 5.96 | 12.08 | 6.98 |
+| mixed32k | 15.26 | **8.05** | 16.20 | 8.76 | 18.11 | 10.34 |
+| outlier64k | 8.31 | **4.44** | 8.90 | 4.76 | 9.86 | 5.57 |
+| bucket64k | 20.28 | **10.90** | 21.56 | 11.82 | 24.08 | 14.09 |
+| bucket128k | 29.70 | **15.73** | 31.51 | 17.13 | 35.14 | 20.56 |
 
-### Key takeaway: use a2a for SWA
+### SWA — FusedAttention — H100
 
-all_gather gathers the full KV tensor regardless of window size — SWA only reduces compute, not communication. a2a redistributes Q heads so both communication and compute shrink with the window. The AG-vs-a2a speedup ranges from **~2× (rl16k)** to **~13× (bucket128k W=512)** depending on seqlen and window size.
+p2p does not support SWA, so only all_gather and a2a are shown.
 
-### a2a vs all_gather speedup with SWA (AG/a2a ratio)
+**cp=2**
 
-| Workload | cp=2 W=512 | cp=2 W=1024 | cp=2 W=2048 | cp=4 W=512 | cp=4 W=1024 | cp=4 W=2048 | cp=8 W=512 | cp=8 W=1024 | cp=8 W=2048 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| rl16k | 2.5× | 2.3× | 1.9× | 2.7× | 2.4× | 2.1× | 3.0× | 2.8× | 2.5× |
-| bucket32k | 4.2× | 3.7× | 3.0× | 3.9× | 3.5× | 2.9× | 3.7× | 3.5× | 3.0× |
-| mixed32k | 3.9× | 3.4× | 2.8× | 3.7× | 3.3× | 2.8× | 4.0× | 3.7× | 3.1× |
-| outlier64k | 8.1× | 7.0× | 5.6× | 7.0× | 6.2× | 5.0× | 6.5× | 6.0× | 4.9× |
-| bucket64k | 8.1× | 7.0× | 5.6× | 7.0× | 6.2× | 5.0× | 6.6× | 5.9× | 5.0× |
-| bucket128k | 12.9× | 11.0× | 8.4× | 10.6× | 9.3× | 7.5× | 9.7× | 8.7× | 7.1× |
+| Workload | W=512 AG | W=512 a2a | W=1024 AG | W=1024 a2a | W=2048 AG | W=2048 a2a |
+|---|---:|---:|---:|---:|---:|---:|
+| rl16k | 26.76 | **10.41** | 27.22 | 11.92 | 28.07 | 14.77 |
+| bucket32k | 99.17 | **16.52** | 100.05 | 19.13 | 101.43 | 24.78 |
+| mixed32k | 133.84 | **24.50** | 134.64 | 28.55 | 137.54 | 37.78 |
+| outlier64k | 123.14 | **12.92** | 123.52 | 14.93 | 124.70 | 19.21 |
+| bucket64k | 412.00 | **33.58** | 412.96 | 39.37 | 416.78 | 52.74 |
+| bucket128k | 1405.52 | **49.36** | 1414.60 | 58.67 | 1411.75 | 78.22 |
 
-## Known Issues
+**cp=4**
 
-**SWA + all_gather rare `cudaErrorIllegalInstruction`**: a small number of SWA AG runs at cp=2 with 4-wide parallel-batch execution crashed intermittently. The same configs pass cleanly when run alone or with cp≥4. The crash signature matches an earlier stream-race fix (`cp_stream.wait_stream(...)` after the THD reorder, commit `611d876e`), suggesting another asynchronous race only exposed under heavy concurrent driver load. Workaround: use a2a (always faster anyway), or run cp=2 SWA AG configs serially.
+| Workload | W=512 AG | W=512 a2a | W=1024 AG | W=1024 a2a | W=2048 AG | W=2048 a2a |
+|---|---:|---:|---:|---:|---:|---:|
+| rl16k | 15.41 | **6.13** | 15.58 | 6.88 | 16.03 | 8.27 |
+| bucket32k | 49.45 | **9.53** | 49.63 | 10.90 | 50.31 | 13.48 |
+| mixed32k | 67.53 | **14.20** | 68.14 | 16.18 | 69.26 | 20.21 |
+| outlier64k | 59.47 | **7.50** | 59.88 | 8.48 | 60.18 | 10.54 |
+| bucket64k | 195.60 | **19.22** | 196.20 | 22.05 | 197.80 | 27.92 |
+| bucket128k | 544.28 | **27.92** | 545.33 | 32.14 | 547.58 | 41.46 |
+
+**cp=8**
+
+| Workload | W=512 AG | W=512 a2a | W=1024 AG | W=1024 a2a | W=2048 AG | W=2048 a2a |
+|---|---:|---:|---:|---:|---:|---:|
+| rl16k | 10.52 | **3.77** | 10.68 | 4.07 | 10.84 | 4.80 |
+| bucket32k | 27.95 | **5.49** | 28.19 | 6.16 | 28.50 | 7.47 |
+| mixed32k | 38.85 | **8.05** | 39.09 | 9.08 | 39.68 | 11.08 |
+| outlier64k | 31.92 | **4.46** | 32.01 | 4.92 | 32.30 | 5.93 |
+| bucket64k | 101.71 | **10.82** | 102.19 | 12.23 | 102.98 | 15.10 |
+| bucket128k | 272.90 | **15.59** | 271.73 | 17.74 | 274.35 | 22.00 |
+
+### SWA — FusedAttention — B200
+
+p2p does not support SWA, so only all_gather and a2a are shown.
+
+**cp=2**
+
+| Workload | W=512 AG | W=512 a2a | W=1024 AG | W=1024 a2a | W=2048 AG | W=2048 a2a |
+|---|---:|---:|---:|---:|---:|---:|
+| rl16k | **5.89** | 7.18 | 6.68 | 7.93 | 8.43 | 9.37 |
+| bucket32k | **8.98** | 11.23 | 10.30 | 12.54 | 13.36 | 15.19 |
+| mixed32k | **13.32** | 15.85 | 15.41 | 17.88 | 20.14 | 22.15 |
+| outlier64k | **7.11** | 8.80 | 8.14 | 9.89 | 10.45 | 11.93 |
+| bucket64k | **17.91** | 21.53 | 20.80 | 24.42 | 27.78 | 30.99 |
+| bucket128k | **26.29** | 31.71 | 31.16 | 36.38 | 41.46 | 46.31 |
+
+**cp=4**
+
+| Workload | W=512 AG | W=512 a2a | W=1024 AG | W=1024 a2a | W=2048 AG | W=2048 a2a |
+|---|---:|---:|---:|---:|---:|---:|
+| rl16k | 4.72 | **4.08** | 5.12 | 4.45 | 5.93 | 5.16 |
+| bucket32k | 7.06 | **6.14** | 7.76 | 6.76 | 9.10 | 8.07 |
+| mixed32k | 10.47 | **8.89** | 11.54 | 9.98 | 13.58 | 11.92 |
+| outlier64k | 5.69 | **4.91** | 6.22 | 5.46 | 7.17 | 6.36 |
+| bucket64k | 14.02 | **11.92** | 15.39 | 13.35 | 18.24 | 16.17 |
+| bucket128k | 20.35 | **16.95** | 22.38 | 19.11 | 26.87 | 23.71 |
+
+**cp=8**
+
+| Workload | W=512 AG | W=512 a2a | W=1024 AG | W=1024 a2a | W=2048 AG | W=2048 a2a |
+|---|---:|---:|---:|---:|---:|---:|
+| rl16k | 4.20 | **2.72** | 4.50 | 2.87 | 4.81 | 3.13 |
+| bucket32k | 6.14 | **3.61** | 6.55 | 3.93 | 7.20 | 4.60 |
+| mixed32k | 8.98 | **5.05** | 9.53 | 5.59 | 10.64 | 6.50 |
+| outlier64k | 4.98 | **3.00** | 5.25 | 3.26 | 5.72 | 3.74 |
+| bucket64k | 12.03 | **6.62** | 12.74 | 7.32 | 14.20 | 8.69 |
+| bucket128k | 17.28 | **9.31** | 18.33 | 10.28 | 20.43 | 12.41 |
+
+
+### SWA communication trends
+
+SWA reduces the attention compute window, but the communication tradeoff is backend
+and CP-size dependent. In these runs, all_gather is often competitive or faster at
+cp=2 for FlashAttention H100 and FusedAttention B200, while a2a is consistently
+faster at cp=4 and cp=8. FusedAttention H100 is the strongest a2a case: the
+measured AG/a2a speedup ranges from 1.9x to 28.5x,
+with the largest gaps on long-sequence bucket128k all_gather rows.
 
 ## Correctness Tests
 

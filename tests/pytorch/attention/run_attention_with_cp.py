@@ -17,18 +17,6 @@ from transformer_engine.pytorch.attention.dot_product_attention.utils import com
 import transformer_engine_torch as tex
 from transformer_engine.pytorch import DType
 from test_attention_with_cp import model_configs_flash_attn, model_configs_fused_attn
-
-# Merge in benchmark/stress configs from benchmark_cp.py if available so the worker
-# can resolve names like cp_thd_0, bench_8k, bariamis_8k, rl16k, etc.
-try:
-    from benchmark_cp import (
-        model_configs_fused_attn as _bench_cfgs_fused_attn,
-    )
-
-    for _k, _v in _bench_cfgs_fused_attn.items():
-        model_configs_fused_attn.setdefault(_k, _v)
-except ImportError:
-    pass
 from transformer_engine.pytorch import (
     autocast,
     DotProductAttention,
@@ -43,6 +31,17 @@ from transformer_engine.common.recipe import (
     Format,
 )
 from utils import ModelConfig, compare_and_assert
+
+# Merge benchmark/stress configs into both backend maps so worker runs can use
+# aliases like rl16k, bucket32k, and mixed32k_swa512 with either backend.
+try:
+    from benchmark_cp import model_configs_fused_attn as _bench_cfgs_fused_attn
+
+    for _k, _v in _bench_cfgs_fused_attn.items():
+        model_configs_fused_attn.setdefault(_k, _v)
+        model_configs_flash_attn.setdefault(_k, _v)
+except ImportError:
+    pass
 
 # Pool mode (NVTE_CP_POOL_PG=1) only: shared CP collective groups, created once
 # per pool by run_attention_with_cp_pool.main() and reused across every case in
