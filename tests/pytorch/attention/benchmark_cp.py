@@ -30,10 +30,21 @@ _current_file = pathlib.Path(__file__).resolve()
 sys.path.append(str(_current_file.parent.parent))
 from utils import ModelConfig, get_available_attention_backends, run_distributed
 
-# Reuse the worker-launch helper from the core test module so we don't duplicate it.
-from test_attention_with_cp import get_bash_arguments
-
 pytest_logging_level = logging.getLevelName(logging.root.level)
+
+
+def get_bash_arguments(num_gpus_per_node, **kwargs):
+    args = [
+        "python3",
+        "-m",
+        "torch.distributed.launch",
+        "--nproc-per-node=" + str(num_gpus_per_node),
+    ]
+    te_path = os.getenv("TE_PATH", "/opt/transformerengine")
+    args.append(os.path.join(te_path, "tests/pytorch/attention/run_attention_with_cp.py"))
+    for k, v in kwargs.items():
+        args.append(f"{k}={v}")
+    return args
 
 
 # Benchmark/stress configs (llama3_8b-like: 32 heads, 8 GQA, d=128).
