@@ -53,6 +53,22 @@ model_configs_fused_attn = {
     "bench_8k": ModelConfig(2, 8192, 32, 128, num_gqa_groups=8, attn_mask_type="causal"),
     "bench_16k": ModelConfig(1, 16384, 32, 128, num_gqa_groups=8, attn_mask_type="causal"),
     "bench_32k": ModelConfig(1, 32768, 32, 128, num_gqa_groups=8, attn_mask_type="causal"),
+    # Fixed 512K tokens with different sequence-count/length decompositions.
+    "uniform_1x512k": ModelConfig(
+        1, 524288, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
+    ),
+    "uniform_2x256k": ModelConfig(
+        2, 262144, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
+    ),
+    "uniform_4x128k": ModelConfig(
+        4, 131072, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
+    ),
+    "uniform_8x64k": ModelConfig(
+        8, 65536, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
+    ),
+    "uniform_16x32k": ModelConfig(
+        16, 32768, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
+    ),
     # THD stress: higher batch / longer seqlen than core suite
     "cp_thd_0": ModelConfig(8, 8192, 12, 128, attn_mask_type="causal"),  # MHA b=8
     "cp_thd_1": ModelConfig(8, 8192, 12, 128),  # MHA b=8 non-causal
