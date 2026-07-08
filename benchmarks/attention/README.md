@@ -71,6 +71,11 @@ Configs are defined in `benchmark_cp.py` and auto-merged into the runner's confi
 
 | Config | B | S | H | g | d | mask |
 |---|---:|---:|---:|---:|---:|---|
+| uniform_1x512k | 1 | 524288 | 32 | 8 | 128 | causal |
+| uniform_2x256k | 2 | 262144 | 32 | 8 | 128 | causal |
+| uniform_4x128k | 4 | 131072 | 32 | 8 | 128 | causal |
+| uniform_8x64k | 8 | 65536 | 32 | 8 | 128 | causal |
+| uniform_16x32k | 16 | 32768 | 32 | 8 | 128 | causal |
 | bench_8k | 2 | 8192 | 32 | 8 | 128 | causal |
 | bench_16k | 1 | 16384 | 32 | 8 | 128 | causal |
 | bench_32k | 1 | 32768 | 32 | 8 | 128 | causal |
@@ -99,7 +104,7 @@ SWA variants: append `_swa512`, `_swa1024`, or `_swa2048` to any training worklo
 
 ## Benchmark Results
 
-bf16, `qkv_format=thd`, training mode, 50 timed iterations after warmup. Values are ms/iter (fwd+bwd). Tables use generic H100/B200 labels only. `AG` means `all_gather`; bold marks the fastest entry in each workload row.
+Unless a section states otherwise, results use bf16, `qkv_format=thd`, training mode, and 50 timed iterations after warmup. Values are ms/iter (fwd+bwd). Tables use generic H100/B200 labels only. `AG` means `all_gather`; bold marks the fastest entry in each workload row.
 
 These FA4 tables were produced through the `FlashAttention` backend with FlashAttention 4 selected by the runtime environment. The TSVs still record `kernel_backend=FlashAttention`, so the section headings use FA4 to avoid conflating them with earlier FlashAttention runs.
 
@@ -389,6 +394,57 @@ For H100 SWA, FA4 a2a stayed essentially flat versus the prior H100 FlashAttenti
 ### Uniform THD Results
 
 Uniform THD runs use `thd_seqlen_pattern=max`. Uniform SWA uses the `cp_thd_swa_*` configs below; p2p is unsupported for SWA. `fail` means the supported config failed after retry, so no timing is reported.
+
+### Fixed-Token Uniform THD - FusedAttention
+
+These workloads hold `B*S=524288` tokens constant while varying the number and
+length of sequences. They use `H=32`, `g=8`, `d=128`, causal masking, 10
+warmups, and 5 timed iterations. The worker runs a full non-CP reference for
+correctness, but reports only CP forward+backward time.
+
+Fixed tokens do not imply fixed attention work: dense attention scales as
+`B*S^2 = 524288*S`, so halving sequence length halves the leading attention
+work in this matrix.
+
+#### Fixed-Token Uniform THD - FusedAttention - H100
+
+| Config | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| uniform_1x512k | 7539.90 | 9269.71 | 7738.33 | 3651.27 | 4123.75 | 3886.90 | **1849.98** | 1988.35 | 1940.29 |
+| uniform_2x256k | 3709.91 | 4824.64 | 3878.30 | 1844.43 | 2063.90 | 1945.75 | **946.37** | 1007.99 | 974.20 |
+| uniform_4x128k | 1847.92 | 2609.12 | 1930.22 | 944.96 | 1036.16 | 971.83 | 493.49 | 514.78 | **485.75** |
+| uniform_8x64k | 940.62 | 1520.48 | 961.40 | 495.83 | 527.75 | 486.70 | 265.93 | 271.92 | **244.43** |
+| uniform_16x32k | 496.83 | 1111.27 | 504.62 | 270.04 | 282.38 | 258.13 | 153.92 | 153.28 | **130.17** |
+
+#### Fixed-Token Uniform THD - FusedAttention - B200
+
+| Config | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| uniform_1x512k | 4349.79 | 3985.59 | 3969.40 | 2016.79 | 2006.22 | 1935.66 | 996.11 | 993.43 | **949.04** |
+| uniform_2x256k | 2147.77 | 1958.09 | 1943.03 | 992.98 | 980.13 | 940.69 | 501.46 | 494.87 | **460.10** |
+| uniform_4x128k | 1084.79 | 968.69 | 972.63 | 504.20 | 495.07 | 471.21 | 262.17 | 256.95 | **230.79** |
+| uniform_8x64k | 552.31 | 496.54 | 501.64 | 265.29 | 259.25 | 244.24 | 141.91 | 139.91 | **120.62** |
+| uniform_16x32k | 284.83 | 261.76 | 269.46 | 145.05 | 140.75 | 131.92 | 82.86 | 80.36 | **66.04** |
+
+#### Fixed-Token Observations and Open Questions
+
+- Runtime approximately halves with sequence length, as expected from
+  `B*S^2` at fixed tokens. The remaining deviation captures communication,
+  launch, and per-sequence overhead rather than equal-FLOP scaling.
+- H100 favors p2p at cp=2 for every workload. A2A overtakes p2p at cp=4 for
+  `8x64k` and shorter, and at cp=8 for `4x128k` and shorter. AG is never the
+  fastest H100 mode in this matrix.
+- B200 favors A2A at cp=4 and cp=8. At cp=2, AG narrowly leads A2A from
+  `4x128k` through `16x32k`, while A2A leads on the two longest-sequence rows.
+- The H100/B200 gap for cp=2 AG grows from 2.33x at `1x512k` to 4.25x at
+  `16x32k`, while the p2p gap stays near 1.7x. Profiling is needed to separate
+  collective latency, topology, memory traffic, and backend kernel selection.
+- These are single five-iteration measurements. Repeated 50-iteration runs are
+  needed to establish variance and determine whether the small AG/A2A cp=2
+  crossovers on B200 are stable.
+- Peak-memory sweeps by communication mode are still needed to pair latency
+  with memory tradeoffs. Fixed-token SWA runs would also test whether AG remains
+  competitive when A2A is infeasible or head divisibility limits it.
 
 ### Uniform THD - FA4 - H100
 
