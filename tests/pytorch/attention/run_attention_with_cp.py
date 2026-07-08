@@ -419,7 +419,8 @@ def run_dpa_with_cp(
         dout_quantizer.optimize_for_gemm = True
         dout_quantizer.internal = False
     qkv_layout = "_".join([qkv_format] * 3)
-    q, k, v, dout = [x.clone().detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
+    # DPA reads these inputs, so share full storage until independent CP shards exist.
+    q, k, v, dout = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
     if fp8_mha:
         q, k, v, qkv_layout, _ = combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer)
     for x in [q, k, v]:
@@ -497,11 +498,8 @@ def run_dpa_with_cp(
     logging.info(f"[Rank {rank}] Run with context parallelism")
 
     # set up inputs
-    q_, k_, v_, dout_, *rest = [
-        x.clone().detach()
-        for x in [q_orig, k_orig, v_orig, dout_orig] + ([] if bias is None else [bias])
-    ]
-    bias_ = rest[0] if len(rest) else None
+    q_, k_, v_, dout_ = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
+    bias_ = bias.clone().detach() if bias is not None else None
     if qkv_format == "bshd" or qkv_format == "sbhd":
         seq_dim = qkv_format.index("s")
         q_, k_, v_, dout_ = [
@@ -530,6 +528,11 @@ def run_dpa_with_cp(
     else:
         assert False, f"{qkv_format} is an unsupported qkv_format!"
     q_, k_, v_, dout_ = [x.contiguous() for x in [q_, k_, v_, dout_]]
+    # index_select owns shard storage; detach outputs so the graph releases full input leaves.
+    out = out.detach()
+    if max_logit is not None:
+        max_logit = max_logit.detach()
+    del q, k, v, dout, q_orig, k_orig, v_orig, dout_orig
     if scaling_mode == "delayed":
         qkv_quantizer.scale.fill_(1.0)
         qkv_quantizer.amax.fill_(0.0)
@@ -661,6 +664,8 @@ def run_dpa_with_cp(
                 if is_training:
                     out_b.backward(dout_)
             torch.cuda.synchronize()
+            # Do not carry a completed graph and its leaf gradients into the next iteration.
+            del out_b, q_b, k_b, v_b
         elapsed = (time.perf_counter() - t0) / benchmark_iters * 1000
         torch.cuda.cudart().cudaProfilerStop()
         print(
