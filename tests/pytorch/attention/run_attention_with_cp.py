@@ -5,6 +5,7 @@
 import copy
 import os
 import sys
+import time
 import logging
 from contextlib import nullcontext
 import torch
@@ -31,6 +32,17 @@ from transformer_engine.common.recipe import (
 )
 from utils import ModelConfig, compare_and_assert
 
+# Merge benchmark/stress configs into both backend maps so worker runs can use
+# aliases like rl16k, bucket32k, and mixed32k_swa512 with either backend.
+try:
+    from benchmark_cp import model_configs_fused_attn as _bench_cfgs_fused_attn
+
+    for _k, _v in _bench_cfgs_fused_attn.items():
+        model_configs_fused_attn.setdefault(_k, _v)
+        model_configs_flash_attn.setdefault(_k, _v)
+except ImportError:
+    pass
+
 # Pool mode (NVTE_CP_POOL_PG=1) only: shared CP collective groups, created once
 # per pool by run_attention_with_cp_pool.main() and reused across every case in
 # that pool. world_size and the rank set don't change per case, so re-creating
@@ -49,6 +61,7 @@ def generate_input_shapes(
     world_size: int,
     kernel_backend: str,
     fa_pad_between_seqs: str = "False",
+    thd_seqlen_pattern: str = "random",
 ):
     if qkv_format == "bshd":
         q_input_shape = (
@@ -107,7 +120,29 @@ def generate_input_shapes(
         cu_seqlens_q_padded = None
         cu_seqlens_kv_padded = None
     elif qkv_format == "thd":
-        seqlens_q = torch.randint(0, config.max_seqlen_q + 1, [config.batch_size]).to(torch.int32)
+        b, s = config.batch_size, config.max_seqlen_q
+        # Custom list: "24576,28672,30720,32768" -> explicit per-seq lengths
+        if "," in thd_seqlen_pattern:
+            seqlens_q = torch.tensor(
+                [int(x) for x in thd_seqlen_pattern.split(",")], dtype=torch.int32
+            )
+            b = len(seqlens_q)
+            s = int(seqlens_q.max())
+            config.batch_size = b
+            config.max_seqlen_q = s
+            config.max_seqlen_kv = s
+        elif thd_seqlen_pattern == "max":
+            seqlens_q = torch.full([b], s, dtype=torch.int32)
+        elif thd_seqlen_pattern == "half":
+            seqlens_q = torch.full([b], s // 2, dtype=torch.int32)
+        elif thd_seqlen_pattern == "linear":
+            seqlens_q = torch.linspace(1, s, b).to(torch.int32)
+        elif thd_seqlen_pattern == "alternating":
+            seqlens_q = torch.tensor(
+                [s if i % 2 == 0 else s // 4 for i in range(b)], dtype=torch.int32
+            )
+        else:  # "random"
+            seqlens_q = torch.randint(0, s + 1, [b]).to(torch.int32)
         seqlens_q_padded = (seqlens_q + 2 * world_size - 1) // (world_size * 2) * (world_size * 2)
         cu_seqlens_q_padded = torch.cat(
             [
@@ -204,8 +239,12 @@ def run_dpa_with_cp(
     fa_pad_between_seqs="False",
     deterministic="False",
     log_level=logging.WARNING,
+    benchmark="0",
+    thd_seqlen_pattern="random",
 ):
     """Test DotProductAttention module with context parallelism"""
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
     logging.root.setLevel(log_level)
     # When is_training is False, gradient outputs are None.
     is_training = is_training == "True"
@@ -320,13 +359,30 @@ def run_dpa_with_cp(
         cu_seqlens_kv,
         cu_seqlens_q_padded,
         cu_seqlens_kv_padded,
-    ) = generate_input_shapes(qkv_format, config, world_size, kernel_backend, fa_pad_between_seqs)
+    ) = generate_input_shapes(
+        qkv_format, config, world_size, kernel_backend, fa_pad_between_seqs, thd_seqlen_pattern
+    )
     q_orig = torch.clamp(torch.randn(q_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     k_orig = torch.clamp(torch.randn(k_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     v_orig = torch.clamp(torch.randn(v_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     dout_orig = torch.clamp(
         torch.randn(attn_output_shape, dtype=dtypes[dtype]), min=-1, max=1
     ).cuda()
+    # Save inputs for cross-backend comparison
+    _save_path = os.environ.get("CP_CROSS_BACKEND_SAVE_DIR")
+    if _save_path:
+        os.makedirs(_save_path, exist_ok=True)
+        torch.save(
+            {
+                "q": q_orig,
+                "k": k_orig,
+                "v": v_orig,
+                "dout": dout_orig,
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_q_padded": cu_seqlens_q_padded,
+            },
+            os.path.join(_save_path, f"inputs_rank{rank}.pt"),
+        )
     if scaling_mode == "delayed":
         qkv_quantizer = Float8Quantizer(
             fp8_dtype=DType.kFloat8E4M3,
@@ -363,7 +419,8 @@ def run_dpa_with_cp(
         dout_quantizer.optimize_for_gemm = True
         dout_quantizer.internal = False
     qkv_layout = "_".join([qkv_format] * 3)
-    q, k, v, dout = [x.clone().detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
+    # DPA reads these inputs, so share full storage until independent CP shards exist.
+    q, k, v, dout = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
     if fp8_mha:
         q, k, v, qkv_layout, _ = combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer)
     for x in [q, k, v]:
@@ -411,6 +468,13 @@ def run_dpa_with_cp(
             cu_seqlens_kv=cu_seqlens_kv,
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+            # Test runner sets cu_seqlens_q == cu_seqlens_q_padded for the
+            # FlashAttention path, i.e. no inter-sequence padding. Declare this
+            # explicitly so the sync-free auto-detect (which conservatively
+            # picks True when padded cu_seqlens are present) does not disable FA.
+            pad_between_seqs=(
+                (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
+            ),
             fp8_output=fp8_mha,
         )
         if config.return_max_logit:
@@ -434,11 +498,8 @@ def run_dpa_with_cp(
     logging.info(f"[Rank {rank}] Run with context parallelism")
 
     # set up inputs
-    q_, k_, v_, dout_, *rest = [
-        x.clone().detach()
-        for x in [q_orig, k_orig, v_orig, dout_orig] + ([] if bias is None else [bias])
-    ]
-    bias_ = rest[0] if len(rest) else None
+    q_, k_, v_, dout_ = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
+    bias_ = bias.clone().detach() if bias is not None else None
     if qkv_format == "bshd" or qkv_format == "sbhd":
         seq_dim = qkv_format.index("s")
         q_, k_, v_, dout_ = [
@@ -467,6 +528,11 @@ def run_dpa_with_cp(
     else:
         assert False, f"{qkv_format} is an unsupported qkv_format!"
     q_, k_, v_, dout_ = [x.contiguous() for x in [q_, k_, v_, dout_]]
+    # index_select owns shard storage; detach outputs so the graph releases full input leaves.
+    out = out.detach()
+    if max_logit is not None:
+        max_logit = max_logit.detach()
+    del q, k, v, dout, q_orig, k_orig, v_orig, dout_orig
     if scaling_mode == "delayed":
         qkv_quantizer.scale.fill_(1.0)
         qkv_quantizer.amax.fill_(0.0)
@@ -528,6 +594,12 @@ def run_dpa_with_cp(
             cu_seqlens_kv=cu_seqlens_kv,
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+            # See note above (non-CP branch): same explicit declaration so
+            # FlashAttention isn't disabled by the conservative sync-free
+            # auto-detect when this test path constructs no inter-seq padding.
+            pad_between_seqs=(
+                (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
+            ),
             fp8_output=fp8_mha,
         )
         if config.return_max_logit:
@@ -551,6 +623,56 @@ def run_dpa_with_cp(
     else:
         dq_, dk_, dv_, dbias_ = None, None, None, None
         d_softmax_offset_ = None
+
+    if _save_path:
+        torch.save(
+            {
+                "out": out_.detach(),
+                "dq": dq_.detach() if dq_ is not None else None,
+                "dk": dk_.detach() if dk_ is not None else None,
+                "dv": dv_.detach() if dv_ is not None else None,
+            },
+            os.path.join(_save_path, f"outputs_{cp_comm_type}_rank{rank}.pt"),
+        )
+
+    # Benchmark: re-run forward+backward with timing
+    benchmark_iters = int(benchmark)
+    if benchmark_iters > 0:
+        warmup = 10
+        t0 = None
+        for it in range(warmup + benchmark_iters):
+            q_b, k_b, v_b = [x.clone().detach().requires_grad_() for x in [q_, k_, v_]]
+            torch.cuda.synchronize()
+            if it == warmup:
+                torch.cuda.cudart().cudaProfilerStart()
+                t0 = time.perf_counter()
+            with fp8_context:
+                out_b = core_attn(
+                    q_b,
+                    k_b,
+                    v_b,
+                    core_attention_bias_type=config.attn_bias_type,
+                    core_attention_bias=bias_,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_kv,
+                    cu_seqlens_q_padded=cu_seqlens_q_padded,
+                    cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+                    fp8_output=fp8_mha,
+                )
+                if isinstance(out_b, tuple):
+                    out_b = out_b[0]
+                if is_training:
+                    out_b.backward(dout_)
+            torch.cuda.synchronize()
+            # Do not carry a completed graph and its leaf gradients into the next iteration.
+            del out_b, q_b, k_b, v_b
+        elapsed = (time.perf_counter() - t0) / benchmark_iters * 1000
+        torch.cuda.cudart().cudaProfilerStop()
+        print(
+            f"[Rank {rank}] {cp_comm_type} {qkv_format} {dtype}: {elapsed:.2f} ms/iter"
+            f" ({benchmark_iters} iters)",
+            flush=True,
+        )
 
     # get outputs
     tensors = [out, dq, dk, dv, dbias, out_, dq_, dk_, dv_, dbias_]
