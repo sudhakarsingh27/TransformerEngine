@@ -69,6 +69,30 @@ model_configs_fused_attn = {
     "uniform_16x32k": ModelConfig(
         16, 32768, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
     ),
+    # Fixed-token SWA probes use the same shapes with a 1024-token left window.
+    "uniform_4x128k_swa1024": ModelConfig(
+        4, 131072, 32, 128, num_gqa_groups=8,
+        attn_mask_type="causal", window_size=(1024, 0),
+    ),
+    "uniform_8x64k_swa1024": ModelConfig(
+        8, 65536, 32, 128, num_gqa_groups=8,
+        attn_mask_type="causal", window_size=(1024, 0),
+    ),
+    "uniform_1x128k": ModelConfig(
+        1, 131072, 32, 128, num_gqa_groups=8, attn_mask_type="causal",
+    ),
+    "uniform_1x128k_swa1024": ModelConfig(
+        1, 131072, 32, 128, num_gqa_groups=8,
+        attn_mask_type="causal", window_size=(1024, 0),
+    ),
+    # 2688-wide model with 32 query heads: 2688 / 32 = 84 channels per head.
+    "uniform_1x128k_h32_d2688": ModelConfig(
+        1, 131072, 32, 84, num_gqa_groups=8, attn_mask_type="causal",
+    ),
+    "uniform_1x128k_h32_d2688_swa1024": ModelConfig(
+        1, 131072, 32, 84, num_gqa_groups=8,
+        attn_mask_type="causal", window_size=(1024, 0),
+    ),
     # THD stress: higher batch / longer seqlen than core suite
     "cp_thd_0": ModelConfig(8, 8192, 12, 128, attn_mask_type="causal"),  # MHA b=8
     "cp_thd_1": ModelConfig(8, 8192, 12, 128),  # MHA b=8 non-causal
