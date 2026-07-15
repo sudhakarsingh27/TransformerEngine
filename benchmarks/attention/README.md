@@ -426,14 +426,29 @@ work in this matrix.
 | uniform_8x64k | 552.31 | 496.54 | 501.64 | 265.29 | 259.25 | 244.24 | 141.91 | 139.91 | **120.62** |
 | uniform_16x32k | 284.83 | 261.76 | 269.46 | 145.05 | 140.75 | 131.92 | 82.86 | 80.36 | **66.04** |
 
+#### Fixed-Token Uniform THD - FA3 - H100
+
+| Config | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| uniform_1x512k | 6276.71 | 6176.67 | 6146.18 | 3258.47 | 3163.84 | 3133.57 | 1636.17 | 1597.77 | **1568.32** |
+| uniform_2x256k | 3158.38 | 3110.29 | 3098.83 | 1643.01 | 1606.01 | 1581.31 | 840.03 | 816.37 | **789.78** |
+| uniform_4x128k | 1598.16 | 1578.72 | 1576.89 | 839.87 | 823.45 | 804.97 | 440.20 | 429.60 | **404.55** |
+| uniform_8x64k | 819.17 | 812.05 | 813.63 | 439.30 | 432.56 | 417.26 | 239.44 | 235.43 | **210.66** |
+| uniform_16x32k | 428.93 | 428.99 | 430.68 | 240.64 | 238.09 | 223.48 | 140.84 | 137.96 | **111.78** |
+
 #### Fixed-Token Observations and Open Questions
 
 - Runtime approximately halves with sequence length, as expected from
   `B*S^2` at fixed tokens. The remaining deviation captures communication,
   launch, and per-sequence overhead rather than equal-FLOP scaling.
-- H100 favors p2p at cp=2 for every workload. A2A overtakes p2p at cp=4 for
-  `8x64k` and shorter, and at cp=8 for `4x128k` and shorter. AG is never the
-  fastest H100 mode in this matrix.
+- H100 FusedAttention favors p2p at cp=2 for every workload. A2A overtakes p2p
+  at cp=4 for `8x64k` and shorter, and at cp=8 for `4x128k` and shorter. AG is
+  never the fastest H100 FusedAttention mode in this matrix.
+- H100 FA3 favors A2A at cp=4 and cp=8. At cp=2, A2A leads through `4x128k`,
+  AG narrowly leads at `8x64k`, and p2p narrowly leads at `16x32k`.
+- FA3 is faster than FusedAttention in every matched H100 cell, with a median
+  speedup of 1.19x (range 1.09x to 2.59x). The largest gaps are all-gather
+  rows; p2p has a narrower 1.09x to 1.20x range.
 - B200 favors A2A at cp=4 and cp=8. At cp=2, AG narrowly leads A2A from
   `4x128k` through `16x32k`, while A2A leads on the two longest-sequence rows.
 - The H100/B200 gap for cp=2 AG grows from 2.33x at `1x512k` to 4.25x at
