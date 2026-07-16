@@ -69,6 +69,18 @@ model_configs_fused_attn = {
     "uniform_16x32k": ModelConfig(
         16, 32768, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
     ),
+    "uniform_32x16k": ModelConfig(
+        32, 16384, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
+    ),
+    "uniform_64x8k": ModelConfig(
+        64, 8192, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
+    ),
+    "uniform_128x4k": ModelConfig(
+        128, 4096, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
+    ),
+    "uniform_256x2k": ModelConfig(
+        256, 2048, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
+    ),
     # Fixed-token SWA probes use the same shapes with a 1024-token left window.
     "uniform_4x128k_swa1024": ModelConfig(
         4, 131072, 32, 128, num_gqa_groups=8,

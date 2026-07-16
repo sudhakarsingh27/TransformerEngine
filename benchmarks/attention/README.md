@@ -76,6 +76,10 @@ Configs are defined in `benchmark_cp.py` and auto-merged into the runner's confi
 | uniform_4x128k | 4 | 131072 | 32 | 8 | 128 | causal |
 | uniform_8x64k | 8 | 65536 | 32 | 8 | 128 | causal |
 | uniform_16x32k | 16 | 32768 | 32 | 8 | 128 | causal |
+| uniform_32x16k | 32 | 16384 | 32 | 8 | 128 | causal |
+| uniform_64x8k | 64 | 8192 | 32 | 8 | 128 | causal |
+| uniform_128x4k | 128 | 4096 | 32 | 8 | 128 | causal |
+| uniform_256x2k | 256 | 2048 | 32 | 8 | 128 | causal |
 | bench_8k | 2 | 8192 | 32 | 8 | 128 | causal |
 | bench_16k | 1 | 16384 | 32 | 8 | 128 | causal |
 | bench_32k | 1 | 32768 | 32 | 8 | 128 | causal |
@@ -395,7 +399,7 @@ For H100 SWA, FA4 a2a stayed essentially flat versus the prior H100 FlashAttenti
 
 Uniform THD runs use `thd_seqlen_pattern=max`. Uniform SWA uses the `cp_thd_swa_*` configs below; p2p is unsupported for SWA. `fail` means the supported config failed after retry, so no timing is reported.
 
-### Fixed-Token Uniform THD - FusedAttention
+### Fixed-Token Uniform THD
 
 These workloads hold `B*S=524288` tokens constant while varying the number and
 length of sequences. They use `H=32`, `g=8`, `d=128`, causal masking, 10
@@ -425,6 +429,13 @@ work in this matrix.
 | uniform_4x128k | 1084.79 | 968.69 | 972.63 | 504.20 | 495.07 | 471.21 | 262.17 | 256.95 | **230.79** |
 | uniform_8x64k | 552.31 | 496.54 | 501.64 | 265.29 | 259.25 | 244.24 | 141.91 | 139.91 | **120.62** |
 | uniform_16x32k | 284.83 | 261.76 | 269.46 | 145.05 | 140.75 | 131.92 | 82.86 | 80.36 | **66.04** |
+| uniform_32x16k | 153.86 | **146.07** | 152.66 | - | - | - | - | - | - |
+| uniform_64x8k | 89.49 | **86.78** | 94.82 | - | - | - | - | - | - |
+| uniform_128x4k | 60.25 | **56.25** | 64.02 | - | - | - | - | - | - |
+| uniform_256x2k | 43.28 | **42.24** | 49.76 | - | - | - | - | - | - |
+
+The four shortest-sequence FusedAttention B200 rows were measured only at
+cp=2; `-` means not measured.
 
 #### Fixed-Token Uniform THD - FA3 - H100
 
@@ -435,22 +446,57 @@ work in this matrix.
 | uniform_4x128k | 1598.16 | 1578.72 | 1576.89 | 839.87 | 823.45 | 804.97 | 440.20 | 429.60 | **404.55** |
 | uniform_8x64k | 819.17 | 812.05 | 813.63 | 439.30 | 432.56 | 417.26 | 239.44 | 235.43 | **210.66** |
 | uniform_16x32k | 428.93 | 428.99 | 430.68 | 240.64 | 238.09 | 223.48 | 140.84 | 137.96 | **111.78** |
+| uniform_32x16k | **239.66** | 241.66 | 243.85 | - | - | - | - | - | - |
+| uniform_64x8k | **142.45** | 145.17 | 146.58 | - | - | - | - | - | - |
+| uniform_128x4k | **93.81** | 97.76 | 99.20 | - | - | - | - | - | - |
+| uniform_256x2k | **71.60** | 77.73 | 76.10 | - | - | - | - | - | - |
+
+The four shortest-sequence FA3 H100 rows were measured only at cp=2; `-`
+means not measured.
+
+#### Fixed-Token Uniform THD - FA4 - B200
+
+| Config | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| uniform_32x16k | **127.05** | 131.98 | 135.14 | - | - | - | - | - | - |
+| uniform_64x8k | **80.49** | 84.08 | 87.22 | - | - | - | - | - | - |
+| uniform_128x4k | **56.70** | 60.05 | 60.46 | - | - | - | - | - | - |
+| uniform_256x2k | **48.53** | 55.27 | 49.85 | - | - | - | - | - | - |
+
+The four shortest-sequence FA4 B200 rows were measured only at cp=2; `-`
+means not measured.
 
 #### Fixed-Token Observations and Open Questions
 
-- Runtime approximately halves with sequence length, as expected from
-  `B*S^2` at fixed tokens. The remaining deviation captures communication,
-  launch, and per-sequence overhead rather than equal-FLOP scaling.
+- Dense-attention work halves with sequence length at fixed tokens. Runtime
+  approaches that trend for longer sequences but flattens substantially on the
+  short-sequence rows, showing an increasing contribution from non-quadratic
+  costs that these end-to-end timings cannot attribute by themselves.
 - H100 FusedAttention favors p2p at cp=2 for every workload. A2A overtakes p2p
   at cp=4 for `8x64k` and shorter, and at cp=8 for `4x128k` and shorter. AG is
   never the fastest H100 FusedAttention mode in this matrix.
+- B200 FusedAttention favors AG at cp=2 for all four short-sequence rows.
+  Relative to AG, p2p is 2.5% to 7.1% slower and A2A is 4.5% to 17.8% slower.
 - H100 FA3 favors A2A at cp=4 and cp=8. At cp=2, A2A leads through `4x128k`,
-  AG narrowly leads at `8x64k`, and p2p narrowly leads at `16x32k`.
+  AG narrowly leads at `8x64k`, and p2p leads from `16x32k` through `256x2k`.
+- At fixed tokens, the cp=2 p2p runtime reduction from each sequence-length
+  halving shrinks from 44.1% (`16x32k` to `32x16k`) to 23.7% (`128x4k` to
+  `256x2k`). This is consistent with an increasing contribution from
+  non-quadratic costs; profiling is needed to separate communication, launch,
+  per-sequence, and kernel-efficiency effects.
+- On the four short-sequence cp=2 rows, AG is 0.8% to 8.6% slower than p2p and
+  A2A is 1.7% to 6.3% slower. The relative communication-mode penalty grows as
+  sequence length falls.
 - FA3 is faster than FusedAttention in every matched H100 cell, with a median
   speedup of 1.19x (range 1.09x to 2.59x). The largest gaps are all-gather
   rows; p2p has a narrower 1.09x to 1.20x range.
-- B200 favors A2A at cp=4 and cp=8. At cp=2, AG narrowly leads A2A from
-  `4x128k` through `16x32k`, while A2A leads on the two longest-sequence rows.
+- B200 FusedAttention favors A2A at cp=4 and cp=8. At cp=2, AG leads from
+  `4x128k` through `256x2k`, while A2A leads on the two longest-sequence rows.
+- B200 FA4 favors p2p for all four short-sequence rows. FA4 is faster than
+  FusedAttention in 8 of 12 matched cells, with median FusedAttention/FA4
+  runtime ratio 1.06x (range 0.76x to 1.21x). Its advantage erodes with shorter
+  sequences: at `256x2k`, FusedAttention is 10.8% faster for p2p and 23.6%
+  faster for AG, while A2A differs by only 0.2%.
 - The H100/B200 gap for cp=2 AG grows from 2.33x at `1x512k` to 4.25x at
   `16x32k`, while the p2p gap stays near 1.7x. Profiling is needed to separate
   collective latency, topology, memory traffic, and backend kernel selection.
