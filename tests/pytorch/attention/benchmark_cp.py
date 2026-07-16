@@ -82,12 +82,24 @@ model_configs_fused_attn = {
         256, 2048, 32, 128, num_gqa_groups=8, attn_mask_type="causal"
     ),
     # Fixed-token SWA probes use the same shapes with a 1024-token left window.
+    "uniform_1x512k_swa1024": ModelConfig(
+        1, 524288, 32, 128, num_gqa_groups=8,
+        attn_mask_type="causal", window_size=(1024, 0),
+    ),
+    "uniform_2x256k_swa1024": ModelConfig(
+        2, 262144, 32, 128, num_gqa_groups=8,
+        attn_mask_type="causal", window_size=(1024, 0),
+    ),
     "uniform_4x128k_swa1024": ModelConfig(
         4, 131072, 32, 128, num_gqa_groups=8,
         attn_mask_type="causal", window_size=(1024, 0),
     ),
     "uniform_8x64k_swa1024": ModelConfig(
         8, 65536, 32, 128, num_gqa_groups=8,
+        attn_mask_type="causal", window_size=(1024, 0),
+    ),
+    "uniform_16x32k_swa1024": ModelConfig(
+        16, 32768, 32, 128, num_gqa_groups=8,
         attn_mask_type="causal", window_size=(1024, 0),
     ),
     "uniform_1x128k": ModelConfig(
@@ -216,7 +228,11 @@ model_configs_fused_attn["bench_86016"] = ModelConfig(2, 86016, 16, 128, attn_ma
 
 
 # pytest-runnable subset: skip the worker-only and the very large configs.
-_pytest_skip_configs = {"bariamis_8k", "bariamis_262k", "bench_84992", "bench_86016"}
+_pytest_skip_configs = {
+    "bariamis_8k", "bariamis_262k", "bench_84992", "bench_86016",
+    "uniform_1x512k_swa1024", "uniform_2x256k_swa1024",
+    "uniform_16x32k_swa1024",
+}
 _pytest_configs = {
     k: v for k, v in model_configs_fused_attn.items() if k not in _pytest_skip_configs
 }

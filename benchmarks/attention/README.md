@@ -88,6 +88,10 @@ Configs are defined in `benchmark_cp.py` and auto-merged into the runner's confi
 | cp_thd_2 | 16 | 4096 | 12 | 12 | 128 | causal |
 | cp_thd_3 | 8 | 8192 | 12 | 2 | 128 | causal |
 
+The first five fixed-token rows also have `_swa1024` aliases, from
+`uniform_1x512k_swa1024` through `uniform_16x32k_swa1024`. They use causal
+masking with a left-only `(1024, 0)` window.
+
 ### Variable-length training workloads (Llama3-8B-shaped: H=32, g=8, d=128)
 
 | Workload | B | S_max | thd_seqlen_pattern |
@@ -395,9 +399,12 @@ H100 causal FA4 was close to the prior H100 FlashAttention table: -3.1% to 6.1% 
 
 For H100 SWA, FA4 a2a stayed essentially flat versus the prior H100 FlashAttention SWA table (-1.7% to 1.5% deltas, 0.2% median), while all_gather was slower (1.9% to 35.1% deltas, 14.5% median).
 
-### Uniform THD Results
+### Uniform Attention Results
 
-Uniform THD runs use `thd_seqlen_pattern=max`. Uniform SWA uses the `cp_thd_swa_*` configs below; p2p is unsupported for SWA. `fail` means the supported config failed after retry, so no timing is reported.
+Uniform THD runs use `thd_seqlen_pattern=max`. Uniform SWA includes the
+fixed-token `_swa1024` aliases and the `cp_thd_swa_*` configs below; p2p is
+unsupported for SWA. `fail` means the supported config failed after retry, so
+no timing is reported.
 
 ### Fixed-Token Uniform THD
 
@@ -466,7 +473,7 @@ means not measured.
 The four shortest-sequence FA4 B200 rows were measured only at cp=2; `-`
 means not measured.
 
-#### Fixed-Token Observations and Open Questions
+#### Fixed-Token Causal Observations and Open Questions
 
 - Dense-attention work halves with sequence length at fixed tokens. Runtime
   approaches that trend for longer sequences but flattens substantially on the
@@ -504,8 +511,66 @@ means not measured.
   needed to establish variance and determine whether the small AG/A2A cp=2
   crossovers on B200 are stable.
 - Peak-memory sweeps by communication mode are still needed to pair latency
-  with memory tradeoffs. Fixed-token SWA runs would also test whether AG remains
-  competitive when A2A is infeasible or head divisibility limits it.
+  with memory tradeoffs.
+
+### Fixed-Token Uniform SWA (1024, 0)
+
+These workloads reuse the first five fixed-token shapes above with a causal,
+left-only `(1024, 0)` window. They hold `B*S=524288`, `H=32`, `g=8`, and
+`d=128` constant, with 10 warmups and 5 timed iterations. P2P does not support
+SWA, so only all-gather and A2A are shown. Holding both `B*S` and the window
+constant also holds the leading windowed-attention work, approximately
+`B*S*1024`, constant across rows.
+
+#### Fixed-Token Uniform SWA - FA3 - H100 - THD
+
+| Config | cp=2 AG | cp=2 a2a | cp=4 AG | cp=4 a2a | cp=8 AG | cp=8 a2a |
+|---|---:|---:|---:|---:|---:|---:|
+| uniform_1x512k_swa1024 | 74.54 | 79.42 | 54.89 | 44.04 | 45.20 | **23.98** |
+| uniform_2x256k_swa1024 | 74.91 | 79.66 | 55.39 | 44.06 | 44.87 | **24.11** |
+| uniform_4x128k_swa1024 | 75.31 | 79.03 | 54.72 | 43.86 | 44.47 | **24.15** |
+| uniform_8x64k_swa1024 | 74.68 | 79.76 | 53.30 | 43.84 | 44.14 | **23.95** |
+| uniform_16x32k_swa1024 | 71.74 | 78.56 | 53.05 | 43.78 | 44.11 | **23.98** |
+
+#### Fixed-Token Uniform SWA - FusedAttention - B200 - THD
+
+| Config | cp=2 AG | cp=2 a2a | cp=4 AG | cp=4 a2a | cp=8 AG | cp=8 a2a |
+|---|---:|---:|---:|---:|---:|---:|
+| uniform_1x512k_swa1024 | 43.79 | 51.52 | 31.19 | 26.69 | 25.57 | **14.09** |
+| uniform_2x256k_swa1024 | 43.97 | 51.97 | 31.43 | 26.75 | 25.77 | **14.15** |
+| uniform_4x128k_swa1024 | 43.76 | 51.68 | 31.38 | 26.85 | 25.52 | **14.07** |
+| uniform_8x64k_swa1024 | 43.39 | 51.35 | 31.18 | 26.65 | 25.54 | **14.18** |
+| uniform_16x32k_swa1024 | 43.39 | 51.10 | 31.18 | 26.54 | 25.52 | **14.08** |
+
+#### Fixed-Token Uniform SWA - FusedAttention - B200 - BSHD
+
+| Config | cp=2 AG | cp=2 a2a | cp=4 AG | cp=4 a2a | cp=8 AG | cp=8 a2a |
+|---|---:|---:|---:|---:|---:|---:|
+| uniform_1x512k_swa1024 | 43.23 | 48.19 | 31.92 | 25.04 | 26.82 | **13.15** |
+| uniform_2x256k_swa1024 | 60.89 | 49.34 | 41.02 | 25.72 | 31.09 | **13.39** |
+| uniform_4x128k_swa1024 | 61.16 | 49.14 | 40.59 | 25.68 | 31.19 | **13.40** |
+| uniform_8x64k_swa1024 | 60.39 | 49.17 | 40.73 | 25.64 | 31.42 | **13.34** |
+| uniform_16x32k_swa1024 | 60.61 | 49.43 | 41.12 | 25.54 | 31.73 | **13.31** |
+
+#### Fixed-Token SWA Observations and Open Questions
+
+- THD runtime is nearly flat across sequence counts when `B*S` and the window
+  are fixed. The largest within-cell span is 5.0% for H100 FA3 and 1.7% for
+  B200 FusedAttention.
+- AG leads A2A at cp=2: the median AG/A2A runtime ratio is 0.94 on H100 FA3
+  THD and 0.85 on B200 FusedAttention THD. A2A leads at cp=4, where those
+  ratios become 1.25 and 1.17, and at cp=8, where they become 1.84 and 1.81.
+- The matched causal/SWA runtime ratio ranges from 3.1x to 82.9x on H100 and
+  from 3.1x to 91.0x on B200. These are not same-work speedups: the comparison
+  reflects full causal attention versus a fixed left-only window, and the gap
+  grows with sequence length.
+- On the controlled B200 FusedAttention comparison, BSHD A2A is 3% to 7%
+  faster than THD. BSHD all-gather is near parity for `1x512k`, but 21% to 40%
+  slower for the four multi-sequence rows, depending on CP size. Profiling is
+  needed to attribute this communication-specific layout effect.
+- The H100 and B200 tables use different attention backends, so their absolute
+  values do not isolate a hardware effect. These are single five-iteration
+  measurements; longer repeats are needed to establish variance.
 
 ### Uniform THD - FA4 - H100
 
