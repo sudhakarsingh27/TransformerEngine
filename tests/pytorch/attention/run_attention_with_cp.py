@@ -248,6 +248,12 @@ def run_dpa_with_cp(
     logging.root.setLevel(log_level)
     # When is_training is False, gradient outputs are None.
     is_training = is_training == "True"
+    benchmark_iters = int(benchmark)
+    cp_bench_only = os.getenv("NVTE_CP_BENCH_ONLY", "0") == "1"
+    if cp_bench_only and benchmark_iters <= 0:
+        raise ValueError("NVTE_CP_BENCH_ONLY requires benchmark > 0")
+    if cp_bench_only and int(os.getenv("RANK", "0")) == 0:
+        print("CP_BENCH_ONLY correctness_paths=skipped inputs=rank_local", flush=True)
 
     # set up environment variables and config
     if deterministic == "True":
@@ -362,15 +368,41 @@ def run_dpa_with_cp(
     ) = generate_input_shapes(
         qkv_format, config, world_size, kernel_backend, fa_pad_between_seqs, thd_seqlen_pattern
     )
-    q_orig = torch.clamp(torch.randn(q_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
-    k_orig = torch.clamp(torch.randn(k_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
-    v_orig = torch.clamp(torch.randn(v_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
-    dout_orig = torch.clamp(
-        torch.randn(attn_output_shape, dtype=dtypes[dtype]), min=-1, max=1
-    ).cuda()
+    input_shapes = [q_input_shape, k_input_shape, v_input_shape, attn_output_shape]
+    if cp_bench_only:
+        # Performance mode needs only rank-local CP leaves; full inputs exist solely
+        # to make correctness comparisons deterministic across the two paths.
+        if qkv_format in ("bshd", "sbhd"):
+            seq_dim = qkv_format.index("s")
+            input_shapes = [list(shape) for shape in input_shapes]
+            for shape in input_shapes:
+                shape[seq_dim] //= world_size
+            seq_idx = torch.tensor([rank, 2 * world_size - rank - 1], device="cuda")
+        elif qkv_format == "thd":
+            seq_idx_q = tex.thd_get_partitioned_indices(
+                cu_seqlens_q_padded, int(q_input_shape[0]), world_size, rank
+            )
+            seq_idx_kv = tex.thd_get_partitioned_indices(
+                cu_seqlens_kv_padded, int(k_input_shape[0]), world_size, rank
+            )
+            input_shapes = [
+                (seq_idx_q.numel(), *q_input_shape[1:]),
+                (seq_idx_kv.numel(), *k_input_shape[1:]),
+                (seq_idx_kv.numel(), *v_input_shape[1:]),
+                (seq_idx_q.numel(), *attn_output_shape[1:]),
+            ]
+        q_, k_, v_, dout_ = [
+            torch.clamp(torch.randn(shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
+            for shape in input_shapes
+        ]
+    else:
+        q_orig, k_orig, v_orig, dout_orig = [
+            torch.clamp(torch.randn(shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
+            for shape in input_shapes
+        ]
     # Save inputs for cross-backend comparison
     _save_path = os.environ.get("CP_CROSS_BACKEND_SAVE_DIR")
-    if _save_path:
+    if _save_path and not cp_bench_only:
         os.makedirs(_save_path, exist_ok=True)
         torch.save(
             {
@@ -419,12 +451,13 @@ def run_dpa_with_cp(
         dout_quantizer.optimize_for_gemm = True
         dout_quantizer.internal = False
     qkv_layout = "_".join([qkv_format] * 3)
-    # DPA reads these inputs, so share full storage until independent CP shards exist.
-    q, k, v, dout = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
-    if fp8_mha:
-        q, k, v, qkv_layout, _ = combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer)
-    for x in [q, k, v]:
-        x.requires_grad = True
+    if not cp_bench_only:
+        # Correctness mode shares full storage until independent CP shards exist.
+        q, k, v, dout = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
+        if fp8_mha:
+            q, k, v, qkv_layout, _ = combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer)
+        for x in [q, k, v]:
+            x.requires_grad = True
 
     if config.attn_bias_type not in ["no_bias", "alibi"]:
         bias_shape_map = {
@@ -449,90 +482,96 @@ def run_dpa_with_cp(
     else:
         bias = None
 
-    ############ run without CP ############
-    logging.info(f"[Rank {rank}] Run without context parallelism")
     if dtype == "fp8":
         fp8_context = autocast(enabled=True, recipe=fp8_recipe, amax_reduction_group=cp_comm_group)
     else:
         fp8_context = nullcontext()
-    max_logit = None
-    with fp8_context:
-        # q, k, v, out in FP8; dout in F16
-        out = core_attn(
-            q,
-            k,
-            v,
-            core_attention_bias_type=config.attn_bias_type,
-            core_attention_bias=bias,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            cu_seqlens_q_padded=cu_seqlens_q_padded,
-            cu_seqlens_kv_padded=cu_seqlens_kv_padded,
-            # Test runner sets cu_seqlens_q == cu_seqlens_q_padded for the
-            # FlashAttention path, i.e. no inter-sequence padding. Declare this
-            # explicitly so the sync-free auto-detect (which conservatively
-            # picks True when padded cu_seqlens are present) does not disable FA.
-            pad_between_seqs=(
-                (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
-            ),
-            fp8_output=fp8_mha,
-        )
-        if config.return_max_logit:
-            out, max_logit = out
+    if not cp_bench_only:
+        ############ run without CP ############
+        logging.info(f"[Rank {rank}] Run without context parallelism")
+        max_logit = None
+        with fp8_context:
+            # q, k, v, out in FP8; dout in F16
+            out = core_attn(
+                q,
+                k,
+                v,
+                core_attention_bias_type=config.attn_bias_type,
+                core_attention_bias=bias,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                cu_seqlens_q_padded=cu_seqlens_q_padded,
+                cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+                # Test runner sets cu_seqlens_q == cu_seqlens_q_padded for the
+                # FlashAttention path, i.e. no inter-sequence padding. Declare this
+                # explicitly so the sync-free auto-detect (which conservatively
+                # picks True when padded cu_seqlens are present) does not disable FA.
+                pad_between_seqs=(
+                    (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
+                ),
+                fp8_output=fp8_mha,
+            )
+            if config.return_max_logit:
+                out, max_logit = out
+            if is_training:
+                if fp8_bwd and fp8_mha:
+                    dout_fp8 = dout_quantizer(dout)
+                    out.backward(dout_fp8)
+                else:
+                    out.backward(dout)
         if is_training:
-            if fp8_bwd and fp8_mha:
-                dout_fp8 = dout_quantizer(dout)
-                out.backward(dout_fp8)
-            else:
-                out.backward(dout)
-    if is_training:
-        dq, dk, dv, dbias = q.grad, k.grad, v.grad, bias.grad if bias is not None else None
-        d_softmax_offset = (
-            core_attn.softmax_offset.grad if config.softmax_type != "vanilla" else None
-        )
-    else:
-        dq, dk, dv, dbias = None, None, None, None
-        d_softmax_offset = None
+            dq, dk, dv, dbias = q.grad, k.grad, v.grad, bias.grad if bias is not None else None
+            d_softmax_offset = (
+                core_attn.softmax_offset.grad if config.softmax_type != "vanilla" else None
+            )
+        else:
+            dq, dk, dv, dbias = None, None, None, None
+            d_softmax_offset = None
 
     ############ run with CP ############
     logging.info(f"[Rank {rank}] Run with context parallelism")
 
     # set up inputs
-    q_, k_, v_, dout_ = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
     bias_ = bias.clone().detach() if bias is not None else None
-    if qkv_format == "bshd" or qkv_format == "sbhd":
-        seq_dim = qkv_format.index("s")
-        q_, k_, v_, dout_ = [
-            x.view(
-                *x.shape[:seq_dim],
-                2 * world_size,
-                x.shape[seq_dim] // (2 * world_size),
-                *x.shape[(seq_dim + 1) :],
+    if not cp_bench_only:
+        q_, k_, v_, dout_ = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
+        if qkv_format == "bshd" or qkv_format == "sbhd":
+            seq_dim = qkv_format.index("s")
+            q_, k_, v_, dout_ = [
+                x.view(
+                    *x.shape[:seq_dim],
+                    2 * world_size,
+                    x.shape[seq_dim] // (2 * world_size),
+                    *x.shape[(seq_dim + 1) :],
+                )
+                for x in [q_, k_, v_, dout_]
+            ]
+            seq_idx = torch.tensor([rank, 2 * world_size - rank - 1], device=q_.device)
+            q_, k_, v_, dout_ = [
+                x.index_select(seq_dim, seq_idx) for x in [q_, k_, v_, dout_]
+            ]
+            q_, k_, v_, dout_ = [
+                x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :])
+                for x in [q_, k_, v_, dout_]
+            ]
+        elif qkv_format == "thd":
+            seq_idx_q = tex.thd_get_partitioned_indices(
+                cu_seqlens_q_padded, q_.shape[0], world_size, rank
             )
-            for x in [q_, k_, v_, dout_]
-        ]
-        seq_idx = torch.tensor([rank, 2 * world_size - rank - 1], device=q_.device)
-        q_, k_, v_, dout_ = [x.index_select(seq_dim, seq_idx) for x in [q_, k_, v_, dout_]]
-        q_, k_, v_, dout_ = [
-            x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :]) for x in [q_, k_, v_, dout_]
-        ]
-    elif qkv_format == "thd":
-        seq_idx_q = tex.thd_get_partitioned_indices(
-            cu_seqlens_q_padded, q_.shape[0], world_size, rank
-        )
-        seq_idx_kv = tex.thd_get_partitioned_indices(
-            cu_seqlens_kv_padded, k_.shape[0], world_size, rank
-        )
-        q_, dout_ = [x.index_select(0, seq_idx_q) for x in [q_, dout_]]
-        k_, v_ = [x.index_select(0, seq_idx_kv) for x in [k_, v_]]
-    else:
-        assert False, f"{qkv_format} is an unsupported qkv_format!"
+            seq_idx_kv = tex.thd_get_partitioned_indices(
+                cu_seqlens_kv_padded, k_.shape[0], world_size, rank
+            )
+            q_, dout_ = [x.index_select(0, seq_idx_q) for x in [q_, dout_]]
+            k_, v_ = [x.index_select(0, seq_idx_kv) for x in [k_, v_]]
+        else:
+            assert False, f"{qkv_format} is an unsupported qkv_format!"
     q_, k_, v_, dout_ = [x.contiguous() for x in [q_, k_, v_, dout_]]
-    # index_select owns shard storage; detach outputs so the graph releases full input leaves.
-    out = out.detach()
-    if max_logit is not None:
-        max_logit = max_logit.detach()
-    del q, k, v, dout, q_orig, k_orig, v_orig, dout_orig
+    if not cp_bench_only:
+        # index_select owns shard storage, so full generated inputs are no longer needed.
+        out = out.detach()
+        if max_logit is not None:
+            max_logit = max_logit.detach()
+        del q, k, v, dout, q_orig, k_orig, v_orig, dout_orig
     if scaling_mode == "delayed":
         qkv_quantizer.scale.fill_(1.0)
         qkv_quantizer.amax.fill_(0.0)
@@ -571,7 +610,7 @@ def run_dpa_with_cp(
         torch.cuda.Stream(),
         cp_comm_type,
     )
-    if config.softmax_type != "vanilla":
+    if config.softmax_type != "vanilla" and core_attn.softmax_offset.grad is not None:
         core_attn.softmax_offset.grad.zero_()
     if dtype == "fp8":
         core_attn.fp8_initialized = False
@@ -580,51 +619,52 @@ def run_dpa_with_cp(
     else:
         fp8_context = nullcontext()
 
-    # run attention
-    max_logit_ = None
-    with fp8_context:
-        # q, k, v, out in FP8; dout in F16
-        out_ = core_attn(
-            q_,
-            k_,
-            v_,
-            core_attention_bias_type=config.attn_bias_type,
-            core_attention_bias=bias_,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            cu_seqlens_q_padded=cu_seqlens_q_padded,
-            cu_seqlens_kv_padded=cu_seqlens_kv_padded,
-            # See note above (non-CP branch): same explicit declaration so
-            # FlashAttention isn't disabled by the conservative sync-free
-            # auto-detect when this test path constructs no inter-seq padding.
-            pad_between_seqs=(
-                (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
-            ),
-            fp8_output=fp8_mha,
-        )
-        if config.return_max_logit:
-            out_, max_logit_ = out_
+    if not cp_bench_only:
+        # Correctness-only CP pass; benchmark-only mode enters the timed warmup directly.
+        max_logit_ = None
+        with fp8_context:
+            # q, k, v, out in FP8; dout in F16
+            out_ = core_attn(
+                q_,
+                k_,
+                v_,
+                core_attention_bias_type=config.attn_bias_type,
+                core_attention_bias=bias_,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                cu_seqlens_q_padded=cu_seqlens_q_padded,
+                cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+                # See note above (non-CP branch): same explicit declaration so
+                # FlashAttention isn't disabled by the conservative sync-free
+                # auto-detect when this test path constructs no inter-seq padding.
+                pad_between_seqs=(
+                    (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
+                ),
+                fp8_output=fp8_mha,
+            )
+            if config.return_max_logit:
+                out_, max_logit_ = out_
+            if is_training:
+                if fp8_bwd and fp8_mha:
+                    dout_fp8_ = dout_quantizer(dout_)
+                    out_.backward(dout_fp8_)
+                else:
+                    out_.backward(dout_)
         if is_training:
-            if fp8_bwd and fp8_mha:
-                dout_fp8_ = dout_quantizer(dout_)
-                out_.backward(dout_fp8_)
-            else:
-                out_.backward(dout_)
-    if is_training:
-        dq_, dk_, dv_, dbias_ = (
-            q_.grad,
-            k_.grad,
-            v_.grad,
-            bias_.grad if bias_ is not None else None,
-        )
-        d_softmax_offset_ = (
-            core_attn.softmax_offset.grad.clone() if config.softmax_type != "vanilla" else None
-        )
-    else:
-        dq_, dk_, dv_, dbias_ = None, None, None, None
-        d_softmax_offset_ = None
+            dq_, dk_, dv_, dbias_ = (
+                q_.grad,
+                k_.grad,
+                v_.grad,
+                bias_.grad if bias_ is not None else None,
+            )
+            d_softmax_offset_ = (
+                core_attn.softmax_offset.grad.clone() if config.softmax_type != "vanilla" else None
+            )
+        else:
+            dq_, dk_, dv_, dbias_ = None, None, None, None
+            d_softmax_offset_ = None
 
-    if _save_path:
+    if _save_path and not cp_bench_only:
         torch.save(
             {
                 "out": out_.detach(),
@@ -636,7 +676,6 @@ def run_dpa_with_cp(
         )
 
     # Benchmark: re-run forward+backward with timing
-    benchmark_iters = int(benchmark)
     if benchmark_iters > 0:
         warmup = 10
         t0 = None
@@ -673,6 +712,17 @@ def run_dpa_with_cp(
             f" ({benchmark_iters} iters)",
             flush=True,
         )
+
+    if cp_bench_only:
+        # Benchmark-only mode has no correctness result to compare.
+        if not _reusing_pool_groups:
+            if cp_comm_group is not None:
+                dist.destroy_process_group(cp_comm_group)
+            for group in cp_comm_sub_groups:
+                dist.destroy_process_group(group)
+        if not _pool_managed_pg:
+            dist.destroy_process_group()
+        return
 
     # get outputs
     tensors = [out, dq, dk, dv, dbias, out_, dq_, dk_, dv_, dbias_]
