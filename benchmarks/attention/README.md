@@ -410,108 +410,120 @@ no timing is reported.
 
 These workloads hold `B*S=524288` tokens constant while varying the number and
 length of sequences. They use `H=32`, `g=8`, `d=128`, causal masking, 10
-warmups, and 5 timed iterations. The worker runs a full non-CP reference for
-correctness, but reports only CP forward+backward time.
+warmups, and 5 timed iterations. They were collected with
+`NVTE_CP_BENCH_ONLY=1` and `NVTE_NVTX_ENABLED=0`: the worker creates rank-local
+CP inputs and omits the non-CP reference/correctness graph. This avoids retained
+reference tensors and allocator state that can affect the measured CP path.
+These values should not be mixed with older default-path measurements or the
+SWA tables below.
 
 Fixed tokens do not imply fixed attention work: dense attention scales as
 `B*S^2 = 524288*S`, so halving sequence length halves the leading attention
 work in this matrix.
 
+For example, this runs the FA3/FA4 all-gather CP8 `16x32k` cell from the
+repository root:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+PYTHONPATH="$PWD/tests/pytorch:$PWD" \
+NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 \
+NVTE_CP_BENCH_ONLY=1 NVTE_NVTX_ENABLED=0 \
+torchrun --nproc-per-node=8 --master-addr=127.0.0.1 --master-port=29500 \
+  tests/pytorch/attention/run_attention_with_cp.py \
+  dtype=bf16 model=uniform_16x32k qkv_format=thd \
+  kernel_backend=FlashAttention cp_comm_type=all_gather benchmark=5 \
+  log_level=WARNING thd_seqlen_pattern=max fa_pad_between_seqs=False
+```
+
 #### Fixed-Token Uniform THD - FusedAttention - H100
 
 | Config | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| uniform_1x512k | 7539.90 | 9269.71 | 7738.33 | 3651.27 | 4123.75 | 3886.90 | **1849.98** | 1988.35 | 1940.29 |
-| uniform_2x256k | 3709.91 | 4824.64 | 3878.30 | 1844.43 | 2063.90 | 1945.75 | **946.37** | 1007.99 | 974.20 |
-| uniform_4x128k | 1847.92 | 2609.12 | 1930.22 | 944.96 | 1036.16 | 971.83 | 493.49 | 514.78 | **485.75** |
-| uniform_8x64k | 940.62 | 1520.48 | 961.40 | 495.83 | 527.75 | 486.70 | 265.93 | 271.92 | **244.43** |
-| uniform_16x32k | 496.83 | 1111.27 | 504.62 | 270.04 | 282.38 | 258.13 | 153.92 | 153.28 | **130.17** |
+| uniform_1x512k | 7505.50 | 8815.98 | 7730.05 | 3653.65 | 4106.82 | 3852.35 | **1887.85** | 2029.75 | 1970.43 |
+| uniform_2x256k | 3709.57 | 4407.56 | 3871.79 | 1834.00 | 2062.04 | 1930.55 | **966.22** | 1025.22 | 989.09 |
+| uniform_4x128k | 1845.69 | 2191.61 | 1927.73 | 940.82 | 1039.59 | 965.51 | 504.36 | 519.50 | **493.29** |
+| uniform_8x64k | 943.08 | 1095.88 | 964.66 | 493.49 | 527.13 | 484.56 | 271.28 | 274.69 | **248.22** |
+| uniform_16x32k | 496.28 | 567.55 | 506.55 | 267.59 | 281.17 | 255.75 | 156.42 | 154.79 | **131.55** |
+| uniform_32x16k | 270.44 | 304.97 | 278.96 | 155.33 | 159.90 | 142.29 | 100.96 | 95.44 | **75.69** |
+| uniform_64x8k | 158.51 | 175.13 | 163.97 | 100.00 | 99.00 | 86.58 | 70.15 | 65.44 | **44.30** |
+| uniform_128x4k | 101.61 | 109.39 | 107.08 | 72.10 | 69.62 | 57.39 | 60.82 | 52.87 | **30.59** |
+| uniform_256x2k | 74.16 | 78.45 | 79.79 | 62.41 | 56.75 | 44.08 | 57.28 | 48.43 | **24.44** |
 
 #### Fixed-Token Uniform THD - FusedAttention - B200
 
 | Config | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| uniform_1x512k | 4349.79 | 3985.59 | 3969.40 | 2016.79 | 2006.22 | 1935.66 | 996.11 | 993.43 | **949.04** |
-| uniform_2x256k | 2147.77 | 1958.09 | 1943.03 | 992.98 | 980.13 | 940.69 | 501.46 | 494.87 | **460.10** |
-| uniform_4x128k | 1084.79 | 968.69 | 972.63 | 504.20 | 495.07 | 471.21 | 262.17 | 256.95 | **230.79** |
-| uniform_8x64k | 552.31 | 496.54 | 501.64 | 265.29 | 259.25 | 244.24 | 141.91 | 139.91 | **120.62** |
-| uniform_16x32k | 284.83 | 261.76 | 269.46 | 145.05 | 140.75 | 131.92 | 82.86 | 80.36 | **66.04** |
-| uniform_32x16k | 153.86 | **146.07** | 152.66 | - | - | - | - | - | - |
-| uniform_64x8k | 89.49 | **86.78** | 94.82 | - | - | - | - | - | - |
-| uniform_128x4k | 60.25 | **56.25** | 64.02 | - | - | - | - | - | - |
-| uniform_256x2k | 43.28 | **42.24** | 49.76 | - | - | - | - | - | - |
-
-The four shortest-sequence FusedAttention B200 rows were measured only at
-cp=2; `-` means not measured.
+| uniform_1x512k | 4358.33 | 3959.39 | 3967.09 | 1980.00 | 1969.32 | 1901.71 | 984.59 | 981.63 | **936.06** |
+| uniform_2x256k | 2162.80 | 1949.76 | 1940.59 | 986.97 | 976.46 | 931.50 | 501.55 | 495.34 | **457.96** |
+| uniform_4x128k | 1083.84 | 968.15 | 974.62 | 502.45 | 494.60 | 469.97 | 263.30 | 258.23 | **230.62** |
+| uniform_8x64k | 553.82 | 497.10 | 503.59 | 264.27 | 259.45 | 244.25 | 143.61 | 139.75 | **120.85** |
+| uniform_16x32k | 291.73 | 263.77 | 269.62 | 145.01 | 142.39 | 132.63 | 83.42 | 80.74 | **65.94** |
+| uniform_32x16k | 156.27 | 146.33 | 154.48 | 84.76 | 82.88 | 75.96 | 54.09 | 50.74 | **39.01** |
+| uniform_64x8k | 89.49 | 86.63 | 94.07 | 55.32 | 52.58 | 48.21 | 39.16 | 35.56 | **23.59** |
+| uniform_128x4k | 60.34 | 57.39 | 64.53 | 40.99 | 38.03 | 32.86 | 32.04 | 28.45 | **16.98** |
+| uniform_256x2k | 43.40 | 42.62 | 49.87 | 32.93 | 30.54 | 26.17 | 30.54 | 26.67 | **14.06** |
 
 #### Fixed-Token Uniform THD - FA3 - H100
 
 | Config | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| uniform_1x512k | 6276.71 | 6176.67 | 6146.18 | 3258.47 | 3163.84 | 3133.57 | 1636.17 | 1597.77 | **1568.32** |
-| uniform_2x256k | 3158.38 | 3110.29 | 3098.83 | 1643.01 | 1606.01 | 1581.31 | 840.03 | 816.37 | **789.78** |
-| uniform_4x128k | 1598.16 | 1578.72 | 1576.89 | 839.87 | 823.45 | 804.97 | 440.20 | 429.60 | **404.55** |
-| uniform_8x64k | 819.17 | 812.05 | 813.63 | 439.30 | 432.56 | 417.26 | 239.44 | 235.43 | **210.66** |
-| uniform_16x32k | 428.93 | 428.99 | 430.68 | 240.64 | 238.09 | 223.48 | 140.84 | 137.96 | **111.78** |
-| uniform_32x16k | **239.66** | 241.66 | 243.85 | - | - | - | - | - | - |
-| uniform_64x8k | **142.45** | 145.17 | 146.58 | - | - | - | - | - | - |
-| uniform_128x4k | **93.81** | 97.76 | 99.20 | - | - | - | - | - | - |
-| uniform_256x2k | **71.60** | 77.73 | 76.10 | - | - | - | - | - | - |
-
-The four shortest-sequence FA3 H100 rows were measured only at cp=2; `-`
-means not measured.
+| uniform_1x512k | 6329.46 | 6208.53 | 6171.52 | 3217.30 | 3119.77 | 3078.80 | 1615.49 | 1576.60 | **1543.65** |
+| uniform_2x256k | 3172.74 | 3107.27 | 3121.66 | 1612.93 | 1581.56 | 1557.33 | 826.79 | 810.54 | **781.77** |
+| uniform_4x128k | 1607.74 | 1588.01 | 1578.15 | 824.78 | 812.40 | 793.44 | 434.21 | 424.21 | **399.49** |
+| uniform_8x64k | 823.66 | 814.62 | 816.81 | 434.11 | 426.61 | 412.81 | 236.14 | 233.17 | **209.45** |
+| uniform_16x32k | 431.24 | 430.15 | 433.98 | 238.34 | 234.48 | 221.27 | 138.06 | 136.77 | **111.76** |
+| uniform_32x16k | 238.32 | 240.09 | 241.52 | 139.96 | 141.04 | 123.50 | 92.88 | 89.05 | **64.91** |
+| uniform_64x8k | 142.11 | 143.94 | 145.10 | 93.84 | 92.76 | 77.52 | 66.92 | 68.60 | **39.34** |
+| uniform_128x4k | 94.74 | 97.58 | 98.61 | 68.69 | 71.31 | 52.76 | 61.43 | 58.55 | **28.37** |
+| uniform_256x2k | 71.53 | 77.67 | 75.92 | 62.99 | 61.88 | 42.04 | 59.82 | 54.19 | **23.28** |
 
 #### Fixed-Token Uniform THD - FA4 - B200
 
 | Config | cp=2 p2p | cp=2 AG | cp=2 a2a | cp=4 p2p | cp=4 AG | cp=4 a2a | cp=8 p2p | cp=8 AG | cp=8 a2a |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| uniform_32x16k | **127.05** | 131.98 | 135.14 | - | - | - | - | - | - |
-| uniform_64x8k | **80.49** | 84.08 | 87.22 | - | - | - | - | - | - |
-| uniform_128x4k | **56.70** | 60.05 | 60.46 | - | - | - | - | - | - |
-| uniform_256x2k | **48.53** | 55.27 | 49.85 | - | - | - | - | - | - |
-
-The four shortest-sequence FA4 B200 rows were measured only at cp=2; `-`
-means not measured.
+| uniform_1x512k | 3226.40 | 3168.54 | 3163.82 | 1547.98 | 1603.87 | 1588.51 | **782.00** | 819.49 | 796.11 |
+| uniform_2x256k | 1671.24 | 1600.74 | 1601.56 | 790.72 | 822.76 | 807.24 | 405.26 | 424.37 | **403.10** |
+| uniform_4x128k | 834.51 | 819.23 | 819.67 | 408.02 | 428.15 | 413.63 | 214.73 | 228.04 | **206.96** |
+| uniform_8x64k | 426.52 | 427.78 | 427.34 | 217.86 | 229.36 | 217.56 | 119.99 | 126.55 | **109.40** |
+| uniform_16x32k | 227.16 | 231.06 | 232.47 | 122.20 | 128.26 | 119.94 | 73.38 | 76.25 | **60.39** |
+| uniform_32x16k | 129.09 | 131.43 | 134.35 | 75.07 | 79.65 | 69.24 | 50.38 | 51.10 | **35.71** |
+| uniform_64x8k | 79.73 | 83.32 | 85.13 | 51.77 | 54.20 | 44.59 | 38.75 | 41.01 | **22.27** |
+| uniform_128x4k | 57.04 | 60.14 | 60.55 | 40.54 | 45.29 | 31.66 | 36.77 | 38.20 | **16.47** |
+| uniform_256x2k | 48.67 | 55.20 | 49.96 | 40.02 | 45.28 | 26.66 | 41.79 | 40.35 | **14.27** |
 
 #### Fixed-Token Causal Observations and Open Questions
 
-- Dense-attention work halves with sequence length at fixed tokens. Runtime
-  approaches that trend for longer sequences but flattens substantially on the
-  short-sequence rows, showing an increasing contribution from non-quadratic
-  costs that these end-to-end timings cannot attribute by themselves.
-- H100 FusedAttention favors p2p at cp=2 for every workload. A2A overtakes p2p
-  at cp=4 for `8x64k` and shorter, and at cp=8 for `4x128k` and shorter. AG is
-  never the fastest H100 FusedAttention mode in this matrix.
-- B200 FusedAttention favors AG at cp=2 for all four short-sequence rows.
-  Relative to AG, p2p is 2.5% to 7.1% slower and A2A is 4.5% to 17.8% slower.
-- H100 FA3 favors A2A at cp=4 and cp=8. At cp=2, A2A leads through `4x128k`,
-  AG narrowly leads at `8x64k`, and p2p leads from `16x32k` through `256x2k`.
-- At fixed tokens, the cp=2 p2p runtime reduction from each sequence-length
-  halving shrinks from 44.1% (`16x32k` to `32x16k`) to 23.7% (`128x4k` to
-  `256x2k`). This is consistent with an increasing contribution from
-  non-quadratic costs; profiling is needed to separate communication, launch,
-  per-sequence, and kernel-efficiency effects.
-- On the four short-sequence cp=2 rows, AG is 0.8% to 8.6% slower than p2p and
-  A2A is 1.7% to 6.3% slower. The relative communication-mode penalty grows as
-  sequence length falls.
-- FA3 is faster than FusedAttention in every matched H100 cell, with a median
-  speedup of 1.19x (range 1.09x to 2.59x). The largest gaps are all-gather
-  rows; p2p has a narrower 1.09x to 1.20x range.
-- B200 FusedAttention favors A2A at cp=4 and cp=8. At cp=2, AG leads from
-  `4x128k` through `256x2k`, while A2A leads on the two longest-sequence rows.
-- B200 FA4 favors p2p for all four short-sequence rows. FA4 is faster than
-  FusedAttention in 8 of 12 matched cells, with median FusedAttention/FA4
-  runtime ratio 1.06x (range 0.76x to 1.21x). Its advantage erodes with shorter
-  sequences: at `256x2k`, FusedAttention is 10.8% faster for p2p and 23.6%
-  faster for AG, while A2A differs by only 0.2%.
-- The H100/B200 gap for cp=2 AG grows from 2.33x at `1x512k` to 4.25x at
-  `16x32k`, while the p2p gap stays near 1.7x. Profiling is needed to separate
-  collective latency, topology, memory traffic, and backend kernel selection.
-- These are single five-iteration measurements. Repeated 50-iteration runs are
-  needed to establish variance and determine whether the small AG/A2A cp=2
-  crossovers on B200 are stable.
-- Peak-memory sweeps by communication mode are still needed to pair latency
-  with memory tradeoffs.
+- No communication mode wins universally. H100 FusedAttention chooses p2p for
+  all nine cp=2 rows, while B200 FusedAttention chooses AG for eight. H100 FA3
+  and B200 FA4 are mixed at cp=2; AG is within 5% of the best mode for 8/9 and
+  7/9 rows, respectively.
+- A2A becomes stronger as CP grows. It wins all cp=4 and cp=8 rows for H100 FA3
+  and B200 FusedAttention. H100 FusedAttention and B200 FA4 transition more
+  gradually, but A2A still wins 6/9 rows at cp=4 and at least 7/9 at cp=8.
+- Best-mode cp=2-to-cp=8 speedup is near the ideal 4x on long sequences, then
+  falls as sequences shorten. Median speedups are 3.74x and 3.85x on H100
+  FusedAttention/FA3, and 4.00x and 3.76x on B200 FusedAttention/FA4.
+- Runtime initially follows the expected 50% reduction when sequence length is
+  halved at fixed tokens, then flattens. On the final halving, cp=2 p2p drops
+  only 15% to 28%, depending on backend, indicating growing launch,
+  communication, per-sequence, or kernel-efficiency costs.
+- FA3 is faster than FusedAttention in 73/81 H100 cells; the median
+  FusedAttention/FA3 ratio is 1.15. The eight FusedAttention wins are confined
+  to short-sequence p2p/AG cells; A2A favors FA3 in all 27 comparisons.
+- FA4 is faster than FusedAttention in 65/81 B200 cells; the median
+  FusedAttention/FA4 ratio is 1.12. FusedAttention increasingly wins p2p/AG on
+  the shortest rows, while `256x2k` A2A differs by no more than 2% at any CP.
+- B200 FusedAttention is faster than H100 FusedAttention in all 81 matched
+  cells, with a 1.88x median H100/B200 ratio. The median ratio is 1.85x for p2p,
+  2.01x for AG, and 1.93x for A2A, so the hardware gap is communication-mode
+  dependent.
+- These are single five-iteration measurements. Longer repeats are needed for
+  narrow cp=2 crossovers, and profiles are needed to separate collective,
+  launch, memory-traffic, and attention-kernel effects.
+- Peak-memory sweeps should use the same CP-only mode so latency and memory
+  tradeoffs share tensor lifetimes. The SWA matrix should also be rerun in this
+  mode before computing causal/SWA speedups.
 
 ### Fixed-Token Uniform SWA (1024, 0)
 
@@ -520,7 +532,9 @@ left-only `(1024, 0)` window. They hold `B*S=524288`, `H=32`, `g=8`, and
 `d=128` constant, with 10 warmups and 5 timed iterations. P2P does not support
 SWA, so only all-gather and A2A are shown. Holding both `B*S` and the window
 constant also holds the leading windowed-attention work, approximately
-`B*S*1024`, constant across rows.
+`B*S*1024`, constant across rows. These tables used the older
+correctness-bearing worker path and are not directly comparable to the CP-only
+causal tables above.
 
 #### Fixed-Token Uniform SWA - FA3 - H100 - THD
 
@@ -560,10 +574,9 @@ constant also holds the leading windowed-attention work, approximately
 - AG leads A2A at cp=2: the median AG/A2A runtime ratio is 0.94 on H100 FA3
   THD and 0.85 on B200 FusedAttention THD. A2A leads at cp=4, where those
   ratios become 1.25 and 1.17, and at cp=8, where they become 1.84 and 1.81.
-- The matched causal/SWA runtime ratio ranges from 3.1x to 82.9x on H100 and
-  from 3.1x to 91.0x on B200. These are not same-work speedups: the comparison
-  reflects full causal attention versus a fixed left-only window, and the gap
-  grows with sequence length.
+- Causal/SWA ratios are intentionally omitted because the causal refresh uses
+  CP-only tensor lifetimes while these SWA runs use the correctness-bearing
+  path. A matched CP-only SWA rerun is required for that comparison.
 - On the controlled B200 FusedAttention comparison, BSHD A2A is 3% to 7%
   faster than THD. BSHD all-gather is near parity for `1x512k`, but 21% to 40%
   slower for the four multi-sequence rows, depending on CP size. Profiling is
