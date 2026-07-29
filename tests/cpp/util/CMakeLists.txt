@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 
 add_executable(test_util
+               test_fused_attn_config.cpp
                test_nvrtc.cpp
                test_string.cpp
                ../test_common.cu)

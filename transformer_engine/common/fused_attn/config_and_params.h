@@ -19,6 +19,12 @@
 namespace transformer_engine {
 namespace fused_attn {
 
+// Packed THD graph dimensions and ragged Stats/LSE are not supported on SM8x or SM120.
+// Those architectures require dense, BHSD-like graph dimensions for the auxiliary tensors.
+inline constexpr bool supports_packed_ragged_graph(size_t cudnn_runtime_version, int sm_arch) {
+  return cudnn_runtime_version >= 90600 && sm_arch >= 90 && sm_arch != 120;
+}
+
 struct FusedAttnConfig {
   // basic attention settings
   bool is_training = true;

@@ -936,6 +936,23 @@ def test_dpa_qkv_layout(dtype, model_configs, model, qkv_layout):
     test_dot_product_attention(dtype, model_configs, model, False, qkv_layout, False, False)
 
 
+def test_mixed_thd_pad_between_seqs_filter():
+    """Mixed THD layouts apply the same backend-independent padding filter as pure THD."""
+    config = ModelConfig(2, 128, 16, 64, attn_mask_type="padding")
+    available_backends, _, _ = get_available_attention_backends(
+        config,
+        qkv_dtype=torch.bfloat16,
+        qkv_layout="thd_bshd_bshd",
+        pad_between_seqs=True,
+        is_training=False,
+        skip_fused_attn=True,
+    )
+    assert not available_backends[2], (
+        "UnfusedDotProductAttention must be disabled when either Q or KV uses THD "
+        "with padding between sequences."
+    )
+
+
 qkv_layouts_packed = [l for l in qkv_layouts if any(c.isdigit() for c in l)]
 
 
@@ -1010,6 +1027,63 @@ model_configs_layout_thd = {
         window_size=(4, 0),
     ),
 }
+
+
+model_configs_thd_sm8x = {
+    "thd_sm8x": ModelConfig(2, 128, 16, 64, attn_mask_type="padding"),
+}
+
+
+@pytest.mark.skipif(
+    device_compute_capability[0] != 8 or get_cudnn_version() >= (9, 18, 1),
+    reason="Unsupported THD boundary requires SM8x with cuDNN older than 9.18.1.",
+)
+def test_dpa_thd_sm8x_unsupported_cudnn():
+    """The graph probe rejects SM8x THD training before cuDNN 9.18.1."""
+    config = model_configs_thd_sm8x["thd_sm8x"]
+    available_backends, _, _ = get_available_attention_backends(
+        config,
+        qkv_dtype=torch.bfloat16,
+        qkv_layout="thd_thd_thd",
+        pad_between_seqs=False,
+        is_training=True,
+        deterministic=_deterministic,
+    )
+    assert not available_backends[
+        1
+    ], "FusedAttention must reject SM8x THD training when cuDNN is older than 9.18.1."
+
+
+@pytest.mark.skipif(
+    device_compute_capability[0] != 8,
+    reason="Dense THD Stats/LSE regression is specific to SM8x.",
+)
+@pytest.mark.skipif(
+    get_cudnn_version() < (9, 18, 1),
+    reason="THD training on SM8x requires cuDNN 9.18.1+.",
+)
+@pytest.mark.parametrize("dtype", param_types_lean)
+def test_dpa_thd_sm8x_dense_stats(dtype):
+    """SM8x THD training uses dense Stats/LSE and executes both forward and backward."""
+    config = model_configs_thd_sm8x["thd_sm8x"]
+    available_backends, _, _ = get_available_attention_backends(
+        config,
+        qkv_dtype=dtype,
+        qkv_layout="thd_thd_thd",
+        pad_between_seqs=False,
+        is_training=True,
+        deterministic=_deterministic,
+    )
+    assert available_backends[1], "FusedAttention should support this SM8x THD training config."
+    test_dot_product_attention(
+        dtype,
+        model_configs_thd_sm8x,
+        "thd_sm8x",
+        False,
+        "thd_thd_thd",
+        False,
+        False,
+    )
 
 
 @pytest.mark.skipif(get_cudnn_version() < (9, 0, 0), reason="cuDNN 9.0.0+ is required.")
