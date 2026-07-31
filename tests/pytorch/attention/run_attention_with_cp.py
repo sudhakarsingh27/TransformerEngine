@@ -308,6 +308,11 @@ def run_dpa_with_cp(
     use_cuda_graph = cuda_graph == "True"
     cuda_graph_warmup_iters = int(cuda_graph_warmup)
     cp_bench_only = os.getenv("NVTE_CP_BENCH_ONLY", "0") == "1"
+    profile_target = os.getenv("NVTE_CP_PROFILE_TARGET", "eager")
+    if profile_target not in ("eager", "cuda_graph"):
+        raise ValueError("NVTE_CP_PROFILE_TARGET must be 'eager' or 'cuda_graph'")
+    if profile_target == "cuda_graph" and not use_cuda_graph:
+        raise ValueError("NVTE_CP_PROFILE_TARGET=cuda_graph requires cuda_graph=True")
     if cp_bench_only and benchmark_iters <= 0:
         raise ValueError("NVTE_CP_BENCH_ONLY requires benchmark > 0")
     if use_cuda_graph:
@@ -787,7 +792,8 @@ def run_dpa_with_cp(
             q_b, k_b, v_b = [x.clone().detach().requires_grad_() for x in [q_, k_, v_]]
             torch.cuda.synchronize()
             if it == warmup:
-                torch.cuda.cudart().cudaProfilerStart()
+                if profile_target == "eager":
+                    torch.cuda.cudart().cudaProfilerStart()
                 t0 = time.perf_counter()
             with fp8_context:
                 out_b = core_attn(
@@ -816,7 +822,8 @@ def run_dpa_with_cp(
             # Do not carry a completed graph and its leaf gradients into the next iteration.
             del out_b, q_b, k_b, v_b
         elapsed = (time.perf_counter() - t0) / benchmark_iters * 1000
-        torch.cuda.cudart().cudaProfilerStop()
+        if profile_target == "eager":
+            torch.cuda.cudart().cudaProfilerStop()
         print(
             f"[Rank {rank}] {cp_comm_type} {qkv_format} {dtype}: {elapsed:.2f} ms/iter"
             f" ({benchmark_iters} iters)",
@@ -998,6 +1005,10 @@ def run_dpa_with_cp(
 
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
+        if profile_target == "cuda_graph":
+            # Keep Nsight's CUDA Profiler API range focused on measured replay.
+            # Capture, correctness, and replay warmup have already completed.
+            torch.cuda.cudart().cudaProfilerStart()
         start_event.record()
         wall_start = time.perf_counter()
         for _ in range(benchmark_iters):
@@ -1008,6 +1019,8 @@ def run_dpa_with_cp(
             del graph_out
         end_event.record()
         torch.cuda.synchronize()
+        if profile_target == "cuda_graph":
+            torch.cuda.cudart().cudaProfilerStop()
         wall_ms = (time.perf_counter() - wall_start) * 1000.0 / benchmark_iters
         cuda_event_ms = start_event.elapsed_time(end_event) / benchmark_iters
 
