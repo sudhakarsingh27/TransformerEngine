@@ -3432,27 +3432,18 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         o_shape = q.shape[:-1] + v.shape[-1:]
         out_f16 = torch.empty(o_shape, dtype=fwd_nominal_dtype, device=q.device)
 
-        # Diagnostic-only escape hatch: if serialization makes CUDA Graph replay
-        # correct, the failure is in the captured two-stream DAG rather than THD
-        # metadata or the attention math. Keep eager execution unchanged so the
-        # reference and graph exercise identical tensor inputs.
-        serialize_graph_splits = (
-            qkv_format == "thd"
-            and is_graph_capturing()
-            and os.getenv("NVTE_CP_AG_CUDAGRAPH_SERIALIZE", "0") == "1"
-        )
+        # FusedAttention uses one thread-local cuDNN handle per device and
+        # retargets it with cudnnSetStream for each call. Two all-gather split
+        # calls may overlap eagerly, but capturing those calls concurrently on
+        # different streams corrupts replay. Preserve eager overlap and add an
+        # ordering edge only while capturing the THD FusedAttention graph.
         order_graph_splits = (
             qkv_format == "thd"
             and is_graph_capturing()
-            and os.getenv("NVTE_CP_AG_CUDAGRAPH_ORDER_SPLITS", "0") == "1"
+            and use_fused_attention
         )
-        current_stream = torch.cuda.current_stream()
         # create two streams to resolve wave quantization issue of Flash Attn in each step
-        flash_attn_streams = (
-            [current_stream, current_stream]
-            if serialize_graph_splits
-            else [current_stream, cp_stream]
-        )
+        flash_attn_streams = [torch.cuda.current_stream(), cp_stream]
         # prepare per-step tensors
         local_seq_chunk_ids = [rank, 2 * cp_size - rank - 1]
         kv_seq_range_per_step = [None, None]
@@ -4024,26 +4015,15 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         dk_per_step = [None, None]
         dv_per_step = [None, None]
 
-        # Match the forward diagnostic topology during backward capture. A
-        # forward-only serialization result would otherwise leave the backward
-        # graph's side-stream behavior as a confounding variable.
-        serialize_graph_splits = (
-            ctx.qkv_format == "thd"
-            and is_graph_capturing()
-            and os.getenv("NVTE_CP_AG_CUDAGRAPH_SERIALIZE", "0") == "1"
-        )
+        # Match the forward capture ordering in backward. Both directions use
+        # the same thread-local cuDNN handle across the two attention streams.
         order_graph_splits = (
             ctx.qkv_format == "thd"
             and is_graph_capturing()
-            and os.getenv("NVTE_CP_AG_CUDAGRAPH_ORDER_SPLITS", "0") == "1"
+            and ctx.use_fused_attention
         )
-        current_stream = torch.cuda.current_stream()
         # create two streams to resolve wave quantization issue of Flash Attn in each step
-        flash_attn_streams = (
-            [current_stream, current_stream]
-            if serialize_graph_splits
-            else [current_stream, ctx.cp_stream]
-        )
+        flash_attn_streams = [torch.cuda.current_stream(), ctx.cp_stream]
         # synchronize dkv update across steps
         dkv_update_done = torch.cuda.Event()
 
