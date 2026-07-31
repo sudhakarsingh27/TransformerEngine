@@ -3441,6 +3441,11 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
             and is_graph_capturing()
             and os.getenv("NVTE_CP_AG_CUDAGRAPH_SERIALIZE", "0") == "1"
         )
+        order_graph_splits = (
+            qkv_format == "thd"
+            and is_graph_capturing()
+            and os.getenv("NVTE_CP_AG_CUDAGRAPH_ORDER_SPLITS", "0") == "1"
+        )
         current_stream = torch.cuda.current_stream()
         # create two streams to resolve wave quantization issue of Flash Attn in each step
         flash_attn_streams = (
@@ -3539,7 +3544,9 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
                 # FA3 uses internal per-call workspace. Consecutive AG per-step
                 # calls are serialized on GPU streams so that workspace lifetimes
                 # do not overlap. FusedAttention keeps the existing per-step overlap.
-                if i > 0 and (use_flash_attn_3 or use_flash_attn_4):
+                if i > 0 and (
+                    use_flash_attn_3 or use_flash_attn_4 or order_graph_splits
+                ):
                     flash_attn_streams[i].wait_stream(flash_attn_streams[i - 1])
                 with torch.cuda.stream(flash_attn_streams[i]), get_nvtx_range_context(
                     f"transformer_engine.cp.all_gather.fwd.step_{i}.compute"
@@ -4025,6 +4032,11 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
             and is_graph_capturing()
             and os.getenv("NVTE_CP_AG_CUDAGRAPH_SERIALIZE", "0") == "1"
         )
+        order_graph_splits = (
+            ctx.qkv_format == "thd"
+            and is_graph_capturing()
+            and os.getenv("NVTE_CP_AG_CUDAGRAPH_ORDER_SPLITS", "0") == "1"
+        )
         current_stream = torch.cuda.current_stream()
         # create two streams to resolve wave quantization issue of Flash Attn in each step
         flash_attn_streams = (
@@ -4141,7 +4153,9 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
                 # backward calls are serialized on GPU streams so that workspace
                 # lifetimes do not overlap. FusedAttention keeps the existing
                 # per-step overlap.
-                if i > 0 and (ctx.use_flash_attn_3 or ctx.use_flash_attn_4):
+                if i > 0 and (
+                    ctx.use_flash_attn_3 or ctx.use_flash_attn_4 or order_graph_splits
+                ):
                     flash_attn_streams[i].wait_stream(flash_attn_streams[i - 1])
                 with torch.cuda.stream(flash_attn_streams[i]), get_nvtx_range_context(
                     f"transformer_engine.cp.all_gather.bwd.step_{i}.compute"
