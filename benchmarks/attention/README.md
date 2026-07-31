@@ -46,6 +46,7 @@ CUDA-event time. Capture and replay warmups are excluded.
 ```bash
 torchrun --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 \
     tests/pytorch/attention/run_attention_with_cp.py \
+    worker \
     dtype=bf16 model=bucket32k qkv_format=thd \
     kernel_backend=FusedAttention cp_comm_type=p2p \
     benchmark=20 cuda_graph=True cuda_graph_warmup=3 \
