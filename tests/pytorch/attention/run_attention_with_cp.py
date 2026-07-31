@@ -864,6 +864,11 @@ def run_dpa_with_cp(
             ),
         )
         graph_inputs = tuple(x.detach().clone().requires_grad_() for x in (q_, k_, v_))
+        if cp_bench_only:
+            # The rank-local source leaves are dead once static graph inputs
+            # exist. Releasing their 3 GiB at the largest fixed-token shape
+            # leaves room for the full eager-versus-graph correctness check.
+            del q_, k_, v_
 
         def capture_barrier():
             # Every rank must issue CP collectives in the same capture order.
