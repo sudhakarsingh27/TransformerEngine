@@ -309,15 +309,18 @@ def run_dpa_with_cp(
     if cp_bench_only and benchmark_iters <= 0:
         raise ValueError("NVTE_CP_BENCH_ONLY requires benchmark > 0")
     if use_cuda_graph:
-        # This is intentionally a narrow prototype. Expanding one axis at a time
-        # keeps a capture failure attributable to CP/NCCL rather than FP8 state,
-        # layout conversion, inference, or a different attention backend.
+        # Keep the prototype narrow enough that capture failures remain
+        # attributable to CP/NCCL. FlashAttention uses the same static
+        # BF16/THD/training graph adapter as FusedAttention, so allow both while
+        # retaining the restrictions on stateful FP8, layout, and inference.
         if dtype != "bf16":
             raise ValueError("cuda_graph=True prototype only supports dtype=bf16")
         if qkv_format != "thd":
             raise ValueError("cuda_graph=True prototype only supports qkv_format=thd")
-        if kernel_backend != "FusedAttention":
-            raise ValueError("cuda_graph=True prototype only supports FusedAttention")
+        if kernel_backend not in ("FusedAttention", "FlashAttention"):
+            raise ValueError(
+                "cuda_graph=True prototype only supports FusedAttention or FlashAttention"
+            )
         if not is_training:
             raise ValueError("cuda_graph=True prototype only supports is_training=True")
         if benchmark_iters <= 0:
