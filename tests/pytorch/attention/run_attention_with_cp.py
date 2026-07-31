@@ -56,6 +56,51 @@ _pool_cp_comm_sub_groups: list = []
 dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp8": torch.bfloat16}
 
 
+class _CUDAGraphDotProductAttentionAdapter(torch.nn.Module):
+    """Expose a tensor-only Q/K/V surface for one fixed attention configuration."""
+
+    def __init__(
+        self,
+        core_attn,
+        *,
+        core_attention_bias_type,
+        core_attention_bias,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        cu_seqlens_q_padded,
+        cu_seqlens_kv_padded,
+    ):
+        super().__init__()
+        if core_attention_bias is not None:
+            raise ValueError("CUDA graph prototype does not support an explicit attention bias")
+        # Register the attention module so make_graphed_callables discovers its
+        # TE state, while binding Python metadata here keeps strings and booleans
+        # out of the helper's tensor-only sample input surface.
+        self.core_attn = core_attn
+        self.core_attention_bias_type = core_attention_bias_type
+        self.register_buffer("cu_seqlens_q", cu_seqlens_q, persistent=False)
+        self.register_buffer("cu_seqlens_kv", cu_seqlens_kv, persistent=False)
+        self.register_buffer("cu_seqlens_q_padded", cu_seqlens_q_padded, persistent=False)
+        self.register_buffer("cu_seqlens_kv_padded", cu_seqlens_kv_padded, persistent=False)
+
+    def forward(self, q, k, v):
+        return self.core_attn(
+            q,
+            k,
+            v,
+            core_attention_bias_type=self.core_attention_bias_type,
+            core_attention_bias=None,
+            cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_kv=self.cu_seqlens_kv,
+            cu_seqlens_q_padded=self.cu_seqlens_q_padded,
+            cu_seqlens_kv_padded=self.cu_seqlens_kv_padded,
+            # Backend choice and output dtype are deliberately fixed for the
+            # lifetime of this per-config graph.
+            pad_between_seqs=True,
+            fp8_output=False,
+        )
+
+
 def generate_input_shapes(
     qkv_format: str,
     config: ModelConfig,
@@ -750,18 +795,15 @@ def run_dpa_with_cp(
         )
 
     if use_cuda_graph:
-        graph_kwargs = {
-            "core_attention_bias_type": config.attn_bias_type,
-            "core_attention_bias": bias_,
-            "cu_seqlens_q": cu_seqlens_q,
-            "cu_seqlens_kv": cu_seqlens_kv,
-            "cu_seqlens_q_padded": cu_seqlens_q_padded,
-            "cu_seqlens_kv_padded": cu_seqlens_kv_padded,
-            # Make backend selection identical in eager warmup, capture, and replay.
-            # A Python-side auto-detection change cannot then silently alter the graph.
-            "pad_between_seqs": True,
-            "fp8_output": False,
-        }
+        graph_adapter = _CUDAGraphDotProductAttentionAdapter(
+            core_attn,
+            core_attention_bias_type=config.attn_bias_type,
+            core_attention_bias=bias_,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+        )
         graph_inputs = tuple(x.detach().clone().requires_grad_() for x in (q_, k_, v_))
 
         def capture_barrier():
@@ -773,22 +815,25 @@ def run_dpa_with_cp(
             torch.cuda.synchronize()
 
         capture_barrier()
+        torch.cuda.reset_peak_memory_stats()
+        capture_start = time.perf_counter()
         graphed_core_attn = make_graphed_callables(
-            core_attn,
+            graph_adapter,
             graph_inputs,
             num_warmup_iters=cuda_graph_warmup_iters,
-            sample_kwargs=graph_kwargs,
             enabled=False,
             pre_warmup_hook=capture_barrier,
             post_warmup_hook=capture_barrier,
         )
         capture_barrier()
+        capture_ms = (time.perf_counter() - capture_start) * 1000.0
+        capture_peak_mib = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
 
         # Validate one replay against the eager CP pass before collecting timing.
         # Graph buffers are reused, so compare before the next replay overwrites them.
         for tensor in graph_inputs:
             tensor.grad = None
-        graph_out = graphed_core_attn(*graph_inputs, **graph_kwargs)
+        graph_out = graphed_core_attn(*graph_inputs)
         graph_out.backward(dout_)
         torch.cuda.synchronize()
         atol, rtol, rmse_tol = get_tols(config, dtype)
@@ -823,7 +868,7 @@ def run_dpa_with_cp(
         for _ in range(replay_warmup):
             for tensor in graph_inputs:
                 tensor.grad = None
-            graph_out = graphed_core_attn(*graph_inputs, **graph_kwargs)
+            graph_out = graphed_core_attn(*graph_inputs)
             graph_out.backward(dout_)
             del graph_out
         capture_barrier()
@@ -835,7 +880,7 @@ def run_dpa_with_cp(
         for _ in range(benchmark_iters):
             for tensor in graph_inputs:
                 tensor.grad = None
-            graph_out = graphed_core_attn(*graph_inputs, **graph_kwargs)
+            graph_out = graphed_core_attn(*graph_inputs)
             graph_out.backward(dout_)
             del graph_out
         end_event.record()
@@ -845,17 +890,23 @@ def run_dpa_with_cp(
 
         # Rank 0 reports the slowest rank, which is the distributed iteration
         # latency that constrains useful throughput.
-        max_times = torch.tensor([wall_ms, cuda_event_ms], dtype=torch.float64, device="cuda")
-        dist.all_reduce(max_times, op=dist.ReduceOp.MAX, group=cp_comm_group)
+        max_metrics = torch.tensor(
+            [wall_ms, cuda_event_ms, capture_ms, capture_peak_mib],
+            dtype=torch.float64,
+            device="cuda",
+        )
+        dist.all_reduce(max_metrics, op=dist.ReduceOp.MAX, group=cp_comm_group)
         if rank == 0:
             print(
                 "CUDA_GRAPH_RESULT"
                 f" model={model} backend={kernel_backend} comm={cp_comm_type}"
                 " cp=2 qkv=thd dtype=bf16"
-                f" wall_ms={max_times[0].item():.3f}"
-                f" cuda_event_ms={max_times[1].item():.3f}"
+                f" wall_ms={max_metrics[0].item():.3f}"
+                f" cuda_event_ms={max_metrics[1].item():.3f}"
                 f" iters={benchmark_iters} replay_warmup={replay_warmup}"
-                f" capture_warmup={cuda_graph_warmup_iters}",
+                f" capture_warmup={cuda_graph_warmup_iters}"
+                f" capture_ms={max_metrics[2].item():.1f}"
+                f" capture_peak_mib={max_metrics[3].item():.1f}",
                 flush=True,
             )
         for tensor in graph_inputs:
