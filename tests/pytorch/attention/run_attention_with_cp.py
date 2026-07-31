@@ -329,12 +329,17 @@ def run_dpa_with_cp(
             raise ValueError("cuda_graph=True requires benchmark > 0")
         if cuda_graph_warmup_iters <= 0:
             raise ValueError("cuda_graph_warmup must be positive")
-        if cp_bench_only:
-            raise ValueError(
-                "cuda_graph=True requires the correctness-bearing path; unset NVTE_CP_BENCH_ONLY"
-            )
+        # Benchmark-only mode skips the full non-CP reference, but the graph
+        # path below still runs one eager CP pass as its correctness oracle.
+        # This keeps large fixed-token workloads on the rank-local input path
+        # used by benchmark_cp without giving up eager-versus-graph validation.
     if cp_bench_only and int(os.getenv("RANK", "0")) == 0:
-        print("CP_BENCH_ONLY correctness_paths=skipped inputs=rank_local", flush=True)
+        correctness_paths = "eager_cp_vs_graph" if use_cuda_graph else "skipped"
+        print(
+            f"CP_BENCH_ONLY correctness_paths={correctness_paths}"
+            " non_cp_reference=skipped inputs=rank_local",
+            flush=True,
+        )
 
     # set up environment variables and config
     if deterministic == "True":
@@ -711,8 +716,10 @@ def run_dpa_with_cp(
                 "cuda_graph=True prototype requires vanilla softmax without return_max_logit"
             )
 
-    if not cp_bench_only:
-        # Correctness-only CP pass; benchmark-only mode enters the timed warmup directly.
+    if not cp_bench_only or use_cuda_graph:
+        # CUDA Graph benchmark-only runs still need one eager CP result as the
+        # graph correctness oracle; ordinary benchmark-only runs enter timing
+        # directly and continue to skip all correctness work.
         max_logit_ = None
         with fp8_context:
             # q, k, v, out in FP8; dout in F16
@@ -749,6 +756,11 @@ def run_dpa_with_cp(
                 v_.grad,
                 bias_.grad if bias_ is not None else None,
             )
+            if use_cuda_graph:
+                # The graph checks need the eager values, not their autograd
+                # history. Drop that history before allocating the capture
+                # pool for the largest fixed-token configurations.
+                out_ = out_.detach()
             d_softmax_offset_ = (
                 core_attn.softmax_offset.grad.clone() if config.softmax_type != "vanilla" else None
             )
@@ -810,6 +822,20 @@ def run_dpa_with_cp(
             f" ({benchmark_iters} iters)",
             flush=True,
         )
+        # Distributed latency is bounded by the slower CP rank. Emit a
+        # machine-readable MAX just like the CUDA Graph result so comparisons
+        # do not depend on parsing interleaved per-rank stdout.
+        eager_max_ms = torch.tensor(elapsed, dtype=torch.float64, device="cuda")
+        dist.all_reduce(eager_max_ms, op=dist.ReduceOp.MAX, group=cp_comm_group)
+        if rank == 0:
+            print(
+                "EAGER_RESULT"
+                f" model={model} backend={kernel_backend} comm={cp_comm_type}"
+                f" cp={world_size} qkv={qkv_format} dtype={dtype}"
+                f" wall_ms={eager_max_ms.item():.3f}"
+                f" iters={benchmark_iters}",
+                flush=True,
+            )
 
     if use_cuda_graph:
         def rounded_max_seqlen(cu_seqlens, cu_seqlens_padded):
