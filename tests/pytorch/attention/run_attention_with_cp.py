@@ -71,6 +71,7 @@ class _CUDAGraphDotProductAttentionAdapter(torch.nn.Module):
         cu_seqlens_kv_padded,
         max_seqlen_q,
         max_seqlen_kv,
+        pad_between_seqs,
     ):
         super().__init__()
         if core_attention_bias is not None:
@@ -86,6 +87,7 @@ class _CUDAGraphDotProductAttentionAdapter(torch.nn.Module):
         self.register_buffer("cu_seqlens_kv_padded", cu_seqlens_kv_padded, persistent=False)
         self.max_seqlen_q = max_seqlen_q
         self.max_seqlen_kv = max_seqlen_kv
+        self.pad_between_seqs = pad_between_seqs
 
     def forward(self, q, k, v):
         return self.core_attn(
@@ -100,9 +102,9 @@ class _CUDAGraphDotProductAttentionAdapter(torch.nn.Module):
             cu_seqlens_kv_padded=self.cu_seqlens_kv_padded,
             max_seqlen_q=self.max_seqlen_q,
             max_seqlen_kv=self.max_seqlen_kv,
-            # Backend choice and output dtype are deliberately fixed for the
-            # lifetime of this per-config graph.
-            pad_between_seqs=True,
+            # Backend choice, THD padding policy, and output dtype are
+            # deliberately fixed for the lifetime of this per-config graph.
+            pad_between_seqs=self.pad_between_seqs,
             fp8_output=False,
         )
 
@@ -786,6 +788,12 @@ def run_dpa_with_cp(
                     cu_seqlens_kv=cu_seqlens_kv,
                     cu_seqlens_q_padded=cu_seqlens_q_padded,
                     cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+                    # Match the correctness and graph paths. FlashAttention
+                    # receives compact uniform THD input, while FusedAttention
+                    # uses its padded-sequence path.
+                    pad_between_seqs=(
+                        (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
+                    ),
                     fp8_output=fp8_mha,
                 )
                 if isinstance(out_b, tuple):
@@ -825,6 +833,9 @@ def run_dpa_with_cp(
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
             max_seqlen_q=graph_max_seqlen_q,
             max_seqlen_kv=graph_max_seqlen_kv,
+            pad_between_seqs=(
+                (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
+            ),
         )
         graph_inputs = tuple(x.detach().clone().requires_grad_() for x in (q_, k_, v_))
 
