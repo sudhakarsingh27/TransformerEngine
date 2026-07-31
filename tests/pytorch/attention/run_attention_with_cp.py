@@ -853,9 +853,29 @@ def run_dpa_with_cp(
         for tensor in graph_inputs:
             tensor.grad = None
         graph_out = graphed_core_attn(*graph_inputs)
-        graph_out.backward(dout_)
         torch.cuda.synchronize()
         atol, rtol, rmse_tol = get_tols(config, dtype)
+        # Check before backward so a failure identifies forward replay itself,
+        # rather than a forward buffer overwritten by the captured backward.
+        compare_and_assert(
+            out_,
+            graph_out,
+            "out_cp_eager",
+            "out_cp_cuda_graph_pre_backward",
+            atol,
+            rtol,
+            rmse_tol,
+            False,
+        )
+        if rank == 0:
+            print(
+                "CUDA_GRAPH_FORWARD_CORRECTNESS"
+                f" model={model} backend={kernel_backend} comm={cp_comm_type}"
+                " cp=2 qkv=thd dtype=bf16 eager_cp_vs_graph=passed",
+                flush=True,
+            )
+        graph_out.backward(dout_)
+        torch.cuda.synchronize()
         graph_tensors = [graph_out, *(tensor.grad for tensor in graph_inputs)]
         eager_tensors = [out_, dq_, dk_, dv_]
         graph_names = ["out", "dq", "dk", "dv"]
