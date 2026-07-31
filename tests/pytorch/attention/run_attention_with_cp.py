@@ -843,6 +843,36 @@ def run_dpa_with_cp(
             seqlens = boundaries[1:] - boundaries[:-1]
             return int((seqlens.max().item() + 63) // 64 * 64)
 
+        def compare_graph_tensor_chunked(a, b, name_a, name_b, atol, rtol, rmse_tol):
+            """Apply the ordinary BF16 tolerance to every element with bounded scratch."""
+            if a.shape != b.shape:
+                raise AssertionError(
+                    f"{name_a} shape {tuple(a.shape)} != {name_b} shape {tuple(b.shape)}"
+                )
+            if a.ndim == 0:
+                compare_and_assert(a, b, name_a, name_b, atol, rtol, rmse_tol, False)
+                return
+            # torch.testing.assert_close materializes full-size elementwise
+            # temporaries. Bound each slice to 32 MiB so the 512K-token
+            # all-gather graph can retain its private pool during validation.
+            bytes_per_row = max(
+                a[0].numel() * a.element_size(),
+                b[0].numel() * b.element_size(),
+            )
+            rows_per_chunk = max(1, (32 * 1024 * 1024) // bytes_per_row)
+            for start in range(0, a.shape[0], rows_per_chunk):
+                end = min(start + rows_per_chunk, a.shape[0])
+                compare_and_assert(
+                    a[start:end],
+                    b[start:end],
+                    f"{name_a}[{start}:{end}]",
+                    f"{name_b}[{start}:{end}]",
+                    atol,
+                    rtol,
+                    rmse_tol,
+                    False,
+                )
+
         # DPA performs this same THD inference when max_seqlen is omitted, but
         # its device-to-host .item() is illegal once CUDA capture has started.
         # One graph is built per exact static sample, so bind the inferred Python
@@ -902,7 +932,7 @@ def run_dpa_with_cp(
         atol, rtol, rmse_tol = get_tols(config, dtype)
         # Check before backward so a failure identifies forward replay itself,
         # rather than a forward buffer overwritten by the captured backward.
-        compare_and_assert(
+        compare_graph_tensor_chunked(
             out_,
             graph_out,
             "out_cp_eager",
@@ -910,24 +940,33 @@ def run_dpa_with_cp(
             atol,
             rtol,
             rmse_tol,
-            False,
         )
         if rank == 0:
             print(
                 "CUDA_GRAPH_FORWARD_CORRECTNESS"
                 f" model={model} backend={kernel_backend} comm={cp_comm_type}"
-                " cp=2 qkv=thd dtype=bf16 eager_cp_vs_graph=passed",
+                " cp=2 qkv=thd dtype=bf16 eager_cp_vs_graph=passed"
+                " comparison=chunked_32mib",
                 flush=True,
             )
+        if cp_bench_only:
+            # Forward correctness is complete, and benchmark-only mode never
+            # reaches the later full-reference comparison. Release the 2 GiB
+            # eager output before captured backward at the largest shape.
+            del out_
         graph_out.backward(dout_)
         torch.cuda.synchronize()
-        graph_tensors = [graph_out, *(tensor.grad for tensor in graph_inputs)]
-        eager_tensors = [out_, dq_, dk_, dv_]
-        graph_names = ["out", "dq", "dk", "dv"]
+        graph_tensors = [tensor.grad for tensor in graph_inputs]
+        eager_tensors = [dq_, dk_, dv_]
+        graph_names = ["dq", "dk", "dv"]
+        if not cp_bench_only:
+            graph_tensors.insert(0, graph_out)
+            eager_tensors.insert(0, out_)
+            graph_names.insert(0, "out")
         for eager_tensor, graph_tensor, tensor_name in zip(
             eager_tensors, graph_tensors, graph_names
         ):
-            compare_and_assert(
+            compare_graph_tensor_chunked(
                 eager_tensor,
                 graph_tensor,
                 f"{tensor_name}_cp_eager",
@@ -935,13 +974,13 @@ def run_dpa_with_cp(
                 atol,
                 rtol,
                 rmse_tol,
-                False,
             )
         if rank == 0:
             print(
                 "CUDA_GRAPH_CORRECTNESS"
                 f" model={model} backend={kernel_backend} comm={cp_comm_type}"
-                " cp=2 qkv=thd dtype=bf16 eager_cp_vs_graph=passed",
+                " cp=2 qkv=thd dtype=bf16 eager_cp_vs_graph=passed"
+                " comparison=chunked_32mib",
                 flush=True,
             )
         del graph_out
