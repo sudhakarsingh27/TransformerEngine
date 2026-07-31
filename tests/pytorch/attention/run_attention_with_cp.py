@@ -69,6 +69,8 @@ class _CUDAGraphDotProductAttentionAdapter(torch.nn.Module):
         cu_seqlens_kv,
         cu_seqlens_q_padded,
         cu_seqlens_kv_padded,
+        max_seqlen_q,
+        max_seqlen_kv,
     ):
         super().__init__()
         if core_attention_bias is not None:
@@ -82,6 +84,8 @@ class _CUDAGraphDotProductAttentionAdapter(torch.nn.Module):
         self.register_buffer("cu_seqlens_kv", cu_seqlens_kv, persistent=False)
         self.register_buffer("cu_seqlens_q_padded", cu_seqlens_q_padded, persistent=False)
         self.register_buffer("cu_seqlens_kv_padded", cu_seqlens_kv_padded, persistent=False)
+        self.max_seqlen_q = max_seqlen_q
+        self.max_seqlen_kv = max_seqlen_kv
 
     def forward(self, q, k, v):
         return self.core_attn(
@@ -94,6 +98,8 @@ class _CUDAGraphDotProductAttentionAdapter(torch.nn.Module):
             cu_seqlens_kv=self.cu_seqlens_kv,
             cu_seqlens_q_padded=self.cu_seqlens_q_padded,
             cu_seqlens_kv_padded=self.cu_seqlens_kv_padded,
+            max_seqlen_q=self.max_seqlen_q,
+            max_seqlen_kv=self.max_seqlen_kv,
             # Backend choice and output dtype are deliberately fixed for the
             # lifetime of this per-config graph.
             pad_between_seqs=True,
@@ -795,6 +801,17 @@ def run_dpa_with_cp(
         )
 
     if use_cuda_graph:
+        def rounded_max_seqlen(cu_seqlens, cu_seqlens_padded):
+            boundaries = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+            seqlens = boundaries[1:] - boundaries[:-1]
+            return int((seqlens.max().item() + 63) // 64 * 64)
+
+        # DPA performs this same THD inference when max_seqlen is omitted, but
+        # its device-to-host .item() is illegal once CUDA capture has started.
+        # One graph is built per exact static sample, so bind the inferred Python
+        # integers before capture without changing eager execution semantics.
+        graph_max_seqlen_q = rounded_max_seqlen(cu_seqlens_q, cu_seqlens_q_padded)
+        graph_max_seqlen_kv = rounded_max_seqlen(cu_seqlens_kv, cu_seqlens_kv_padded)
         graph_adapter = _CUDAGraphDotProductAttentionAdapter(
             core_attn,
             core_attention_bias_type=config.attn_bias_type,
@@ -803,6 +820,8 @@ def run_dpa_with_cp(
             cu_seqlens_kv=cu_seqlens_kv,
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+            max_seqlen_q=graph_max_seqlen_q,
+            max_seqlen_kv=graph_max_seqlen_kv,
         )
         graph_inputs = tuple(x.detach().clone().requires_grad_() for x in (q_, k_, v_))
 
