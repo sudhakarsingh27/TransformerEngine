@@ -23,6 +23,7 @@ from transformer_engine.pytorch import (
     Float8Quantizer,
     Float8CurrentScalingQuantizer,
     MXFP8Quantizer,
+    make_graphed_callables,
 )
 from transformer_engine.common.recipe import (
     DelayedScaling,
@@ -241,6 +242,8 @@ def run_dpa_with_cp(
     log_level=logging.WARNING,
     benchmark="0",
     thd_seqlen_pattern="random",
+    cuda_graph="False",
+    cuda_graph_warmup="3",
 ):
     """Test DotProductAttention module with context parallelism"""
     torch.manual_seed(1234)
@@ -249,9 +252,31 @@ def run_dpa_with_cp(
     # When is_training is False, gradient outputs are None.
     is_training = is_training == "True"
     benchmark_iters = int(benchmark)
+    use_cuda_graph = cuda_graph == "True"
+    cuda_graph_warmup_iters = int(cuda_graph_warmup)
     cp_bench_only = os.getenv("NVTE_CP_BENCH_ONLY", "0") == "1"
     if cp_bench_only and benchmark_iters <= 0:
         raise ValueError("NVTE_CP_BENCH_ONLY requires benchmark > 0")
+    if use_cuda_graph:
+        # This is intentionally a narrow prototype. Expanding one axis at a time
+        # keeps a capture failure attributable to CP/NCCL rather than FP8 state,
+        # layout conversion, inference, or a different attention backend.
+        if dtype != "bf16":
+            raise ValueError("cuda_graph=True prototype only supports dtype=bf16")
+        if qkv_format != "thd":
+            raise ValueError("cuda_graph=True prototype only supports qkv_format=thd")
+        if kernel_backend != "FusedAttention":
+            raise ValueError("cuda_graph=True prototype only supports FusedAttention")
+        if not is_training:
+            raise ValueError("cuda_graph=True prototype only supports is_training=True")
+        if benchmark_iters <= 0:
+            raise ValueError("cuda_graph=True requires benchmark > 0")
+        if cuda_graph_warmup_iters <= 0:
+            raise ValueError("cuda_graph_warmup must be positive")
+        if cp_bench_only:
+            raise ValueError(
+                "cuda_graph=True requires the correctness-bearing path; unset NVTE_CP_BENCH_ONLY"
+            )
     if cp_bench_only and int(os.getenv("RANK", "0")) == 0:
         print("CP_BENCH_ONLY correctness_paths=skipped inputs=rank_local", flush=True)
 
@@ -303,6 +328,8 @@ def run_dpa_with_cp(
     logging.info(f"[Rank {rank}] Setup: world_size {world_size}")
     if not _pool_managed_pg:
         dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+    if use_cuda_graph and world_size != 2:
+        raise ValueError("cuda_graph=True prototype requires exactly 2 ranks (CP=2)")
 
     # Set up communication group for CP. In pool mode, the pool worker has
     # already pre-created world-scoped and a2a+p2p sub-groups once and stashed
@@ -618,6 +645,15 @@ def run_dpa_with_cp(
         fp8_context = autocast(enabled=True, recipe=fp8_recipe, amax_reduction_group=cp_comm_group)
     else:
         fp8_context = nullcontext()
+    if use_cuda_graph:
+        if config.dropout_p != 0.0:
+            raise ValueError("cuda_graph=True prototype requires attention_dropout=0")
+        if config.attn_bias_type not in ("no_bias", "alibi"):
+            raise ValueError("cuda_graph=True prototype does not capture an explicit attention bias")
+        if config.softmax_type != "vanilla" or config.return_max_logit:
+            raise ValueError(
+                "cuda_graph=True prototype requires vanilla softmax without return_max_logit"
+            )
 
     if not cp_bench_only:
         # Correctness-only CP pass; benchmark-only mode enters the timed warmup directly.
@@ -712,6 +748,120 @@ def run_dpa_with_cp(
             f" ({benchmark_iters} iters)",
             flush=True,
         )
+
+    if use_cuda_graph:
+        graph_kwargs = {
+            "core_attention_bias_type": config.attn_bias_type,
+            "core_attention_bias": bias_,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_kv": cu_seqlens_kv,
+            "cu_seqlens_q_padded": cu_seqlens_q_padded,
+            "cu_seqlens_kv_padded": cu_seqlens_kv_padded,
+            # Make backend selection identical in eager warmup, capture, and replay.
+            # A Python-side auto-detection change cannot then silently alter the graph.
+            "pad_between_seqs": True,
+            "fp8_output": False,
+        }
+        graph_inputs = tuple(x.detach().clone().requires_grad_() for x in (q_, k_, v_))
+
+        def capture_barrier():
+            # Every rank must issue CP collectives in the same capture order.
+            # Synchronizing both sides of make_graphed_callables' eager warmup
+            # prevents a faster rank from entering NCCL capture early.
+            torch.cuda.synchronize()
+            dist.barrier(group=cp_comm_group)
+            torch.cuda.synchronize()
+
+        capture_barrier()
+        graphed_core_attn = make_graphed_callables(
+            core_attn,
+            graph_inputs,
+            num_warmup_iters=cuda_graph_warmup_iters,
+            sample_kwargs=graph_kwargs,
+            enabled=False,
+            pre_warmup_hook=capture_barrier,
+            post_warmup_hook=capture_barrier,
+        )
+        capture_barrier()
+
+        # Validate one replay against the eager CP pass before collecting timing.
+        # Graph buffers are reused, so compare before the next replay overwrites them.
+        for tensor in graph_inputs:
+            tensor.grad = None
+        graph_out = graphed_core_attn(*graph_inputs, **graph_kwargs)
+        graph_out.backward(dout_)
+        torch.cuda.synchronize()
+        atol, rtol, rmse_tol = get_tols(config, dtype)
+        graph_tensors = [graph_out, *(tensor.grad for tensor in graph_inputs)]
+        eager_tensors = [out_, dq_, dk_, dv_]
+        graph_names = ["out", "dq", "dk", "dv"]
+        for eager_tensor, graph_tensor, tensor_name in zip(
+            eager_tensors, graph_tensors, graph_names
+        ):
+            compare_and_assert(
+                eager_tensor,
+                graph_tensor,
+                f"{tensor_name}_cp_eager",
+                f"{tensor_name}_cp_cuda_graph",
+                atol,
+                rtol,
+                rmse_tol,
+                False,
+            )
+        if rank == 0:
+            print(
+                "CUDA_GRAPH_CORRECTNESS"
+                f" model={model} backend={kernel_backend} comm={cp_comm_type}"
+                " cp=2 qkv=thd dtype=bf16 eager_cp_vs_graph=passed",
+                flush=True,
+            )
+        del graph_out
+
+        # Reuse the same leaves so graph replay avoids host allocation and input
+        # copies. Clearing .grad matches the eager loop's fresh-leaf semantics.
+        replay_warmup = 10
+        for _ in range(replay_warmup):
+            for tensor in graph_inputs:
+                tensor.grad = None
+            graph_out = graphed_core_attn(*graph_inputs, **graph_kwargs)
+            graph_out.backward(dout_)
+            del graph_out
+        capture_barrier()
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        wall_start = time.perf_counter()
+        for _ in range(benchmark_iters):
+            for tensor in graph_inputs:
+                tensor.grad = None
+            graph_out = graphed_core_attn(*graph_inputs, **graph_kwargs)
+            graph_out.backward(dout_)
+            del graph_out
+        end_event.record()
+        torch.cuda.synchronize()
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0 / benchmark_iters
+        cuda_event_ms = start_event.elapsed_time(end_event) / benchmark_iters
+
+        # Rank 0 reports the slowest rank, which is the distributed iteration
+        # latency that constrains useful throughput.
+        max_times = torch.tensor([wall_ms, cuda_event_ms], dtype=torch.float64, device="cuda")
+        dist.all_reduce(max_times, op=dist.ReduceOp.MAX, group=cp_comm_group)
+        if rank == 0:
+            print(
+                "CUDA_GRAPH_RESULT"
+                f" model={model} backend={kernel_backend} comm={cp_comm_type}"
+                " cp=2 qkv=thd dtype=bf16"
+                f" wall_ms={max_times[0].item():.3f}"
+                f" cuda_event_ms={max_times[1].item():.3f}"
+                f" iters={benchmark_iters} replay_warmup={replay_warmup}"
+                f" capture_warmup={cuda_graph_warmup_iters}",
+                flush=True,
+            )
+        for tensor in graph_inputs:
+            tensor.grad = None
+        torch.cuda.synchronize()
+        graphed_core_attn.reset()
 
     if cp_bench_only:
         # Benchmark-only mode has no correctness result to compare.

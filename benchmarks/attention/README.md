@@ -35,6 +35,29 @@ NSYS_OUT=my_profile torchrun --nproc-per-node=4 --no-python \
 
 The `nsys_rank0_only.sh` wrapper runs rank 0 under `nsys profile` and other ranks bare.
 
+### Minimal BF16 CUDA graph validation
+
+The opt-in CUDA graph prototype is intentionally limited to two ranks, BF16,
+THD, FusedAttention, training, zero dropout, and the correctness-bearing path.
+It first runs the existing eager no-CP vs CP checks, then compares one graphed
+CP replay against eager CP, and finally reports both synchronized wall time and
+CUDA-event time. Capture and replay warmups are excluded.
+
+```bash
+torchrun --nproc-per-node=2 --master-addr=127.0.0.1 --master-port=29500 \
+    tests/pytorch/attention/run_attention_with_cp.py \
+    dtype=bf16 model=bucket32k qkv_format=thd \
+    kernel_backend=FusedAttention cp_comm_type=p2p \
+    benchmark=20 cuda_graph=True cuda_graph_warmup=3 \
+    log_level=WARNING \
+    thd_seqlen_pattern="24576,28672,30720,32768"
+```
+
+Keep `NVTE_CP_BENCH_ONLY` unset: the prototype rejects benchmark-only mode
+because its purpose is to validate graph numerics before trusting replay timing.
+All ranks enter capture in the same order; `CUDA_GRAPH_RESULT` reports the
+maximum wall and CUDA-event latency across ranks.
+
 ### SWA (Sliding Window Attention)
 
 SWA configs append `_swa<W>` to the model name. p2p does not support SWA — use all_gather or a2a.
@@ -58,6 +81,8 @@ python -m torch.distributed.launch --nproc-per-node=8 \
 | `kernel_backend` | `FlashAttention` | `FusedAttention` (cuDNN) or `FlashAttention` |
 | `cp_comm_type` | `p2p` | `p2p`, `all_gather`, or `a2a` |
 | `benchmark` | `0` | Number of timed iterations (0 = correctness-only, no timing) |
+| `cuda_graph` | `False` | Opt into the narrow BF16 THD FusedAttention CP=2 graph prototype |
+| `cuda_graph_warmup` | `3` | Eager warmups used while constructing CUDA graphs |
 | `thd_seqlen_pattern` | `random` | Comma-separated per-sequence lengths, or `random`/`max`/`half`/`linear`/`alternating` |
 | `log_level` | `WARNING` | Python logging level |
 | `is_training` | `True` | Run backward pass |
