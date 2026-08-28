@@ -1841,6 +1841,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         # MXFP8/F16 attention:    q, k, v: torch.Tensor, dtype=fwd_nominal_dtype
         # FP8DS/CS attention:     q, k, v: torch.Tensor, dtype=torch.uint8
         out = None
+        # Current fused/A2A plumbing still consumes this original format; the
+        # online merge only changes the lifetime of per-step outputs.
+        o_format = qkv_format
         second_half_lse_seqlen = None
         for i in range(cp_size + 1):
             if i < cp_size:
