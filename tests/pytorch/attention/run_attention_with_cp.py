@@ -5,20 +5,23 @@
 import copy
 import os
 import sys
-import time
 import logging
 from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
     get_cu_seqlens_on_cp_rank,
+    get_thd_partitioned_indices,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.utils import combine_and_quantize
-import transformer_engine_torch as tex
 from transformer_engine.pytorch import DType
-from test_attention_with_cp import model_configs_flash_attn, model_configs_fused_attn
+from test_attention_with_cp import (
+    model_configs_flash_attn,
+    model_configs_fused_attn,
+)
 from transformer_engine.pytorch import (
     autocast,
+    CPLoadBalancingStrategy,
     DotProductAttention,
     Float8Quantizer,
     Float8CurrentScalingQuantizer,
@@ -31,17 +34,6 @@ from transformer_engine.common.recipe import (
     Format,
 )
 from utils import ModelConfig, compare_and_assert
-
-# Merge benchmark/stress configs into both backend maps so worker runs can use
-# aliases like rl16k, bucket32k, and mixed32k_swa512 with either backend.
-try:
-    from benchmark_cp import model_configs_fused_attn as _bench_cfgs_fused_attn
-
-    for _k, _v in _bench_cfgs_fused_attn.items():
-        model_configs_fused_attn.setdefault(_k, _v)
-        model_configs_flash_attn.setdefault(_k, _v)
-except ImportError:
-    pass
 
 # Pool mode (NVTE_CP_POOL_PG=1) only: shared CP collective groups, created once
 # per pool by run_attention_with_cp_pool.main() and reused across every case in
@@ -61,7 +53,7 @@ def generate_input_shapes(
     world_size: int,
     kernel_backend: str,
     fa_pad_between_seqs: str = "False",
-    thd_seqlen_pattern: str = "random",
+    load_balancing_strategy=CPLoadBalancingStrategy.DUAL_CHUNK_SWAP,
 ):
     if qkv_format == "bshd":
         q_input_shape = (
@@ -120,30 +112,33 @@ def generate_input_shapes(
         cu_seqlens_q_padded = None
         cu_seqlens_kv_padded = None
     elif qkv_format == "thd":
-        b, s = config.batch_size, config.max_seqlen_q
-        # Custom list: "24576,28672,30720,32768" -> explicit per-seq lengths
-        if "," in thd_seqlen_pattern:
-            seqlens_q = torch.tensor(
-                [int(x) for x in thd_seqlen_pattern.split(",")], dtype=torch.int32
+        if load_balancing_strategy is CPLoadBalancingStrategy.NO_LOAD_BALANCE:
+            assert config.batch_size == 2
+            if kernel_backend == "FlashAttention" and fa_pad_between_seqs == "False":
+                seqlens_q = torch.tensor(
+                    [config.max_seqlen_q - 2, config.max_seqlen_q], dtype=torch.int32
+                )
+                assert seqlens_q.sum().item() % world_size == 0
+                seqlens_q_padded = seqlens_q
+            else:
+                # Exercise both document padding and a CP chunk boundary inside a document.
+                seqlens_q = torch.tensor(
+                    [config.max_seqlen_q - 2, config.max_seqlen_q - 1],
+                    dtype=torch.int32,
+                )
+                padded_total = 2 * config.max_seqlen_q
+                assert padded_total % world_size == 0
+                seqlens_q_padded = torch.tensor(
+                    [config.max_seqlen_q - 1, config.max_seqlen_q + 1],
+                    dtype=torch.int32,
+                )
+        else:
+            seqlens_q = torch.randint(0, config.max_seqlen_q + 1, [config.batch_size]).to(
+                torch.int32
             )
-            b = len(seqlens_q)
-            s = int(seqlens_q.max())
-            config.batch_size = b
-            config.max_seqlen_q = s
-            config.max_seqlen_kv = s
-        elif thd_seqlen_pattern == "max":
-            seqlens_q = torch.full([b], s, dtype=torch.int32)
-        elif thd_seqlen_pattern == "half":
-            seqlens_q = torch.full([b], s // 2, dtype=torch.int32)
-        elif thd_seqlen_pattern == "linear":
-            seqlens_q = torch.linspace(1, s, b).to(torch.int32)
-        elif thd_seqlen_pattern == "alternating":
-            seqlens_q = torch.tensor(
-                [s if i % 2 == 0 else s // 4 for i in range(b)], dtype=torch.int32
+            seqlens_q_padded = (
+                (seqlens_q + 2 * world_size - 1) // (world_size * 2) * (world_size * 2)
             )
-        else:  # "random"
-            seqlens_q = torch.randint(0, s + 1, [b]).to(torch.int32)
-        seqlens_q_padded = (seqlens_q + 2 * world_size - 1) // (world_size * 2) * (world_size * 2)
         cu_seqlens_q_padded = torch.cat(
             [
                 torch.zeros([1], dtype=torch.int32),
@@ -238,22 +233,19 @@ def run_dpa_with_cp(
     is_training="True",
     fa_pad_between_seqs="False",
     deterministic="False",
+    load_balancing_strategy="DUAL_CHUNK_SWAP",
     log_level=logging.WARNING,
-    benchmark="0",
-    thd_seqlen_pattern="random",
 ):
     """Test DotProductAttention module with context parallelism"""
-    torch.manual_seed(1234)
-    torch.cuda.manual_seed(1234)
     logging.root.setLevel(log_level)
+    load_balancing_strategy = CPLoadBalancingStrategy[load_balancing_strategy]
     # When is_training is False, gradient outputs are None.
     is_training = is_training == "True"
-    benchmark_iters = int(benchmark)
-    cp_bench_only = os.getenv("NVTE_CP_BENCH_ONLY", "0") == "1"
-    if cp_bench_only and benchmark_iters <= 0:
-        raise ValueError("NVTE_CP_BENCH_ONLY requires benchmark > 0")
-    if cp_bench_only and int(os.getenv("RANK", "0")) == 0:
-        print("CP_BENCH_ONLY correctness_paths=skipped inputs=rank_local", flush=True)
+    pad_between_seqs = None
+    if qkv_format == "thd":
+        # Keep this in sync with generate_input_shapes so DPA gets the explicit
+        # padding state without a GPU-to-CPU sync.
+        pad_between_seqs = kernel_backend == "FusedAttention" or fa_pad_between_seqs == "True"
 
     # set up environment variables and config
     if deterministic == "True":
@@ -276,7 +268,10 @@ def run_dpa_with_cp(
         config = copy.deepcopy(model_configs_flash_attn[model])
     if kernel_backend == "FusedAttention":
         os.environ["NVTE_FUSED_ATTN"] = "1"
-        config = copy.deepcopy(model_configs_fused_attn[model])
+        if model in model_configs_fused_attn:
+            config = copy.deepcopy(model_configs_fused_attn[model])
+        else:
+            assert False, f"{model=} is not a known FusedAttention CP config!"
     assert config.attn_mask_type in [
         "causal",
         "no_mask",
@@ -366,55 +361,19 @@ def run_dpa_with_cp(
         cu_seqlens_q_padded,
         cu_seqlens_kv_padded,
     ) = generate_input_shapes(
-        qkv_format, config, world_size, kernel_backend, fa_pad_between_seqs, thd_seqlen_pattern
+        qkv_format,
+        config,
+        world_size,
+        kernel_backend,
+        fa_pad_between_seqs,
+        load_balancing_strategy,
     )
-    input_shapes = [q_input_shape, k_input_shape, v_input_shape, attn_output_shape]
-    if cp_bench_only:
-        # Performance mode needs only rank-local CP leaves; full inputs exist solely
-        # to make correctness comparisons deterministic across the two paths.
-        if qkv_format in ("bshd", "sbhd"):
-            seq_dim = qkv_format.index("s")
-            input_shapes = [list(shape) for shape in input_shapes]
-            for shape in input_shapes:
-                shape[seq_dim] //= world_size
-            seq_idx = torch.tensor([rank, 2 * world_size - rank - 1], device="cuda")
-        elif qkv_format == "thd":
-            seq_idx_q = tex.thd_get_partitioned_indices(
-                cu_seqlens_q_padded, int(q_input_shape[0]), world_size, rank
-            )
-            seq_idx_kv = tex.thd_get_partitioned_indices(
-                cu_seqlens_kv_padded, int(k_input_shape[0]), world_size, rank
-            )
-            input_shapes = [
-                (seq_idx_q.numel(), *q_input_shape[1:]),
-                (seq_idx_kv.numel(), *k_input_shape[1:]),
-                (seq_idx_kv.numel(), *v_input_shape[1:]),
-                (seq_idx_q.numel(), *attn_output_shape[1:]),
-            ]
-        q_, k_, v_, dout_ = [
-            torch.clamp(torch.randn(shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
-            for shape in input_shapes
-        ]
-    else:
-        q_orig, k_orig, v_orig, dout_orig = [
-            torch.clamp(torch.randn(shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
-            for shape in input_shapes
-        ]
-    # Save inputs for cross-backend comparison
-    _save_path = os.environ.get("CP_CROSS_BACKEND_SAVE_DIR")
-    if _save_path and not cp_bench_only:
-        os.makedirs(_save_path, exist_ok=True)
-        torch.save(
-            {
-                "q": q_orig,
-                "k": k_orig,
-                "v": v_orig,
-                "dout": dout_orig,
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_q_padded": cu_seqlens_q_padded,
-            },
-            os.path.join(_save_path, f"inputs_rank{rank}.pt"),
-        )
+    q_orig = torch.clamp(torch.randn(q_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
+    k_orig = torch.clamp(torch.randn(k_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
+    v_orig = torch.clamp(torch.randn(v_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
+    dout_orig = torch.clamp(
+        torch.randn(attn_output_shape, dtype=dtypes[dtype]), min=-1, max=1
+    ).cuda()
     if scaling_mode == "delayed":
         qkv_quantizer = Float8Quantizer(
             fp8_dtype=DType.kFloat8E4M3,
@@ -451,13 +410,11 @@ def run_dpa_with_cp(
         dout_quantizer.optimize_for_gemm = True
         dout_quantizer.internal = False
     qkv_layout = "_".join([qkv_format] * 3)
-    if not cp_bench_only:
-        # Correctness mode shares full storage until independent CP shards exist.
-        q, k, v, dout = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
-        if fp8_mha:
-            q, k, v, qkv_layout, _ = combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer)
-        for x in [q, k, v]:
-            x.requires_grad = True
+    q, k, v, dout = [x.clone().detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
+    if fp8_mha:
+        q, k, v, qkv_layout, _ = combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer)
+    for x in [q, k, v]:
+        x.requires_grad = True
 
     if config.attn_bias_type not in ["no_bias", "alibi"]:
         bias_shape_map = {
@@ -482,96 +439,92 @@ def run_dpa_with_cp(
     else:
         bias = None
 
+    ############ run without CP ############
+    logging.info(f"[Rank {rank}] Run without context parallelism")
     if dtype == "fp8":
         fp8_context = autocast(enabled=True, recipe=fp8_recipe, amax_reduction_group=cp_comm_group)
     else:
         fp8_context = nullcontext()
-    if not cp_bench_only:
-        ############ run without CP ############
-        logging.info(f"[Rank {rank}] Run without context parallelism")
-        max_logit = None
-        with fp8_context:
-            # q, k, v, out in FP8; dout in F16
-            out = core_attn(
-                q,
-                k,
-                v,
-                core_attention_bias_type=config.attn_bias_type,
-                core_attention_bias=bias,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_kv,
-                cu_seqlens_q_padded=cu_seqlens_q_padded,
-                cu_seqlens_kv_padded=cu_seqlens_kv_padded,
-                # Test runner sets cu_seqlens_q == cu_seqlens_q_padded for the
-                # FlashAttention path, i.e. no inter-sequence padding. Declare this
-                # explicitly so the sync-free auto-detect (which conservatively
-                # picks True when padded cu_seqlens are present) does not disable FA.
-                pad_between_seqs=(
-                    (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
-                ),
-                fp8_output=fp8_mha,
-            )
-            if config.return_max_logit:
-                out, max_logit = out
-            if is_training:
-                if fp8_bwd and fp8_mha:
-                    dout_fp8 = dout_quantizer(dout)
-                    out.backward(dout_fp8)
-                else:
-                    out.backward(dout)
+    max_logit = None
+    with fp8_context:
+        # q, k, v, out in FP8; dout in F16
+        out = core_attn(
+            q,
+            k,
+            v,
+            core_attention_bias_type=config.attn_bias_type,
+            core_attention_bias=bias,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+            pad_between_seqs=pad_between_seqs,
+            fp8_output=fp8_mha,
+        )
+        if config.return_max_logit:
+            out, max_logit = out
         if is_training:
-            dq, dk, dv, dbias = q.grad, k.grad, v.grad, bias.grad if bias is not None else None
-            d_softmax_offset = (
-                core_attn.softmax_offset.grad if config.softmax_type != "vanilla" else None
-            )
-        else:
-            dq, dk, dv, dbias = None, None, None, None
-            d_softmax_offset = None
+            if fp8_bwd and fp8_mha:
+                dout_fp8 = dout_quantizer(dout)
+                out.backward(dout_fp8)
+            else:
+                out.backward(dout)
+    if is_training:
+        dq, dk, dv, dbias = q.grad, k.grad, v.grad, bias.grad if bias is not None else None
+        d_softmax_offset = (
+            core_attn.softmax_offset.grad if config.softmax_type != "vanilla" else None
+        )
+    else:
+        dq, dk, dv, dbias = None, None, None, None
+        d_softmax_offset = None
 
     ############ run with CP ############
     logging.info(f"[Rank {rank}] Run with context parallelism")
 
     # set up inputs
-    bias_ = bias.clone().detach() if bias is not None else None
-    if not cp_bench_only:
-        q_, k_, v_, dout_ = [x.detach() for x in [q_orig, k_orig, v_orig, dout_orig]]
-        if qkv_format == "bshd" or qkv_format == "sbhd":
-            seq_dim = qkv_format.index("s")
-            q_, k_, v_, dout_ = [
-                x.view(
-                    *x.shape[:seq_dim],
-                    2 * world_size,
-                    x.shape[seq_dim] // (2 * world_size),
-                    *x.shape[(seq_dim + 1) :],
-                )
-                for x in [q_, k_, v_, dout_]
-            ]
-            seq_idx = torch.tensor([rank, 2 * world_size - rank - 1], device=q_.device)
-            q_, k_, v_, dout_ = [
-                x.index_select(seq_dim, seq_idx) for x in [q_, k_, v_, dout_]
-            ]
-            q_, k_, v_, dout_ = [
-                x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :])
-                for x in [q_, k_, v_, dout_]
-            ]
-        elif qkv_format == "thd":
-            seq_idx_q = tex.thd_get_partitioned_indices(
-                cu_seqlens_q_padded, q_.shape[0], world_size, rank
+    q_, k_, v_, dout_, *rest = [
+        x.clone().detach()
+        for x in [q_orig, k_orig, v_orig, dout_orig] + ([] if bias is None else [bias])
+    ]
+    bias_ = rest[0] if len(rest) else None
+    if qkv_format == "bshd" or qkv_format == "sbhd":
+        seq_dim = qkv_format.index("s")
+        q_, k_, v_, dout_ = [
+            x.view(
+                *x.shape[:seq_dim],
+                2 * world_size,
+                x.shape[seq_dim] // (2 * world_size),
+                *x.shape[(seq_dim + 1) :],
             )
-            seq_idx_kv = tex.thd_get_partitioned_indices(
-                cu_seqlens_kv_padded, k_.shape[0], world_size, rank
-            )
-            q_, dout_ = [x.index_select(0, seq_idx_q) for x in [q_, dout_]]
-            k_, v_ = [x.index_select(0, seq_idx_kv) for x in [k_, v_]]
-        else:
-            assert False, f"{qkv_format} is an unsupported qkv_format!"
+            for x in [q_, k_, v_, dout_]
+        ]
+        seq_idx = torch.tensor([rank, 2 * world_size - rank - 1], device=q_.device)
+        q_, k_, v_, dout_ = [x.index_select(seq_dim, seq_idx) for x in [q_, k_, v_, dout_]]
+        q_, k_, v_, dout_ = [
+            x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :]) for x in [q_, k_, v_, dout_]
+        ]
+    elif qkv_format == "thd":
+        seq_idx_q = get_thd_partitioned_indices(
+            cu_seqlens_q_padded,
+            q_.shape[0],
+            world_size,
+            rank,
+            device=q_.device,
+            load_balancing_strategy=load_balancing_strategy,
+        )
+        seq_idx_kv = get_thd_partitioned_indices(
+            cu_seqlens_kv_padded,
+            k_.shape[0],
+            world_size,
+            rank,
+            device=k_.device,
+            load_balancing_strategy=load_balancing_strategy,
+        )
+        q_, dout_ = [x.index_select(0, seq_idx_q) for x in [q_, dout_]]
+        k_, v_ = [x.index_select(0, seq_idx_kv) for x in [k_, v_]]
+    else:
+        assert False, f"{qkv_format} is an unsupported qkv_format!"
     q_, k_, v_, dout_ = [x.contiguous() for x in [q_, k_, v_, dout_]]
-    if not cp_bench_only:
-        # index_select owns shard storage, so full generated inputs are no longer needed.
-        out = out.detach()
-        if max_logit is not None:
-            max_logit = max_logit.detach()
-        del q, k, v, dout, q_orig, k_orig, v_orig, dout_orig
     if scaling_mode == "delayed":
         qkv_quantizer.scale.fill_(1.0)
         qkv_quantizer.amax.fill_(0.0)
@@ -609,8 +562,9 @@ def run_dpa_with_cp(
         cp_comm_ranks,
         torch.cuda.Stream(),
         cp_comm_type,
+        load_balancing_strategy,
     )
-    if config.softmax_type != "vanilla" and core_attn.softmax_offset.grad is not None:
+    if config.softmax_type != "vanilla":
         core_attn.softmax_offset.grad.zero_()
     if dtype == "fp8":
         core_attn.fp8_initialized = False
@@ -619,110 +573,44 @@ def run_dpa_with_cp(
     else:
         fp8_context = nullcontext()
 
-    if not cp_bench_only:
-        # Correctness-only CP pass; benchmark-only mode enters the timed warmup directly.
-        max_logit_ = None
-        with fp8_context:
-            # q, k, v, out in FP8; dout in F16
-            out_ = core_attn(
-                q_,
-                k_,
-                v_,
-                core_attention_bias_type=config.attn_bias_type,
-                core_attention_bias=bias_,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_kv,
-                cu_seqlens_q_padded=cu_seqlens_q_padded,
-                cu_seqlens_kv_padded=cu_seqlens_kv_padded,
-                # See note above (non-CP branch): same explicit declaration so
-                # FlashAttention isn't disabled by the conservative sync-free
-                # auto-detect when this test path constructs no inter-seq padding.
-                pad_between_seqs=(
-                    (kernel_backend != "FlashAttention") if qkv_format == "thd" else None
-                ),
-                fp8_output=fp8_mha,
-            )
-            if config.return_max_logit:
-                out_, max_logit_ = out_
-            if is_training:
-                if fp8_bwd and fp8_mha:
-                    dout_fp8_ = dout_quantizer(dout_)
-                    out_.backward(dout_fp8_)
-                else:
-                    out_.backward(dout_)
+    # run attention
+    max_logit_ = None
+    with fp8_context:
+        # q, k, v, out in FP8; dout in F16
+        out_ = core_attn(
+            q_,
+            k_,
+            v_,
+            core_attention_bias_type=config.attn_bias_type,
+            core_attention_bias=bias_,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+            pad_between_seqs=pad_between_seqs,
+            fp8_output=fp8_mha,
+        )
+        if config.return_max_logit:
+            out_, max_logit_ = out_
         if is_training:
-            dq_, dk_, dv_, dbias_ = (
-                q_.grad,
-                k_.grad,
-                v_.grad,
-                bias_.grad if bias_ is not None else None,
-            )
-            d_softmax_offset_ = (
-                core_attn.softmax_offset.grad.clone() if config.softmax_type != "vanilla" else None
-            )
-        else:
-            dq_, dk_, dv_, dbias_ = None, None, None, None
-            d_softmax_offset_ = None
-
-    if _save_path and not cp_bench_only:
-        torch.save(
-            {
-                "out": out_.detach(),
-                "dq": dq_.detach() if dq_ is not None else None,
-                "dk": dk_.detach() if dk_ is not None else None,
-                "dv": dv_.detach() if dv_ is not None else None,
-            },
-            os.path.join(_save_path, f"outputs_{cp_comm_type}_rank{rank}.pt"),
+            if fp8_bwd and fp8_mha:
+                dout_fp8_ = dout_quantizer(dout_)
+                out_.backward(dout_fp8_)
+            else:
+                out_.backward(dout_)
+    if is_training:
+        dq_, dk_, dv_, dbias_ = (
+            q_.grad,
+            k_.grad,
+            v_.grad,
+            bias_.grad if bias_ is not None else None,
         )
-
-    # Benchmark: re-run forward+backward with timing
-    if benchmark_iters > 0:
-        warmup = 10
-        t0 = None
-        for it in range(warmup + benchmark_iters):
-            q_b, k_b, v_b = [x.clone().detach().requires_grad_() for x in [q_, k_, v_]]
-            torch.cuda.synchronize()
-            if it == warmup:
-                torch.cuda.cudart().cudaProfilerStart()
-                t0 = time.perf_counter()
-            with fp8_context:
-                out_b = core_attn(
-                    q_b,
-                    k_b,
-                    v_b,
-                    core_attention_bias_type=config.attn_bias_type,
-                    core_attention_bias=bias_,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_kv,
-                    cu_seqlens_q_padded=cu_seqlens_q_padded,
-                    cu_seqlens_kv_padded=cu_seqlens_kv_padded,
-                    fp8_output=fp8_mha,
-                )
-                if isinstance(out_b, tuple):
-                    out_b = out_b[0]
-                if is_training:
-                    out_b.backward(dout_)
-            torch.cuda.synchronize()
-            # Do not carry a completed graph and its leaf gradients into the next iteration.
-            del out_b, q_b, k_b, v_b
-        elapsed = (time.perf_counter() - t0) / benchmark_iters * 1000
-        torch.cuda.cudart().cudaProfilerStop()
-        print(
-            f"[Rank {rank}] {cp_comm_type} {qkv_format} {dtype}: {elapsed:.2f} ms/iter"
-            f" ({benchmark_iters} iters)",
-            flush=True,
+        d_softmax_offset_ = (
+            core_attn.softmax_offset.grad.clone() if config.softmax_type != "vanilla" else None
         )
-
-    if cp_bench_only:
-        # Benchmark-only mode has no correctness result to compare.
-        if not _reusing_pool_groups:
-            if cp_comm_group is not None:
-                dist.destroy_process_group(cp_comm_group)
-            for group in cp_comm_sub_groups:
-                dist.destroy_process_group(group)
-        if not _pool_managed_pg:
-            dist.destroy_process_group()
-        return
+    else:
+        dq_, dk_, dv_, dbias_ = None, None, None, None
+        d_softmax_offset_ = None
 
     # get outputs
     tensors = [out, dq, dk, dv, dbias, out_, dq_, dk_, dv_, dbias_]
