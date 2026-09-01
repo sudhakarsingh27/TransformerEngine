@@ -2124,29 +2124,10 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                                 seq_dim,
                             )
                         elif qkv_format == "thd":
-                            if softmax_lse_in_packed_format:
-                                # LSE is [h, t], out is [t, h, d]
-                                scale = torch.exp(
-                                    old_softmax_lse - softmax_lse
-                                ).transpose(0, 1).unsqueeze(-1)
-                                out.mul_(scale)
-                            else:
-                                # LSE is [b*h, s_padded] — zero out and reconstruct
-                                # via two thd_out_correction calls
-                                out_backup = out.clone()
-                                out.zero_()
-                                tex.thd_out_correction(
-                                    out,
-                                    out_backup,
-                                    softmax_lse,
-                                    old_softmax_lse,
-                                    cu_seqlens_q_padded,
-                                    False,
-                                    softmax_lse_in_packed_format,
-                                )
                             tex.thd_out_correction(
                                 out,
                                 out_per_step[(i - 1) % 2],
+                                old_softmax_lse,
                                 softmax_lse,
                                 softmax_lse_per_step[(i - 1) % 2],
                                 cu_seqlens_q_padded,
@@ -2162,30 +2143,10 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                                 cu_seqlens_q_padded,
                                 softmax_lse_in_packed_format,
                             )
-                            # Rescale out for affected (second-half) tokens;
-                            # first-half tokens have old==new so scale=1.0
-                            if softmax_lse_in_packed_format:
-                                scale = torch.exp(
-                                    old_softmax_lse - softmax_lse
-                                ).transpose(0, 1).unsqueeze(-1)
-                                out.mul_(scale)
-                            else:
-                                # Zero out and reconstruct; use only_second_half=False
-                                # because first-half has old==new so scale=1.0
-                                out_backup = out.clone()
-                                out.zero_()
-                                tex.thd_out_correction(
-                                    out,
-                                    out_backup,
-                                    softmax_lse,
-                                    old_softmax_lse,
-                                    cu_seqlens_q_padded,
-                                    False,
-                                    softmax_lse_in_packed_format,
-                                )
                             tex.thd_out_correction(
                                 out,
                                 out_per_step[(i - 1) % 2],
+                                old_softmax_lse,
                                 softmax_lse,
                                 softmax_lse_per_step[(i - 1) % 2],
                                 cu_seqlens_q_padded,
