@@ -319,6 +319,85 @@ def _test_reduce_scatter(
     torch.testing.assert_close(dx_test, dx_ref, rtol=0, atol=0)
 
 
+def _test_context_parallel_all_to_all(
+    *,
+    local_tokens: int = 5,
+    local_features: int = 7,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device = "cuda",
+) -> None:
+    """Check both CP-A2A directions and their inverse gradients."""
+    process_group = world_group()
+    rank = torch.distributed.get_rank(process_group)
+    world_size = torch.distributed.get_world_size(process_group)
+    full_features = world_size * local_features
+
+    # Replicate the global reference on each rank so expected peer slices can
+    # be computed without using the implementation under test.
+    x_global = torch.arange(
+        world_size * local_tokens * full_features,
+        dtype=dtype,
+        device=device,
+    ).reshape(world_size, local_tokens, full_features)
+    grad_head_global = torch.arange(
+        world_size * world_size * local_tokens * local_features,
+        dtype=dtype,
+        device=device,
+    ).reshape(world_size, world_size * local_tokens, local_features)
+
+    x = x_global[rank].clone().requires_grad_()
+    expected_head = torch.cat(
+        [
+            x_global[src, :, rank * local_features : (rank + 1) * local_features]
+            for src in range(world_size)
+        ],
+        dim=0,
+    )
+    expected_dx = torch.cat(
+        [
+            grad_head_global[dst].reshape(world_size, local_tokens, local_features)[
+                rank
+            ]
+            for dst in range(world_size)
+        ],
+        dim=-1,
+    )
+
+    to_head = te_ops.ContextParallelAllToAll(
+        process_group=process_group,
+        direction="sequence_to_head",
+    )
+    head = to_head(x)
+    head.backward(grad_head_global[rank])
+    torch.testing.assert_close(head, expected_head, rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, expected_dx, rtol=0, atol=0)
+
+    grad_sequence_global = torch.arange(
+        world_size * local_tokens * full_features,
+        dtype=dtype,
+        device=device,
+    ).reshape(world_size, local_tokens, full_features)
+    expected_dhead = torch.cat(
+        [
+            grad_sequence_global[src][
+                :, rank * local_features : (rank + 1) * local_features
+            ]
+            for src in range(world_size)
+        ],
+        dim=0,
+    )
+
+    head_input = expected_head.clone().requires_grad_()
+    to_sequence = te_ops.ContextParallelAllToAll(
+        process_group=process_group,
+        direction="head_to_sequence",
+    )
+    sequence = to_sequence(head_input)
+    sequence.backward(grad_sequence_global[rank])
+    torch.testing.assert_close(sequence, x_global[rank], rtol=0, atol=0)
+    torch.testing.assert_close(head_input.grad, expected_dhead, rtol=0, atol=0)
+
+
 def _test_basic_linear(
     *,
     local_weight_shape: tuple[int, int] = (32, 32),
@@ -978,6 +1057,9 @@ def run_parallel_tests() -> None:
     if rank == 0:
         print(f"Running _test_reduce_scatter")
     _test_reduce_scatter()
+    if rank == 0:
+        print("Running _test_context_parallel_all_to_all")
+    _test_context_parallel_all_to_all()
 
     # Basic linear op
     for config in itertools.product(

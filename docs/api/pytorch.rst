@@ -198,6 +198,8 @@ Operation fuser
 
 .. autoapiclass:: transformer_engine.pytorch.ops.ConstantScale
 
+.. autoapiclass:: transformer_engine.pytorch.ops.ContextParallelAllToAll
+
 .. autoapiclass:: transformer_engine.pytorch.ops.Dropout
 
 .. autoapiclass:: transformer_engine.pytorch.ops.GEGLU

@@ -567,3 +567,58 @@ forward/backward pair must be jointly equivalent.
 
     # Register joint fusion with operation fuser
     te.ops.register_forward_backward_fusion(fuse_linear_silu)
+Unfused context-parallel example
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``ContextParallelAllToAll`` is an example of the first step in adding a
+new fusion. It is a ``BasicOperation`` that defines the numerical and
+autograd contract using ordinary PyTorch collectives. There is intentionally
+no fused kernel or registered replacement yet, so the operation fuser runs
+the linear and all-to-all as separate operations.
+
+The basic operation uses flattened 2-D tensors. ``sequence_to_head`` maps
+``[local_tokens, full_features]`` to ``[global_tokens, local_features]`` and
+``head_to_sequence`` applies the inverse mapping. Attention-specific layout
+adapters, including dual-chunk or THD reordering, are outside this contract.
+All ranks must provide the same number of local token rows.
+
+.. code-block:: python
+
+    import transformer_engine.pytorch as te
+
+    # cp_group has P ranks. projection_features is divisible by P.
+    before_attention = te.ops.Sequential(
+        te.ops.BasicLinear(hidden_size, projection_features),
+        te.ops.ContextParallelAllToAll(
+            cp_group,
+            direction="sequence_to_head",
+        ),
+    )
+    after_attention = te.ops.Sequential(
+        te.ops.ContextParallelAllToAll(
+            cp_group,
+            direction="head_to_sequence",
+        ),
+        te.ops.BasicLinear(projection_features, hidden_size),
+    )
+
+    qkv_shard = before_attention(x)
+    attention_out = local_attention(qkv_shard)
+    out = after_attention(attention_out)
+
+On the first call, each ``Sequential`` groups its adjacent
+``FusibleOperation`` objects into an ``OperationFuser``. The fuser scans its
+registered replacement functions. Since no CP fusion is registered, it keeps
+the basic operations and executes their ``op_forward`` methods. Its custom
+autograd function later calls ``op_backward`` in reverse order; the all-to-all
+backward is the inverse layout exchange.
+
+A future optimized implementation would add two ``FusedOperation`` classes
+and registration functions that recognize these exact windows:
+
+* ``BasicLinear -> ContextParallelAllToAll(sequence_to_head)``
+* ``ContextParallelAllToAll(head_to_sequence) -> BasicLinear``
+
+The fused operation must produce the same outputs and gradients as the basic
+operations. The operation fuser only performs pattern replacement; it does not
+need to understand context-parallel semantics.
