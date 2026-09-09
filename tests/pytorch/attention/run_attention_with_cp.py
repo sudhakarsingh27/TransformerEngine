@@ -628,9 +628,10 @@ def run_dpa_with_cp(
     if benchmark_iters > 0:
         warmup_iters = 10
         start = None
+        q_b, k_b, v_b = [x.clone().detach().requires_grad_() for x in (q_, k_, v_)]
+        if bias_ is not None:
+            bias_.grad = None
         for iteration in range(warmup_iters + benchmark_iters):
-            q_b, k_b, v_b = [x.clone().detach().requires_grad_() for x in (q_, k_, v_)]
-            torch.cuda.synchronize()
             if iteration == warmup_iters:
                 torch.cuda.cudart().cudaProfilerStart()
                 start = time.perf_counter()
@@ -656,7 +657,10 @@ def run_dpa_with_cp(
                     else:
                         out_b.backward(dout_)
             torch.cuda.synchronize()
-            del out_b, q_b, k_b, v_b
+            q_b.grad = k_b.grad = v_b.grad = None
+            if bias_ is not None:
+                bias_.grad = None
+            del out_b
         elapsed_ms = (time.perf_counter() - start) * 1000 / benchmark_iters
         torch.cuda.cudart().cudaProfilerStop()
         print(
