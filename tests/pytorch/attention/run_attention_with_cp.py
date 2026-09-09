@@ -5,6 +5,7 @@
 import copy
 import os
 import sys
+import time
 import logging
 from contextlib import nullcontext
 import torch
@@ -54,6 +55,7 @@ def generate_input_shapes(
     kernel_backend: str,
     fa_pad_between_seqs: str = "False",
     load_balancing_strategy=CPLoadBalancingStrategy.DUAL_CHUNK_SWAP,
+    thd_seqlen_pattern: str = "random",
 ):
     if qkv_format == "bshd":
         q_input_shape = (
@@ -133,9 +135,14 @@ def generate_input_shapes(
                     dtype=torch.int32,
                 )
         else:
-            seqlens_q = torch.randint(0, config.max_seqlen_q + 1, [config.batch_size]).to(
-                torch.int32
-            )
+            if thd_seqlen_pattern == "max":
+                seqlens_q = torch.full([config.batch_size], config.max_seqlen_q, dtype=torch.int32)
+            elif thd_seqlen_pattern == "random":
+                seqlens_q = torch.randint(
+                    0, config.max_seqlen_q + 1, [config.batch_size], dtype=torch.int32
+                )
+            else:
+                raise ValueError(f"Unsupported THD sequence-length pattern: {thd_seqlen_pattern}")
             seqlens_q_padded = (
                 (seqlens_q + 2 * world_size - 1) // (world_size * 2) * (world_size * 2)
             )
@@ -234,10 +241,15 @@ def run_dpa_with_cp(
     fa_pad_between_seqs="False",
     deterministic="False",
     load_balancing_strategy="DUAL_CHUNK_SWAP",
+    benchmark="0",
+    thd_seqlen_pattern="random",
     log_level=logging.WARNING,
 ):
     """Test DotProductAttention module with context parallelism"""
     logging.root.setLevel(log_level)
+    benchmark_iters = int(benchmark)
+    if benchmark_iters < 0:
+        raise ValueError("benchmark must be non-negative")
     load_balancing_strategy = CPLoadBalancingStrategy[load_balancing_strategy]
     # When is_training is False, gradient outputs are None.
     is_training = is_training == "True"
@@ -367,6 +379,7 @@ def run_dpa_with_cp(
         kernel_backend,
         fa_pad_between_seqs,
         load_balancing_strategy,
+        thd_seqlen_pattern,
     )
     q_orig = torch.clamp(torch.randn(q_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     k_orig = torch.clamp(torch.randn(k_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
@@ -611,6 +624,46 @@ def run_dpa_with_cp(
     else:
         dq_, dk_, dv_, dbias_ = None, None, None, None
         d_softmax_offset_ = None
+
+    if benchmark_iters > 0:
+        warmup_iters = 10
+        start = None
+        for iteration in range(warmup_iters + benchmark_iters):
+            q_b, k_b, v_b = [x.clone().detach().requires_grad_() for x in (q_, k_, v_)]
+            torch.cuda.synchronize()
+            if iteration == warmup_iters:
+                torch.cuda.cudart().cudaProfilerStart()
+                start = time.perf_counter()
+            with fp8_context:
+                out_b = core_attn(
+                    q_b,
+                    k_b,
+                    v_b,
+                    core_attention_bias_type=config.attn_bias_type,
+                    core_attention_bias=bias_,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_kv,
+                    cu_seqlens_q_padded=cu_seqlens_q_padded,
+                    cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+                    pad_between_seqs=pad_between_seqs,
+                    fp8_output=fp8_mha,
+                )
+                if isinstance(out_b, tuple):
+                    out_b = out_b[0]
+                if is_training:
+                    if fp8_bwd and fp8_mha:
+                        out_b.backward(dout_quantizer(dout_))
+                    else:
+                        out_b.backward(dout_)
+            torch.cuda.synchronize()
+            del out_b, q_b, k_b, v_b
+        elapsed_ms = (time.perf_counter() - start) * 1000 / benchmark_iters
+        torch.cuda.cudart().cudaProfilerStop()
+        print(
+            f"[Rank {rank}] {cp_comm_type} {qkv_format} {dtype}: {elapsed_ms:.2f} ms/iter"
+            f" ({benchmark_iters} iters)",
+            flush=True,
+        )
 
     # get outputs
     tensors = [out, dq, dk, dv, dbias, out_, dq_, dk_, dv_, dbias_]
