@@ -67,6 +67,24 @@ python -m torch.distributed.launch --nproc-per-node=8 \
 | `is_training` | `True` | Run backward pass |
 | `deterministic` | `False` | Force deterministic cuDNN algorithms |
 
+### Memory probe
+
+Set both `NVTE_CP_BENCH_ONLY=1` and `NVTE_CP_MEMORY_PROBE=1` on a normal
+benchmark command to print rank-local `CP_MEMORY` JSON records for setup, input
+cloning, forward, and backward. The probe measures the first warmup iteration;
+the remaining warmup and measured iterations retain their existing behavior.
+If allocation fails, the final `status=start` record identifies the OOM phase.
+
+```bash
+NVTE_CP_BENCH_ONLY=1 NVTE_CP_MEMORY_PROBE=1 \
+NVTE_DPA_FP8CS_O_in_F16=1 NVTE_FP8_DPA_BWD=1 \
+torchrun --standalone --nproc-per-node=2 run_attention_with_cp.py worker \
+    dtype=fp8 model=uniform_64x8k qkv_format=thd \
+    kernel_backend=FusedAttention cp_comm_type=all_gather \
+    fp8_dpa=True fp8_mha=False fp8_bwd=True scaling_mode=current \
+    f16_O=True benchmark=1 thd_seqlen_pattern=max
+```
+
 ## Available Configs
 
 Configs are defined in `benchmark_cp.py` and auto-merged into the runner's config dict.

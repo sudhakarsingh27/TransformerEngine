@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 
 import copy
+import json
 import os
 import sys
 import time
@@ -56,6 +57,37 @@ _pool_cp_comm_group = None
 _pool_cp_comm_sub_groups: list = []
 
 dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp8": torch.bfloat16}
+
+
+def _memory_stage_start(stage, rank, iteration=None):
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+    torch.cuda.reset_peak_memory_stats()
+    record = {"rank": rank, "stage": stage, "status": "start"}
+    if iteration is not None:
+        record["iteration"] = iteration
+    print("CP_MEMORY " + json.dumps(record, sort_keys=True), flush=True)
+    return baseline
+
+
+def _memory_stage_report(stage, baseline, rank, iteration=None):
+    torch.cuda.synchronize()
+    allocated, reserved = baseline
+    mib = 1024**2
+    record = {
+        "allocated_mib": torch.cuda.memory_allocated() / mib,
+        "peak_allocated_delta_mib": (torch.cuda.max_memory_allocated() - allocated) / mib,
+        "peak_allocated_mib": torch.cuda.max_memory_allocated() / mib,
+        "peak_reserved_delta_mib": (torch.cuda.max_memory_reserved() - reserved) / mib,
+        "peak_reserved_mib": torch.cuda.max_memory_reserved() / mib,
+        "rank": rank,
+        "reserved_mib": torch.cuda.memory_reserved() / mib,
+        "stage": stage,
+        "status": "ok",
+    }
+    if iteration is not None:
+        record["iteration"] = iteration
+    print("CP_MEMORY " + json.dumps(record, sort_keys=True), flush=True)
 
 
 def generate_input_shapes(
@@ -278,8 +310,11 @@ def run_dpa_with_cp(
     logging.root.setLevel(log_level)
     benchmark_iters = int(benchmark)
     cp_bench_only = os.getenv("NVTE_CP_BENCH_ONLY", "0") == "1"
+    memory_probe = os.getenv("NVTE_CP_MEMORY_PROBE", "0") == "1"
     if cp_bench_only and benchmark_iters <= 0:
         raise ValueError("NVTE_CP_BENCH_ONLY requires benchmark > 0")
+    if memory_probe and not cp_bench_only:
+        raise ValueError("NVTE_CP_MEMORY_PROBE requires NVTE_CP_BENCH_ONLY=1")
     if cp_bench_only and int(os.getenv("RANK", "0")) == 0:
         print("CP_BENCH_ONLY correctness_paths=skipped inputs=rank_local", flush=True)
     load_balancing_strategy = CPLoadBalancingStrategy[load_balancing_strategy]
@@ -344,6 +379,7 @@ def run_dpa_with_cp(
     logging.info(f"[Rank {rank}] Setup: world_size {world_size}")
     if not _pool_managed_pg:
         dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+    memory_setup_baseline = _memory_stage_start("setup", rank) if memory_probe else None
 
     # Set up communication group for CP. In pool mode, the pool worker has
     # already pre-created world-scoped and a2a+p2p sub-groups once and stashed
@@ -735,12 +771,23 @@ def run_dpa_with_cp(
     if benchmark_iters > 0:
         warmup = 10
         start = None
+        if memory_probe:
+            _memory_stage_report("setup", memory_setup_baseline, rank)
         for iteration in range(warmup + benchmark_iters):
+            measure_memory = memory_probe and iteration == 0
+            memory_baseline = (
+                _memory_stage_start("input_clone", rank, iteration) if measure_memory else None
+            )
             q_b, k_b, v_b = [x.clone().detach().requires_grad_() for x in (q_, k_, v_)]
+            if measure_memory:
+                _memory_stage_report("input_clone", memory_baseline, rank, iteration)
             torch.cuda.synchronize()
             if iteration == warmup:
                 torch.cuda.cudart().cudaProfilerStart()
                 start = time.perf_counter()
+            memory_baseline = (
+                _memory_stage_start("forward", rank, iteration) if measure_memory else None
+            )
             with fp8_context:
                 out_b = core_attn(
                     q_b,
@@ -757,11 +804,18 @@ def run_dpa_with_cp(
                 )
                 if isinstance(out_b, tuple):
                     out_b = out_b[0]
+                if measure_memory:
+                    _memory_stage_report("forward", memory_baseline, rank, iteration)
                 if is_training:
+                    memory_baseline = (
+                        _memory_stage_start("backward", rank, iteration) if measure_memory else None
+                    )
                     if fp8_bwd and fp8_mha:
                         out_b.backward(dout_quantizer(dout_))
                     else:
                         out_b.backward(dout_)
+                    if measure_memory:
+                        _memory_stage_report("backward", memory_baseline, rank, iteration)
             torch.cuda.synchronize()
             del out_b, q_b, k_b, v_b
         elapsed_ms = (time.perf_counter() - start) * 1000 / benchmark_iters
