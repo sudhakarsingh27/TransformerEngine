@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import contextlib
 import functools
 import os
 import math
@@ -23,6 +24,7 @@ import transformer_engine.pytorch.ops.fused.grouped_mlp as grouped_mlp_module
 from transformer_engine.pytorch.ops.fused.grouped_mlp import (
     _cudnn_frontend_supports_grouped_gemm_situglu,
     _cudnn_frontend_supports_grouped_gemm_srelu,
+    _cudnn_frontend_version_at_least,
     _cudnn_frontend_version_supported,
 )
 from transformer_engine.pytorch.ops.basic.grouped_linear import (
@@ -39,6 +41,7 @@ from transformer_engine.pytorch import (
     QuantizerRole,
     is_bf16_available,
 )
+from transformer_engine.pytorch.utils import get_device_compute_capability
 import transformer_engine_torch as tex
 
 # Import utility functions
@@ -56,6 +59,11 @@ from utils import (
 fp8_available, reason_for_no_fp8 = te.is_fp8_available(return_reason=True)
 mxfp8_available, reason_for_no_mxfp8 = te.is_mxfp8_available(return_reason=True)
 nvfp4_available, reason_for_no_nvfp4 = te.is_nvfp4_available(return_reason=True)
+
+# Device arch
+device_arch = get_device_compute_capability()
+device_is_blackwell = device_arch[0] == 10 and device_arch[1] < 7
+device_is_rubin = device_arch[0] == 10 and device_arch[1] == 7
 
 # Soft-clamp scale for ScaledTanhSReLU coverage. Deliberately small relative to the
 # FC1 outputs these tests produce, so tanh actually saturates -- a large scale would
@@ -1067,6 +1075,46 @@ class TestGroupedLinearOp:
 class TestGroupedMLPFusedOp:
     """Tests for grouped MLP fused op"""
 
+    def test_fusion_requires_supported_grad_output_format(self, monkeypatch) -> None:
+        """Fuse E4M3 MXFP8 and NVFP4, but decline MXFP8 with an E5M2 backward."""
+        from transformer_engine.common.recipe import Format, MXFP8BlockScaling, NVFP4BlockScaling
+
+        # Skip invalid configurations
+        maybe_skip_quantization("mxfp8")
+        maybe_skip_quantization("nvfp4")
+
+        fused_op_cls = grouped_mlp_module.GroupedMLP_CuTeGEMMGLU
+        monkeypatch.setattr(fused_op_cls, "is_supported", classmethod(lambda cls: True))
+
+        fc1 = te.ops.GroupedLinear(1, 64, 128, bias=False, device="cuda")
+        activation = te.ops.ScaledSwiGLU(glu_interleave_size=32)
+        fc2 = te.ops.GroupedLinear(1, 64, 64, bias=False, device="cuda")
+        ops = [fc1, activation, fc2]
+
+        def fuse(recipe):
+            return grouped_mlp_module.fuse_glu_ops(ops, recipe=recipe)
+
+        def assert_fused(recipe):
+            fused_ops = fuse(recipe)
+            assert len(fused_ops) == 1
+            fused_op = fused_ops[0]
+            assert isinstance(fused_op, fused_op_cls)
+            assert list(fused_op.basic_ops) == ops
+
+        hybrid = MXFP8BlockScaling(fp8_format=Format.HYBRID)
+        assert fuse(hybrid) is ops
+
+        e4m3 = MXFP8BlockScaling(fp8_format=Format.E4M3)
+        assert_fused(e4m3)
+
+        # NVFP4 quantizes gradients to FP4, so the FP8 format must not gate it. Forcing the
+        # lookup to E5M2 is what an NVFP4 recipe would hit if the check were not MXFP8-only.
+        monkeypatch.setattr(
+            grouped_mlp_module, "get_fp8_torch_dtype", lambda *_, **__: torch.float8_e5m2
+        )
+        nvfp4 = NVFP4BlockScaling(disable_rht=False)
+        assert_fused(nvfp4)
+
     @pytest.mark.parametrize("bias", (False, True))
     @pytest.mark.parametrize("quantization", _grouped_mlp_quantization_list)
     @pytest.mark.parametrize("single_grouped_weight", (False, True))
@@ -1427,20 +1475,39 @@ class TestGroupedMLPFusedOp:
             fc2.backward_dw()
 
         # Check for expected fusions
-        if activation == "scaled_situglu":
+        if activation == "scaled_swiglu":
+            cudnn_frontend_supports_grouped_mlp = _cudnn_frontend_version_supported() and (
+                device_is_blackwell or device_is_rubin
+            )
+        elif activation in ("scaled_clamped_qgeglu", "scaled_clamped_qgeglu_custom"):
+            cudnn_frontend_supports_grouped_mlp = _cudnn_frontend_version_supported()
+            if device_is_blackwell:
+                pass
+            elif device_is_rubin:
+                if not _cudnn_frontend_version_at_least("1.30.0"):
+                    cudnn_frontend_supports_grouped_mlp = False
+            else:
+                cudnn_frontend_supports_grouped_mlp = False
+        elif activation == "scaled_situglu":
             cudnn_frontend_supports_grouped_mlp = (
                 grouped_mlp_module._cudnn_frontend_supports_grouped_gemm_situglu()
+                and device_is_blackwell
             )
         elif activation == "scaled_srelu":
-            cudnn_frontend_supports_grouped_mlp = _cudnn_frontend_supports_grouped_gemm_srelu()
+            cudnn_frontend_supports_grouped_mlp = (
+                _cudnn_frontend_supports_grouped_gemm_srelu()
+                and (device_is_blackwell or device_is_rubin)
+            )
         elif activation == "scaled_tanh_srelu":
             # Needs both the base srelu kernels and the tanh_clamp_scale parameter.
             cudnn_frontend_supports_grouped_mlp = (
                 _cudnn_frontend_supports_grouped_gemm_srelu()
                 and grouped_mlp_module._cudnn_frontend_supports_grouped_gemm_srelu_tanh()
+                and (device_is_blackwell or device_is_rubin)
             )
         else:
-            cudnn_frontend_supports_grouped_mlp = _cudnn_frontend_version_supported()
+            raise ValueError(f"Unexpected grouped MLP activation ({activation})")
+
         expected_grouped_mlp_fusion = cudnn_frontend_supports_grouped_mlp and (
             (
                 quantization == "mxfp8"
@@ -1616,6 +1683,8 @@ class TestGroupedMLPFusedOp:
         """Real cuDNN MXFP8 GLU wrappers execute with TE's generated argument dtypes."""
         if not _cudnn_frontend_supports_grouped_gemm_situglu():
             pytest.skip("Installed cuDNN frontend lacks grouped SiTU-GLU")
+        if not device_is_blackwell:
+            pytest.skip("cuDNN frontend only supports SiTU-GLU on Blackwell")
         fused_cls = te.ops.fused.GroupedMLP_CuTeGEMMGLU
         assert fused_cls.is_supported()
         # FC2 bias-gradient accumulation uses an atomic Triton reduction.
@@ -1681,6 +1750,8 @@ class TestGroupedMLPFusedOp:
         """NVFP4 SiTU uses cuDNN's fused GLU-Hadamard forward when available."""
         if not _cudnn_frontend_supports_grouped_gemm_situglu():
             pytest.skip("Installed cuDNN frontend lacks grouped SiTU-GLU")
+        if not device_is_blackwell:
+            pytest.skip("cuDNN frontend only supports SiTU-GLU on Blackwell")
         assert te.ops.fused.GroupedMLP_CuTeGEMMGLU.is_supported()
         # FC2 bias-gradient accumulation uses an atomic Triton reduction.
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
@@ -2097,6 +2168,14 @@ class TestGroupedMLPFusedOp:
             pytest.skip("single_grouped_weight requires NVTE_GROUPED_LINEAR_SINGLE_PARAM=1")
         if not te.ops.fused.GroupedMLP_CuTeGEMMGLU.is_supported():
             pytest.skip("MXFP8 fused grouped MLP is not supported on this system")
+        if activation == "scaled_clamped_qgeglu":
+            if device_is_blackwell:
+                pass
+            elif device_is_rubin:
+                if not _cudnn_frontend_version_at_least("1.30.0"):
+                    pytest.skip("Rubin kernel requires cuDNN Frontend 1.30.0+ for QGEGLU support")
+            else:
+                pytest.skip("cuDNN Frontend does not support QGEGLU on this device")
 
         split_sizes = [split_alignment * (i + 1) for i in range(group_size)]
         random.shuffle(split_sizes)
@@ -2552,6 +2631,14 @@ class TestGroupedMLPFusedOp:
             pytest.skip("MXFP8 fused grouped MLP is not supported on this system")
         if dtype not in (torch.bfloat16, torch.float16):
             pytest.skip("MXFP8 fused grouped MLP is only supported with BF16/FP16")
+        if activation == "scaled_clamped_qgeglu":
+            if device_is_blackwell:
+                pass
+            elif device_is_rubin:
+                if not _cudnn_frontend_version_at_least("1.30.0"):
+                    pytest.skip("Rubin kernel requires cuDNN Frontend 1.30.0+ for QGEGLU support")
+            else:
+                pytest.skip("cuDNN Frontend does not support QGEGLU on this device")
 
         split_sizes = [split_alignment * (i + 1) for i in range(group_size)]
         random.shuffle(split_sizes)
@@ -2803,6 +2890,194 @@ class TestGroupedMLPFusedOp:
         else:
             for graph_grad, param in zip(graph_param_grads, reference_module.parameters()):
                 assert_close(graph_grad, param.grad, **tols)
+
+
+class TestGroupedMLPDeterminism:
+    """Determinism coverage for the CuTe DSL fused grouped MLP.
+
+    Only the dSReLU wrapper can make ``dprob`` bit-exact, and only from cuDNN FE 1.28.0 on.
+    Anything else must refuse a determinism request rather than run non-deterministically.
+    """
+
+    @pytest.fixture
+    def _restore_torch_determinism(self):
+        """``use_deterministic_algorithms`` is process-global, so put it back."""
+        previous = torch.are_deterministic_algorithms_enabled()
+        yield
+        torch.use_deterministic_algorithms(previous)
+
+    @pytest.mark.parametrize(
+        "allow_nondeterministic,torch_flag,expected",
+        (
+            (None, False, False),  # default: non-deterministic algorithms are allowed
+            ("1", False, False),
+            ("0", False, True),  # the TE variable alone
+            (None, True, True),  # the torch flag alone, which TE must not ignore
+            ("1", True, True),  # ... including when the TE variable says otherwise
+            ("0", True, True),
+        ),
+    )
+    def test_either_knob_requests_determinism(
+        self,
+        monkeypatch,
+        _restore_torch_determinism,
+        *,
+        allow_nondeterministic: Optional[str],
+        torch_flag: bool,
+        expected: bool,
+    ) -> None:
+        """``=1`` is the absence of a request, not a request for non-determinism."""
+        if allow_nondeterministic is None:
+            monkeypatch.delenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", raising=False)
+        else:
+            monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", allow_nondeterministic)
+        torch.use_deterministic_algorithms(torch_flag)
+        assert grouped_mlp_module._deterministic_algorithms_required() is expected
+
+    def test_only_the_srelu_path_can_be_deterministic(self) -> None:
+        """The capability belongs to the wrapper, not the environment. Needs no GPU."""
+        glu = grouped_mlp_module.GroupedMLP_CuTeGEMMGLU
+        unary = grouped_mlp_module.GroupedMLP_CuTeGEMMUnary
+        assert glu.grouped_gemm_dactivation_is_deterministic() is False
+        assert isinstance(unary.grouped_gemm_dactivation_is_deterministic(), bool)
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    @pytest.mark.parametrize(
+        "activation,fused_cls",
+        (
+            ("scaled_srelu", grouped_mlp_module.GroupedMLP_CuTeGEMMUnary),
+            ("scaled_swiglu", grouped_mlp_module.GroupedMLP_CuTeGEMMGLU),
+        ),
+    )
+    def test_determinism_either_runs_or_refuses(
+        self, monkeypatch, *, activation, fused_cls
+    ) -> None:
+        """A request TE cannot honor must fail loudly; one it can must still be correct."""
+        if not fused_cls.is_supported():
+            pytest.skip("MXFP8 fused grouped MLP is not supported on this system")
+
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        expectation = (
+            contextlib.nullcontext()
+            if fused_cls.grouped_gemm_dactivation_is_deterministic()
+            else pytest.raises(RuntimeError, match="dprob")
+        )
+        with expectation:
+            TestGroupedMLPFusedOp().test_grouped_mlp(
+                bias=False,
+                hidden_size=128,
+                quantization="mxfp8",
+                single_grouped_weight=False,
+                activation=activation,
+            )
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_scale_bias_refuses_under_the_torch_flag(
+        self, monkeypatch, _restore_torch_determinism
+    ) -> None:
+        """``scale_bias`` finishes ``dprob`` in a Triton kernel that reads only the env var.
+
+        So the torch flag alone is the combination that used to pass this op's own check and
+        then reduce nondeterministically anyway, on a front-end new enough to say yes.
+        """
+        fused_cls = grouped_mlp_module.GroupedMLP_CuTeGEMMUnary
+        if not fused_cls.is_supported():
+            pytest.skip("MXFP8 fused grouped MLP is not supported on this system")
+
+        monkeypatch.delenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", raising=False)
+        # warn_only so torch's own enforcement cannot raise first and mask what TE does.
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        with pytest.raises(RuntimeError, match="dprob"):
+            TestGroupedMLPFusedOp().test_grouped_mlp(
+                bias=True,
+                hidden_size=128,
+                quantization="mxfp8",
+                single_grouped_weight=False,
+                activation="scaled_srelu",
+            )
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_dprob_is_bit_exact_across_runs(self, monkeypatch) -> None:
+        """Repeated identical runs must give a bit-identical ``dprob``.
+
+        An ulp of reordering passes every tolerance in this file, so only an exact
+        comparison across runs can see it.
+        """
+        fused_cls = grouped_mlp_module.GroupedMLP_CuTeGEMMUnary
+        if not fused_cls.is_supported():
+            pytest.skip("MXFP8 fused grouped MLP is not supported on this system")
+        if not fused_cls.grouped_gemm_dactivation_is_deterministic():
+            pytest.skip("dSReLU determinism needs cuDNN frontend 1.28.0 or later")
+
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        # Measured on GB300, determinism off, 8 launches per shape (job 538058): this shape
+        # gives 7/7 runs differing from run 0, so the assertion below can actually fail.
+        # Shapes matter more than they look -- l=8 with the same n and tokens/group varies
+        # only 2/7, which an 8-run sample reports as stable often enough to be useless, and
+        # cudnn-frontend#521 measured its own l=4 / [256]*4 / n=512 as never varying.
+        group_size = 16
+        hidden_size = 2048
+        tokens_per_group = 1024
+        split_sizes = torch.tensor([tokens_per_group] * group_size, dtype=torch.int, device=device)
+        num_tokens = tokens_per_group * group_size
+
+        recipe = make_recipe("mxfp8")
+
+        # Plain random tensors, not make_reference_and_test_tensors: this test compares two
+        # runs against each other, never against a reference, so the fp64 companion and the
+        # MXFP8 representability round-trip would both be allocated and thrown away.
+        def _rand(*shape, requires_grad=True) -> torch.Tensor:
+            out = torch.empty(shape, dtype=dtype, device=device).uniform_(-0.25, 0.25)
+            return out.requires_grad_() if requires_grad else out
+
+        x = _rand(num_tokens, hidden_size)
+        dy = _rand(num_tokens, hidden_size, requires_grad=False)
+        probs = _rand(num_tokens)
+
+        # No bias, or probs.grad comes from the Triton dbias kernel instead of cuDNN.
+        with te.quantized_model_init(enabled=True, recipe=recipe):
+            module = te.ops.Sequential(
+                te.ops.GroupedLinear(
+                    group_size, hidden_size, hidden_size, bias=False, device=device, dtype=dtype
+                ),
+                te.ops.ScaledSReLU(),
+                te.ops.GroupedLinear(
+                    group_size, hidden_size, hidden_size, bias=False, device=device, dtype=dtype
+                ),
+            )
+
+        def _run() -> torch.Tensor:
+            x.grad = None
+            probs.grad = None
+            with te.autocast(enabled=True, recipe=recipe):
+                y = module(x, split_sizes, probs, split_sizes)
+            y.backward(dy)
+            return probs.grad.detach().clone()
+
+        runs = [_run()]
+        # Without the fusion there is no cuDNN dprob and the comparison proves nothing.
+        forward_ops = module._module_groups[0]._forward_ops
+        assert len(forward_ops) == 1
+        assert isinstance(forward_ops[0][0], fused_cls)
+        # More than two, as cudnn-frontend#521 does: the cross-CTA order that determinism
+        # removes is set by the scheduler, so two runs can agree by luck.
+        runs += [_run() for _ in range(int(os.getenv("NVTE_TEST_DETERMINISM_REPEATS", "4")) - 1)]
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(runs[0]).all(), "dprob is not finite; the comparison would be moot"
+        # Bytes, not values: torch.equal calls +0.0 and -0.0 equal, and a change in reduction
+        # order can produce exactly that. Weight grads are excluded from the comparison --
+        # the CuTe DSL wgrad kernel has its own K-split atomics, which this change leaves.
+        for index, later in enumerate(runs[1:], start=1):
+            assert torch.equal(
+                runs[0].contiguous().view(torch.uint8), later.contiguous().view(torch.uint8)
+            ), (
+                f"dprob differs between run 0 and run {index} under determinism; max |delta| ="
+                f" {(runs[0].float() - later.float()).abs().max().item()}"
+            )
 
 
 def test_grouped_gemm_quant_cute_matches_mxfp8_quantized() -> None:
