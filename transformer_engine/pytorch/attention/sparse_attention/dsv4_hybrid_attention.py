@@ -49,6 +49,7 @@ class DSv4HybridAttention(torch.nn.Module):
         index_topk: int = 512,
         rope_theta: float = 160000.0,
         rope: Optional[torch.nn.Module] = None,
+        fused_rope: bool = False,
         rms_norm_eps: float = 1e-6,
         max_seqlen: Optional[int] = None,
         device: str = "cuda",
@@ -60,7 +61,10 @@ class DSv4HybridAttention(torch.nn.Module):
         # Keep the current kernel geometry explicit without exposing untested sizes.
         self.num_heads = 64
         self.index_head_dim = 128
-        if layer_type not in ("compressed_sparse_attention", "heavily_compressed_attention"):
+        if layer_type not in (
+            "compressed_sparse_attention",
+            "heavily_compressed_attention",
+        ):
             raise ValueError("Only DSv4 CSA and HCA are supported.")
         if input_format not in ("sbd", "bsd"):
             raise ValueError("input_format must be 'sbd' or 'bsd'.")
@@ -146,6 +150,10 @@ class DSv4HybridAttention(torch.nn.Module):
                 compression_ratio, rope_head_dim, rope_theta, device, max_seqlen
             )
         )
+        # Preserve the existing path by default until the extra fused launches are benchmarked.
+        if fused_rope and not callable(getattr(self.rope, "angles", None)):
+            raise ValueError("Fused RoPE requires rope.angles(seq, device).")
+        self.fused_rope = fused_rope
         self.hidden_size, self.q_lora_rank = hidden_size, q_lora_rank
         self.fused_projections = _fuse_projections
         self.head_dim, self.rope_head_dim = head_dim, rope_head_dim
@@ -175,7 +183,11 @@ class DSv4HybridAttention(torch.nn.Module):
         cu = torch.arange(batch + 1, device=hidden_states.device, dtype=torch.int32) * seq
         cu_comp = torch.arange(batch + 1, device=hidden_states.device, dtype=torch.int32) * n_comp
 
-        token_rope, compressed_rope = self.rope(seq, hidden_states.device)
+        token_rope, compressed_rope = (
+            self.rope.angles(seq, hidden_states.device)
+            if self.fused_rope
+            else self.rope(seq, hidden_states.device)
+        )
 
         if self.fused_projections:
             q_a, local_kv_projected = self.q_a_kv_proj(hidden_states).split(
@@ -189,15 +201,20 @@ class DSv4HybridAttention(torch.nn.Module):
         # Query-up norm is unweighted; TE RMSNorm would add a learned scale.
         q = torch.nn.functional.rms_norm(q, (self.head_dim,), eps=self.rms_norm_eps)
         q = (
-            apply_rotary(q, *token_rope)
+            apply_rotary(q, token_rope, fused=self.fused_rope)
             .reshape(batch * seq, self.num_heads, self.head_dim)
             .contiguous()
         )
-        local_kv = apply_rotary(self.kv_norm(local_kv_projected).unsqueeze(2), *token_rope)
+        local_kv = apply_rotary(
+            self.kv_norm(local_kv_projected).unsqueeze(2),
+            token_rope,
+            fused=self.fused_rope,
+        )
         local_kv = local_kv.reshape(batch * seq, self.head_dim).contiguous()
         compressed_kv = apply_rotary(
             self.compressor(hidden_states, cu, cu_comp).reshape(batch, n_comp, 1, self.head_dim),
-            *compressed_rope,
+            compressed_rope,
+            fused=self.fused_rope,
         )
         compressed_kv = compressed_kv.reshape(batch * n_comp, self.head_dim).contiguous()
 
@@ -213,6 +230,7 @@ class DSv4HybridAttention(torch.nn.Module):
                 cu_comp,
                 token_rope,
                 compressed_rope,
+                fused_rope=self.fused_rope,
                 return_context=return_indexer_context,
             )
             if return_indexer_context:
@@ -230,8 +248,10 @@ class DSv4HybridAttention(torch.nn.Module):
             indices=indices,
             max_compressed_seqlen=None if self.is_csa else n_comp,
         ).reshape(batch, seq, self.num_heads, self.head_dim)
-        cos, sin = token_rope
-        output = apply_rotary(output, cos, -sin).reshape(batch, seq, self.o_groups, -1)
+        inverse_rope = -token_rope if self.fused_rope else (token_rope[0], -token_rope[1])
+        output = apply_rotary(output, inverse_rope, fused=self.fused_rope).reshape(
+            batch, seq, self.o_groups, -1
+        )
         weight = self.o_a_proj.weight.reshape(self.o_groups, self.o_lora_rank, -1)
         grouped = torch.einsum("bsgd,grd->bsgr", output, weight).flatten(2)
         result = self.o_b_proj(grouped)

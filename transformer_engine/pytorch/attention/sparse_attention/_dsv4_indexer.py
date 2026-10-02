@@ -58,6 +58,7 @@ class _Indexer(torch.nn.Module):
         token_rope,
         compressed_rope,
         *,
+        fused_rope=False,
         return_context=False,
     ):
         """Select compressed rows and optionally expose live tensors for the indexer loss."""
@@ -71,14 +72,16 @@ class _Indexer(torch.nn.Module):
         # The singleton axis is the shared index-key head, not a tunable head count.
         key = (
             apply_rotary(
-                index_compressed.reshape(batch, n_comp, 1, self.head_dim), *compressed_rope
+                index_compressed.reshape(batch, n_comp, 1, self.head_dim),
+                compressed_rope,
+                fused=fused_rope,
             )
             .reshape(batch * n_comp, self.head_dim)
             .contiguous()
         )
         query = self.q_proj(q_residual).reshape(batch, seq, self.n_heads, self.head_dim)
         query = (
-            apply_rotary(query, *token_rope)
+            apply_rotary(query, token_rope, fused=fused_rope)
             .reshape(batch * seq, self.n_heads, self.head_dim)
             .contiguous()
         )

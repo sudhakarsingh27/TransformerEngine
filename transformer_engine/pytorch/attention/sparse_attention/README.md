@@ -27,6 +27,11 @@ SBD ── TE query/local-KV projections + norms ──────────�
 The high-level layer uses 64 heads of width 512 and defaults to plain interleaved
 partial RoPE with `rope_theta`; callers may inject a `rope` module returning token
 and compressed `(cos, sin)` pairs.
+`fused_rope=True` reuses MHA/GQA's fused RoPE CUDA kernel. The `rope` module must
+also implement `angles(seq, device)`, returning FP32 interleaved token angles
+`[S,1,1,R]` and contiguous window-start angles `[S/ratio,1,1,R]`.
+This lets a caller supply YaRN or another angle policy without changing the kernel;
+DSv4 uses unit-magnitude rotation, so angle tables do not encode an amplitude scale.
 Use `input_format="bsd"` for batch-major callers. The SBD boundary conversion
 is a view when batch size is one; larger batches require a repack for the current
 cuDNN packed-row contract.
