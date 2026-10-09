@@ -265,8 +265,8 @@ def run_dpa_with_cp(
     if benchmark_iters > 0 and not benchmark_only:
         raise ValueError("benchmark requires NVTE_CP_BENCH_ONLY=1")
     if benchmark_only:
-        if benchmark_iters != 5:
-            raise ValueError("NVTE_CP_BENCH_ONLY requires benchmark=5")
+        if benchmark_iters <= 0:
+            raise ValueError("NVTE_CP_BENCH_ONLY requires a positive benchmark iteration count")
         if model not in model_configs_cp_benchmark:
             raise ValueError(
                 "NVTE_CP_BENCH_ONLY requires a fixed-token benchmark model"
