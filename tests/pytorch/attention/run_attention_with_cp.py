@@ -22,6 +22,10 @@ from test_attention_with_cp import (
     model_configs_flash_attn,
     model_configs_fused_attn,
 )
+from benchmark_cp import (
+    model_configs as model_configs_cp_benchmark,
+    run_fixed_token_benchmark,
+)
 from transformer_engine.pytorch import (
     autocast,
     CPLoadBalancingStrategy,
@@ -57,6 +61,7 @@ def generate_input_shapes(
     kernel_backend: str,
     fa_pad_between_seqs: str = "False",
     load_balancing_strategy=CPLoadBalancingStrategy.DUAL_CHUNK_SWAP,
+    thd_seqlen_pattern: str = "random",
 ):
     if qkv_format == "bshd":
         q_input_shape = (
@@ -136,9 +141,18 @@ def generate_input_shapes(
                     dtype=torch.int32,
                 )
         else:
-            seqlens_q = torch.randint(0, config.max_seqlen_q + 1, [config.batch_size]).to(
-                torch.int32
-            )
+            if thd_seqlen_pattern == "max":
+                seqlens_q = torch.full(
+                    [config.batch_size], config.max_seqlen_q, dtype=torch.int32
+                )
+            elif thd_seqlen_pattern == "random":
+                seqlens_q = torch.randint(
+                    0, config.max_seqlen_q + 1, [config.batch_size], dtype=torch.int32
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported THD sequence-length pattern: {thd_seqlen_pattern}"
+                )
             seqlens_q_padded = (
                 (seqlens_q + 2 * world_size - 1) // (world_size * 2) * (world_size * 2)
             )
@@ -238,10 +252,35 @@ def run_dpa_with_cp(
     deterministic="False",
     load_balancing_strategy="DUAL_CHUNK_SWAP",
     softcap="0.0",
+    benchmark="0",
+    thd_seqlen_pattern="random",
     log_level=logging.WARNING,
 ):
     """Test DotProductAttention module with context parallelism"""
     logging.root.setLevel(log_level)
+    benchmark_iters = int(benchmark)
+    benchmark_only = os.getenv("NVTE_CP_BENCH_ONLY", "0") == "1"
+    if benchmark_iters < 0:
+        raise ValueError("benchmark must be non-negative")
+    if benchmark_iters > 0 and not benchmark_only:
+        raise ValueError("benchmark requires NVTE_CP_BENCH_ONLY=1")
+    if benchmark_only:
+        if benchmark_iters != 5:
+            raise ValueError("NVTE_CP_BENCH_ONLY requires benchmark=5")
+        if model not in model_configs_cp_benchmark:
+            raise ValueError(
+                "NVTE_CP_BENCH_ONLY requires a fixed-token benchmark model"
+            )
+        if dtype != "bf16" or qkv_format != "thd" or is_training != "True":
+            raise ValueError("NVTE_CP_BENCH_ONLY requires BF16 THD training")
+        if thd_seqlen_pattern != "max":
+            raise ValueError("NVTE_CP_BENCH_ONLY requires thd_seqlen_pattern=max")
+        if kernel_backend not in ("FusedAttention", "FlashAttention"):
+            raise ValueError(
+                "NVTE_CP_BENCH_ONLY requires FusedAttention or FlashAttention"
+            )
+        if cp_comm_type not in ("p2p", "all_gather", "a2a"):
+            raise ValueError("NVTE_CP_BENCH_ONLY requires p2p, all_gather, or a2a")
     load_balancing_strategy = CPLoadBalancingStrategy[load_balancing_strategy]
     # When is_training is False, gradient outputs are None.
     is_training = is_training == "True"
@@ -269,11 +308,17 @@ def run_dpa_with_cp(
         # Deep-copy: the module-level dict is shared across pool cases; the
         # THD branch below rewrites attn_mask_type in place, which would
         # otherwise leak into subsequent cases reusing the same model key.
-        config = copy.deepcopy(model_configs_flash_attn[model])
+        configs = (
+            model_configs_cp_benchmark if benchmark_only else model_configs_flash_attn
+        )
+        config = copy.deepcopy(configs[model])
     if kernel_backend == "FusedAttention":
         os.environ["NVTE_FUSED_ATTN"] = "1"
-        if model in model_configs_fused_attn:
-            config = copy.deepcopy(model_configs_fused_attn[model])
+        configs = (
+            model_configs_cp_benchmark if benchmark_only else model_configs_fused_attn
+        )
+        if model in configs:
+            config = copy.deepcopy(configs[model])
         else:
             assert False, f"{model=} is not a known FusedAttention CP config!"
     assert config.attn_mask_type in [
@@ -300,6 +345,8 @@ def run_dpa_with_cp(
         device_count = torch.cuda.device_count()
         device = rank % device_count
         torch.cuda.set_device(device)
+    if benchmark_only and world_size not in (2, 4, 8):
+        raise ValueError("NVTE_CP_BENCH_ONLY requires CP size 2, 4, or 8")
     logging.info(f"[Rank {rank}] Setup: world_size {world_size}")
     if not _pool_managed_pg:
         dist.init_process_group(backend="nccl", world_size=world_size, rank=rank)
@@ -373,7 +420,49 @@ def run_dpa_with_cp(
         kernel_backend,
         fa_pad_between_seqs,
         load_balancing_strategy,
+        thd_seqlen_pattern,
     )
+    if benchmark_only:
+        run_fixed_token_benchmark(
+            core_attn=core_attn,
+            config=config,
+            model=model,
+            kernel_backend=kernel_backend,
+            cp_comm_type=cp_comm_type,
+            cp_comm_group=cp_comm_group,
+            load_balancing_strategy=load_balancing_strategy,
+            pad_between_seqs=pad_between_seqs,
+            cu_seqlens=(
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                cu_seqlens_q_padded,
+                cu_seqlens_kv_padded,
+            ),
+            input_shapes=(
+                q_input_shape,
+                k_input_shape,
+                v_input_shape,
+                attn_output_shape,
+            ),
+            benchmark_iters=benchmark_iters,
+        )
+        if not _reusing_pool_groups:
+            if cp_comm_group is not None:
+                try:
+                    dist.destroy_process_group(cp_comm_group)
+                except Exception:
+                    pass
+            for group in cp_comm_sub_groups:
+                try:
+                    dist.destroy_process_group(group)
+                except Exception:
+                    pass
+        if not _pool_managed_pg:
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+        return
     q_orig = torch.clamp(torch.randn(q_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     k_orig = torch.clamp(torch.randn(k_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     v_orig = torch.clamp(torch.randn(v_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
