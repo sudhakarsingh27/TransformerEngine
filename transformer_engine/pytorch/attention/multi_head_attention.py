@@ -14,6 +14,7 @@ from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor
 from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
 from transformer_engine.pytorch.module import LayerNormLinear, Linear, RMSNorm, LayerNorm
 from transformer_engine.pytorch.ops.basic.l2normalization import L2Normalization
+from transformer_engine.pytorch.device import te_device_type
 from transformer_engine.pytorch.utils import (
     SplitAlongDim,
     divide,
@@ -100,6 +101,11 @@ class MultiheadAttention(torch.nn.Module):
                           or bottom right (`True`) corner of the softmax matrix in the encoder.
                           If `None`, it will be set to `False` for `attn_mask_type` =
                           {`causal`, `padding_causal`} and `True` for other mask types.
+    softcap : float, default = 0.0
+             tanh logit softcapping value applied to the attention scores as
+             ``softcap * tanh(scores / softcap)``. A value of ``0.0`` disables softcapping.
+             Similar to :attr:`window_size`, ``softcap`` can be overridden by
+             :attr:`softcap` in :meth:`forward` as well.
     num_gqa_groups : int, default = None
                          number of GQA groups in the transformer layer.
                          Grouped Query Attention is described in
@@ -136,7 +142,7 @@ class MultiheadAttention(torch.nn.Module):
                             whether to use interleaved rotary position embeddings.
     bias : bool, default = True
           if set to ``False``, the transformer layer will not learn any additive biases.
-    device : Union[torch.device, str], default = "cuda"
+    device : Union[torch.device, str], default=te_device_type()
           The device on which the parameters of the model will be allocated. It is the user's
           responsibility to ensure all parameters are moved to the GPU before running the
           forward pass.
@@ -256,6 +262,7 @@ class MultiheadAttention(torch.nn.Module):
         attn_mask_type: str = "causal",
         window_size: Optional[Tuple[int, int]] = None,
         bottom_right_diagonal: Optional[bool] = None,
+        softcap: float = 0.0,
         tp_group: Optional[dist_group_type] = None,
         tp_size: int = 1,
         num_gqa_groups: Optional[int] = None,
@@ -279,7 +286,7 @@ class MultiheadAttention(torch.nn.Module):
         ub_bulk_wgrad: bool = False,
         bias: bool = True,
         normalization: str = "LayerNorm",
-        device: Union[torch.device, str] = "cuda",
+        device: Union[torch.device, str] = te_device_type(),
         qkv_format: str = "sbhd",
         name: str = None,
         qk_norm_type: Optional[str] = None,
@@ -295,6 +302,7 @@ class MultiheadAttention(torch.nn.Module):
         self.attn_mask_type = attn_mask_type
         self.window_size = window_size
         self.bottom_right_diagonal = bottom_right_diagonal
+        self.softcap = softcap
         self.layer_number = 1 if layer_number is None else layer_number
         self.input_layernorm = input_layernorm
         self.attention_type = attention_type
@@ -754,6 +762,7 @@ class MultiheadAttention(torch.nn.Module):
         pad_between_seqs: Optional[bool] = None,
         thd_attention_policies: Optional[List[Dict[str, Any]]] = None,
         thd_attention_policy_dispatch: str = "auto",
+        softcap: Optional[float] = None,
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         r"""
         Forward propagation for MultiheadAttention layer.
@@ -790,6 +799,10 @@ class MultiheadAttention(torch.nn.Module):
                               or bottom right (`True`) corner of the softmax matrix in the encoder.
                               If `None`, it will be set to `False` for `attn_mask_type` =
                               {`causal`, `padding_causal`} and `True` for other mask types.
+        softcap: Optional[float], default = None
+                    tanh logit softcapping value applied to the attention scores as
+                    ``softcap * tanh(scores / softcap)``. A value of ``0.0`` disables
+                    softcapping. When `None`, the value passed to the constructor is used.
         thd_attention_policies: Optional[List[Dict[str, Any]]], default = None
                               Per-sequence policies for packed THD attention. Passed through to
                               :class:`DotProductAttention`; do not also pass :attr:`attn_mask_type`
@@ -872,6 +885,10 @@ class MultiheadAttention(torch.nn.Module):
                 "padding_causal_bottom_right",
             }:
                 bottom_right_diagonal = True
+
+        # softcap is not mask-specific, so resolve it outside the policy branch above.
+        if softcap is None:
+            softcap = self.softcap
 
         if (
             thd_attention_policies is None
@@ -1240,6 +1257,7 @@ class MultiheadAttention(torch.nn.Module):
             attention_mask=attention_mask,
             attn_mask_type=attn_mask_type,
             window_size=window_size,
+            softcap=softcap,
             bottom_right_diagonal=bottom_right_diagonal,
             thd_attention_policies=thd_attention_policies,
             thd_attention_policy_dispatch=thd_attention_policy_dispatch,

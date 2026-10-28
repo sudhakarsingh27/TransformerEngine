@@ -19,12 +19,17 @@ from typing import Any, Iterable, Optional, Tuple, Union
 import torch
 from torch.ops import aten
 
+from transformer_engine.pytorch.device import te_device_type
 from .storage.identity_tensor_storage import IdentityTensorStorage
 from ..quantized_tensor import QuantizedTensor, QuantizedTensorStorage, Quantizer
 
 
 class IdentityQuantizer(Quantizer):
     """Quantizer that produces a high-precision passthrough representation.
+
+    .. warning::
+        **EXPERIMENTAL**: ``IdentityQuantizer`` is under active development and
+        its API is subject to change without notice.
 
     Returns an :class:`IdentityTensorStorage` (or :class:`IdentityTensor`)
     holding the tensor directly, without a low-precision encoding.
@@ -110,7 +115,7 @@ class IdentityQuantizer(Quantizer):
         pin_memory: bool = False,
     ) -> Union["IdentityTensor", IdentityTensorStorage]:
         if device is None:
-            device = torch.device("cuda")
+            device = torch.device(te_device_type())
         device = torch.device(device)
         data_dtype = self.dtype if self.dtype is not None else dtype
         data = torch.empty(tuple(shape), dtype=data_dtype, device=device, pin_memory=pin_memory)
@@ -174,6 +179,21 @@ class IdentityTensor(IdentityTensorStorage, QuantizedTensor):
 
     Presents as a standard tensor of its nominal dtype; internally it just
     holds data directly in that dtype, without a low-precision encoding.
+
+    Parameters
+    ----------
+    shape : iterable of int
+        Tensor dimensions.
+    dtype : torch.dtype
+        Logical tensor datatype.
+    hp_data : torch.Tensor
+        Held high-precision data.
+    quantizer : IdentityQuantizer, optional
+        Quantizer that produced the tensor.
+    requires_grad : bool, default = False
+        Whether to compute gradients for this tensor.
+    device : torch.device, optional
+        Device containing the tensor.
     """
 
     def __repr__(self, *, tensor_contents=None):

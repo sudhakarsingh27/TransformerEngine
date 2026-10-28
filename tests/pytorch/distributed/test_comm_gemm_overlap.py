@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
+import ctypes
 import os
 import subprocess
 from pathlib import Path
@@ -15,6 +16,24 @@ if torch.cuda.device_count() < 2:
 
 fp8_available, reason_for_no_fp8 = te.is_fp8_available(return_reason=True)
 mxfp8_available, reason_for_no_mxfp8 = te.is_mxfp8_available(return_reason=True)
+nvfp4_available, reason_for_no_nvfp4 = te.is_nvfp4_available(return_reason=True)
+
+
+def _loaded_cublasmp_version() -> int:
+    """Version of the cuBLASMp library loaded by Transformer Engine, or 0 if there is none."""
+    if not tex.nvte_built_with_cublasmp():
+        return 0
+    try:
+        version = ctypes.c_int(0)
+        ctypes.CDLL("libcublasmp.so.0").cublasMpGetVersion(ctypes.byref(version))
+    except (OSError, AttributeError):
+        return 0
+    return version.value
+
+
+# NVFP4 with cuBLASMp applies the global scales through a device-side alpha (cuBLASMp 0.11.0+)
+cublasmp_nvfp4_available = _loaded_cublasmp_version() >= 1100
+reason_for_no_cublasmp_nvfp4 = "NVFP4 with cuBLASMp requires cuBLASMp 0.11.0 or newer."
 
 RNG_SEED: int = 42
 SEQ_LENGTH: int = 1024
@@ -32,6 +51,17 @@ MAX_LAYER_NAME_LENGTH = max([len(layer.__name__) for layer in TE_LAYERS])
 
 # to avoid numerical tolerance issues of doing comm gemm overlap, limit the number of GPUs used
 MAX_GPUS_TO_USE = 4
+
+COMM_GEMM_QUANTIZATION_PARAMS = [
+    pytest.param(False, "none", id="ub-bf16"),
+    pytest.param(False, "fp8", id="ub-fp8"),
+    pytest.param(False, "mxfp8", id="ub-mxfp8"),
+    pytest.param(True, "none", id="cublasmp-bf16"),
+    pytest.param(True, "fp8", id="cublasmp-fp8"),
+    pytest.param(True, "mxfp8", id="cublasmp-mxfp8"),
+    # Userbuffers does not support NVFP4
+    pytest.param(True, "nvfp4", id="cublasmp-nvfp4"),
+]
 
 TEST_ROOT = Path(__file__).parent.resolve()
 NUM_PROCS: int = min(torch.cuda.device_count(), MAX_GPUS_TO_USE)
@@ -90,6 +120,8 @@ def _run_gemm_with_overlap(
             pytest.skip(reason_for_no_fp8)
         if quantization == "mxfp8" and not mxfp8_available:
             pytest.skip(reason_for_no_mxfp8)
+        if quantization == "nvfp4" and not nvfp4_available:
+            pytest.skip(reason_for_no_nvfp4)
         test_cmd.append(f"--quantization={quantization}")
         if p2p:
             test_cmd.append("--p2p")
@@ -102,10 +134,8 @@ def _run_gemm_with_overlap(
         if use_cublasmp:
             if not tex.nvte_built_with_cublasmp():
                 pytest.skip("Transformer Engine not built with cuBLASMp (NVTE_WITH_CUBLASMP=0).")
-            if quantization == "mxfp8":
-                pytest.skip(
-                    "cuBLASMp comm+GEMM overlap does not yet support MXFP8 (block scaling)."
-                )
+            if quantization == "nvfp4" and not cublasmp_nvfp4_available:
+                pytest.skip(reason_for_no_cublasmp_nvfp4)
             if comm_type == "RS" and not p2p and not tex.device_supports_multicast():
                 pytest.skip(
                     "cuBLASMp non-P2P reduce-scatter requires NVSwitch (multicast support)."
@@ -153,14 +183,19 @@ def _run_layer_with_overlap(
             pytest.skip(reason_for_no_fp8)
         if quantization == "mxfp8" and not mxfp8_available:
             pytest.skip(reason_for_no_mxfp8)
+        if quantization == "nvfp4":
+            if not nvfp4_available:
+                pytest.skip(reason_for_no_nvfp4)
+            if not use_cublasmp:
+                pytest.skip("Userbuffers does not support NVFP4.")
         test_cmd.append("--fp8")
         test_cmd.append(f"--quantization={quantization}")
 
     if use_cublasmp:
         if not tex.nvte_built_with_cublasmp():
             pytest.skip("Transformer Engine not built with cuBLASMp (NVTE_WITH_CUBLASMP=0).")
-        if fp8 and quantization == "mxfp8":
-            pytest.skip("cuBLASMp comm+GEMM overlap does not yet support MXFP8 (block scaling).")
+        if fp8 and quantization == "nvfp4" and not cublasmp_nvfp4_available:
+            pytest.skip(reason_for_no_cublasmp_nvfp4)
         test_cmd.append("--use-cublasmp")
 
     test_env = os.environ.copy()
@@ -182,8 +217,7 @@ def _run_layer_with_overlap(
     _assert_subprocess_succeeded(result)
 
 
-@pytest.mark.parametrize("use_cublasmp", (False, True))
-@pytest.mark.parametrize("quantization", ("none", "fp8", "mxfp8"))
+@pytest.mark.parametrize("use_cublasmp,quantization", COMM_GEMM_QUANTIZATION_PARAMS)
 @pytest.mark.parametrize("aggregate", (False, True))
 def test_split_all_gather_overlaps(quantization, aggregate, use_cublasmp):
     """
@@ -193,8 +227,7 @@ def test_split_all_gather_overlaps(quantization, aggregate, use_cublasmp):
     _run_gemm_with_overlap("AG", False, True, False, aggregate, quantization, use_cublasmp)
 
 
-@pytest.mark.parametrize("use_cublasmp", (False, True))
-@pytest.mark.parametrize("quantization", ("none", "fp8", "mxfp8"))
+@pytest.mark.parametrize("use_cublasmp,quantization", COMM_GEMM_QUANTIZATION_PARAMS)
 @pytest.mark.parametrize("p2p", (False, True))
 def test_split_reduce_scatter_overlaps(quantization, p2p, use_cublasmp):
     """
@@ -332,7 +365,7 @@ def test_linear_with_overlap_compile(
 @pytest.mark.parametrize("use_cublasmp", (False, True))
 @pytest.mark.parametrize(
     "quantization",
-    ["fp8_delayed_scaling", "fp8_current_scaling", "mxfp8"],
+    ["fp8_delayed_scaling", "fp8_current_scaling", "mxfp8", "nvfp4"],
 )
 @pytest.mark.parametrize(
     "layer_type,linear_parallel_mode,overlap_rs_dgrad",
@@ -374,6 +407,11 @@ def test_layers_with_overlap_fp8(
 ):
     """
     Test Transformer Engine layers with comm+GEMM overlap.
+
+    The layer runner uses 3-D logical activations. Column-parallel and composite-layer cases
+    without RS-dgrad overlap exercise FP8 GEMMs with bulk reduce-scatter in backward, and the
+    runner checks that output and gradient shapes match the non-overlap reference in addition to
+    checking their values.
     """
     _run_layer_with_overlap(
         layer_type,
@@ -381,97 +419,5 @@ def test_layers_with_overlap_fp8(
         overlap_rs_dgrad,
         True,
         quantization,
-        use_cublasmp=use_cublasmp,
-    )
-
-
-@pytest.mark.parametrize("use_cublasmp", (False, True))
-@pytest.mark.parametrize(
-    "fp8",
-    (False,),
-    ids=[
-        " BF16  ",
-    ],
-)
-@pytest.mark.parametrize(
-    "num_layers",
-    (2,),
-    ids=[
-        " 2 layers ",
-    ],
-)
-@pytest.mark.parametrize(
-    "layer_type,linear_parallel_mode,overlap_rs_dgrad",
-    list(
-        zip(
-            [te.TransformerLayer.__name__ for _ in range(2)],
-            [None] * 2,
-            [False, True],
-        )
-    ),
-    ids=[
-        " " + " - ".join(test_name_parts) + " "
-        for test_name_parts in zip(
-            [te.TransformerLayer.__name__ for _ in range(2)],
-            ["BULK DGRAD/WGRAD", "DGRAD+RS"],
-        )
-    ],
-)
-def test_multi_layer_with_overlap_bf16(
-    layer_type, linear_parallel_mode, overlap_rs_dgrad, fp8, num_layers, use_cublasmp
-):
-    """
-    Test Transformer Engine layers with comm+GEMM overlap.
-    """
-    _run_layer_with_overlap(
-        layer_type,
-        linear_parallel_mode,
-        overlap_rs_dgrad,
-        fp8,
-        None,
-        num_layers,
-        use_cublasmp=use_cublasmp,
-    )
-
-
-@pytest.mark.parametrize("use_cublasmp", (False, True))
-@pytest.mark.parametrize(
-    "quantization",
-    ["fp8_delayed_scaling", "fp8_current_scaling", "mxfp8"],
-)
-@pytest.mark.parametrize(
-    "num_layers",
-    (2,),
-)
-@pytest.mark.parametrize(
-    "layer_type,linear_parallel_mode,overlap_rs_dgrad",
-    list(
-        zip(
-            [te.TransformerLayer.__name__ for _ in range(2)],
-            [None] * 2,
-            [False, True],
-        )
-    ),
-    ids=[
-        "-".join(test_name_parts)
-        for test_name_parts in zip(
-            [te.TransformerLayer.__name__ for _ in range(2)],
-            ["BULK DGRAD/WGRAD", "DGRAD+RS"],
-        )
-    ],
-)
-def test_multi_layer_with_overlap_fp8(
-    layer_type, linear_parallel_mode, overlap_rs_dgrad, quantization, num_layers, use_cublasmp
-):
-    """
-    Test Transformer Engine layers with comm+GEMM overlap.
-    """
-    _run_layer_with_overlap(
-        layer_type,
-        linear_parallel_mode,
-        overlap_rs_dgrad,
-        True,
-        quantization,
-        num_layers,
         use_cublasmp=use_cublasmp,
     )

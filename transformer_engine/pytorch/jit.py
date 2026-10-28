@@ -10,6 +10,7 @@ from functools import wraps
 from typing import Callable, Optional, Tuple
 import torch
 
+from .device import te_device_type
 from .torch_version import torch_version
 from .export import is_in_onnx_export_mode
 from .utils import gpu_autocast_ctx
@@ -40,12 +41,6 @@ def lazy_compile(func):
 jit_fuser = lambda func: func
 if torch_version() >= (2, 0, 0) and bool(int(os.getenv("NVTE_TORCH_COMPILE", "1"))):
     jit_fuser = lazy_compile
-
-
-# See: https://github.com/NVIDIA/TransformerEngine/issues/597
-dropout_fuser = torch.jit.script
-if torch_version() >= (2, 2, 0) and bool(int(os.getenv("NVTE_TORCH_COMPILE", "1"))):
-    dropout_fuser = lazy_compile
 
 
 # Decorator to disable Torch Dynamo
@@ -178,7 +173,7 @@ def bgrad_dgelu_fused_(
         1 + tanh_out
     )
     dgelu = ff * grad_output
-    bgrad = dgelu.sum(dim=0)
+    bgrad = dgelu.clone() if dgelu.dim() == 1 else dgelu.sum(dim=list(range(dgelu.dim() - 1)))
     return bgrad, dgelu
 
 
@@ -302,7 +297,7 @@ def get_bias_dropout_add(training: bool) -> Callable:
     return _bias_dropout_add
 
 
-@dropout_fuser
+@jit_fuser
 def bias_dropout_add_fused_train_(
     x: torch.Tensor, bias: torch.Tensor, residual: torch.Tensor, prob: float
 ) -> torch.Tensor:
@@ -319,7 +314,7 @@ def bias_dropout_add_fused_train(
             return bias_dropout_add_fused_train_(x, bias, residual, prob)
 
 
-@dropout_fuser
+@jit_fuser
 def bias_dropout_add_fused_inference_(
     x: torch.Tensor, bias: torch.Tensor, residual: torch.Tensor, prob: float
 ) -> torch.Tensor:
@@ -343,9 +338,17 @@ def warmup_jit_bias_dropout_add(
     # Save cuda RNG state to ensure warmup does not affect reproducibility.
     rng_state = torch.cuda.get_rng_state()
 
-    inp = torch.rand((seq_length, micro_batch_size, hidden_size), dtype=dtype, device="cuda")
-    residual = torch.rand((seq_length, micro_batch_size, hidden_size), dtype=dtype, device="cuda")
-    bias = torch.rand((hidden_size), dtype=dtype, device="cuda")
+    inp = torch.rand(
+        (seq_length, micro_batch_size, hidden_size),
+        dtype=dtype,
+        device=te_device_type(),
+    )
+    residual = torch.rand(
+        (seq_length, micro_batch_size, hidden_size),
+        dtype=dtype,
+        device=te_device_type(),
+    )
+    bias = torch.rand((hidden_size), dtype=dtype, device=te_device_type())
     dropout_rate = 0.1
     # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
@@ -380,11 +383,11 @@ def warmup_jit_bias_gelu(
     # Save cuda RNG state to ensure warmup does not affect reproducibility.
     rng_state = torch.cuda.get_rng_state()
 
-    bias = torch.rand(ffn_hidden_size_per_partition, dtype=dtype, device="cuda")
+    bias = torch.rand(ffn_hidden_size_per_partition, dtype=dtype, device=te_device_type())
     inp = torch.rand(
         (seq_length * micro_batch_size, ffn_hidden_size_per_partition),
         dtype=dtype,
-        device="cuda",
+        device=te_device_type(),
     )
     # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
@@ -418,7 +421,7 @@ def warmup_jit_l2normalization(
     inp = torch.rand(
         (seq_length * micro_batch_size, hidden_size),
         dtype=dtype,
-        device="cuda",
+        device=te_device_type(),
     )
     eps = 1e-6
     # Warmup JIT fusions with the input grad_enable state of both forward

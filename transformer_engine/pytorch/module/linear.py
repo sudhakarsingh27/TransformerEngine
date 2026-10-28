@@ -6,8 +6,6 @@
 
 from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, Callable, Dict, Optional, Tuple, Union, List
-from functools import reduce
-from operator import mul as multiply_op
 import warnings
 import weakref
 
@@ -18,8 +16,10 @@ import transformer_engine_torch as tex
 from transformer_engine.common.recipe import Recipe
 from transformer_engine.pytorch.torch_version import torch_version
 
+from transformer_engine.pytorch.device import te_device_type
 from .base import (
     fill_userbuffers_buffer_for_all_gather,
+    get_cublasmp_all_gather_output,
     get_dummy_wgrad,
     get_ub,
     get_ub_is_fp8,
@@ -33,6 +33,7 @@ from .base import (
 )
 from ._common import (
     can_reconstruct_wgrad_input_from_original,
+    check_fp8_reduce_and_update,
     noop_cat,
     set_quantizer_amax_reduction_group,
     set_quantizer_usage_for_wgrad_all_gather,
@@ -88,11 +89,12 @@ from ..quantized_tensor import (
 from ..dynamo import (
     TensorSpec,
     TensorOrQuantized,
-    register_custom_op,
+    register_custom_op_with_autograd,
     is_value_opaque_quantizer,
 )
 from ..tensor.float8_tensor import Float8CurrentScalingQuantizer, Float8Quantizer
 from ..tensor.mxfp8_tensor import MXFP8Quantizer
+from ..tensor.nvfp4_tensor import NVFP4Quantizer
 from ..tensor.utils import clear_columnwise_cache, is_custom
 from ..export import is_in_onnx_export_mode, assert_warmed_up
 from ..cpu_offload import (
@@ -210,11 +212,8 @@ class LinearFwdArgs:
             # A quantized dgrad can't cross the op boundary: grads are packed
             # one plain Tensor[] slot each (_pack_bwd_result).
             return "a quantized input grad (fp8_grad=True)"
-        if self.cache_weight and self.fp8:
-            # The cached workspace is updated in place on the first microbatch,
-            # which the functional op (mutates_args=()) can't express. Without
-            # FP8 no workspace exists, so is_first_microbatch is inert.
-            return "FP8 weight caching (is_first_microbatch)"
+        if self.fp8 and self.skip_fp8_weight_update is not None:
+            return "GPU-controlled FP8 weight cache updates"
         if self.fuse_wgrad_accumulation:
             return "fuse_wgrad_accumulation (main_grad)"
         for quantizer in (
@@ -315,16 +314,6 @@ class LinearBwdArgs:
         ) = restore_from_func_ctx(
             ctx
         )  # pylint: disable=unbalanced-tuple-unpacking
-
-
-def _check_fp8_reduce_and_update():
-    """Check if this is the first FP8 module (for backward reduce-and-update)."""
-    qstate = FP8GlobalStateManager.quantization_state
-    _first_fp8_module = qstate.is_first_fp8_module
-    result = FP8GlobalStateManager.is_first_fp8_module()
-    if in_fp8_activation_recompute_phase():
-        qstate.is_first_fp8_module = _first_fp8_module
-    return result
 
 
 def _out_leading_from_inp(leading: int, args: Union[LinearFwdArgs, LinearBwdArgs]) -> int:
@@ -675,12 +664,6 @@ def _linear_forward_impl(
     else:
         out = gemm_out
 
-    # Restore the input's logical rank (e.g., (seq, batch, hidden)) on the output.
-    # This is mainly to correct for cuBLASMp comm+GEMM operators that unconditionally
-    # return a 2D output buffer that ends up incompatible with downstream consumers
-    # (e.g. ``bias_dropout_add`` residual connections inside ``TransformerLayer``).
-    out = out.view(-1, *inp.shape[1:-1], out_features)
-
     # ------------------------------------------------------
     # Output tensor is ready to return...
     # ------------------------------------------------------
@@ -910,11 +893,14 @@ def _linear_forward_fake(
     # ------------------------------------------------------
     # Output tensor: y = x @ w^T (quantized iff an output quantizer is set).
     # ------------------------------------------------------
-    # A rank-1 input is viewed to (1, in_features), so the output leads with 1.
     inp_leading = inp.shape[0] if len(inp.shape) > 1 else 1
     out_leading = _out_leading_from_inp(inp_leading, args)
     out = TensorSpec(
-        shape=(out_leading, *tuple(inp.shape[1:-1]), out_features),
+        shape=(
+            (out_features,)
+            if len(inp.shape) == 1
+            else (out_leading, *tuple(inp.shape[1:-1]), out_features)
+        ),
         dtype=activation_dtype,
         quantizer=output_quantizer,
         requires_grad=is_grad_enabled
@@ -1194,7 +1180,11 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
         if bwd_args.inp_shape is None:
             in_features = saved_weight.shape[-1]
             inp_leading = _inp_leading_from_out(grad_output.shape[0], bwd_args)
-            bwd_args.inp_shape = torch.Size([inp_leading, *grad_output.shape[1:-1], in_features])
+            bwd_args.inp_shape = (
+                torch.Size([in_features])
+                if grad_output.ndim == 1
+                else torch.Size([inp_leading, *grad_output.shape[1:-1], in_features])
+            )
 
         # Configure Userbuffers communication (comm+GEMM overlap)
         bwd_args.ub_obj_gradout = None
@@ -1202,10 +1192,7 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
         ub_obj_wgrad = None
         ub_type_dgrad = None
         ub_type_wgrad = None
-        dgrad_shape = [
-            reduce(multiply_op, bwd_args.inp_shape[:-1]),
-            bwd_args.inp_shape[-1],
-        ]
+        dgrad_shape = bwd_args.inp_shape
         if bwd_args.ub_overlap_ag:
             # Overlap grad_output all-gather with dgrad compute
             bwd_args.ub_obj_gradout = get_ub(bwd_args.ub_name + "_dgrad", bwd_args.fp8)
@@ -1241,10 +1228,14 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
         if grad_output_quantizer is not None:
             quantizer = grad_output_quantizer
             quantizer.set_usage(rowwise=True, columnwise=True)
-            if bwd_args.ub_overlap_ag:
+            if bwd_args.ub_overlap_ag and not (
+                bwd_args.ub_obj_gradout.with_cublasmp() and isinstance(quantizer, NVFP4Quantizer)
+            ):
                 # Userbuffers only supports communication for one
                 # tensor usage at a time. Configure quantizer with
-                # usage for only dgrad GEMM.
+                # usage for only dgrad GEMM. cuBLASMp all-gathers only
+                # the row-wise data, so NVFP4 keeps its column-wise
+                # data for wgrad.
                 quantizer.set_usage(columnwise=False)
 
         # Adjust the quantization direction approach depending
@@ -1405,7 +1396,9 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                     device=grad_output_arg.device,
                 )
             elif bwd_args.ub_bulk_wgrad:
-                gemm_out = ub_obj_wgrad.get_buffer(local_chunk=False)
+                gemm_out = ub_obj_wgrad.get_buffer(
+                    local_chunk=False, shape=(*grad_output.shape[:-1], dgrad_shape[-1])
+                )
 
             # dgrad GEMM
             # Note: dx = dy * w
@@ -1456,7 +1449,7 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                     else reduce_scatter_out
                 )
             elif bwd_args.ub_bulk_wgrad:
-                dgrad = ub_obj_wgrad.get_buffer(local_chunk=True)
+                dgrad = ub_obj_wgrad.get_buffer(local_chunk=True, shape=dgrad_shape)
             elif bwd_args.parallel_mode == "column" and bwd_args.tp_size > 1:
                 nvtx_range_push(f"{nvtx_label}.column_parallel_comm_dgrad")
                 dgrad = gemm_out
@@ -1476,26 +1469,46 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
         # Grad input tensor has been computed...
         # --------------------------------------------------
 
-        # cuBLASMp's AG+GEMM consumes the gathered grad_output inline and does
-        # not preserve it for wgrad. Userbuffers leaves the gathered tensor in
-        # its persistent buffer; cuBLASMp does not, so we gather here. Route
+        # cuBLASMp's AG+GEMM leaves the gathered grad_output at the start of
+        # its workspace, as Userbuffers leaves it in its persistent buffer, so
+        # wgrad reuses it for unquantized and per-tensor FP8 data. A delayed
+        # wgrad runs after the workspace is reused, and other formats need
+        # data the dgrad GEMM did not gather, so those gather here. Route
         # through the same FP8-aware all-gather as the non-overlap path in
         # ``TransformerEngineBaseModule.grad_output_preprocess`` by passing the
-        # grad_output quantizer. The columnwise data needed for wgrad is then
-        # produced by ``update_usage(columnwise_usage=True)`` further below.
+        # grad_output quantizer. Per-tensor FP8 can reconstruct columnwise
+        # data from the gathered rowwise data; MXFP8 must instead quantize
+        # the original gradient columnwise to avoid double quantization.
+        # NVFP4 gathers the columnwise data quantized with the rowwise data.
         if (
             bwd_args.requires_wgrad
             and bwd_args.ub_overlap_ag
             and bwd_args.ub_obj_gradout is not None
             and bwd_args.ub_obj_gradout.with_cublasmp()
         ):
-            if grad_output_quantizer is not None:
-                set_quantizer_usage_for_wgrad_all_gather(grad_output_quantizer)
-            grad_output, _ = gather_along_first_dim(
-                grad_output,
-                bwd_args.tp_group,
-                quantizer=grad_output_quantizer,
-            )
+            grad_output_total = None
+            if bwd_args.requires_dgrad and not (
+                bwd_args.wgrad_store is not None and bwd_args.wgrad_store.delay_wgrad_compute()
+            ):
+                grad_output_total = get_cublasmp_all_gather_output(
+                    bwd_args.ub_obj_gradout,
+                    grad_output,
+                    grad_output_quantizer,
+                    bwd_args.tp_group,
+                )
+            if grad_output_total is None:
+                if grad_output_quantizer is not None:
+                    set_quantizer_usage_for_wgrad_all_gather(grad_output_quantizer)
+                if isinstance(grad_output_quantizer, MXFP8Quantizer):
+                    grad_output = grad_output_arg.reshape(
+                        -1, grad_output_arg.shape[-1]
+                    ).contiguous()
+                grad_output_total, _ = gather_along_first_dim(
+                    grad_output,
+                    bwd_args.tp_group,
+                    quantizer=grad_output_quantizer,
+                )
+            grad_output = grad_output_total
 
         # --------------------------------------------------
         # Compute grad weight
@@ -1520,7 +1533,11 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
             # Prepare grad output tensor
             # Note: Synchronize tensor-parallel communication and
             # make sure required data is available
-            if bwd_args.ub_overlap_ag and isinstance(grad_output_quantizer, MXFP8Quantizer):
+            if (
+                bwd_args.ub_overlap_ag
+                and isinstance(grad_output_quantizer, MXFP8Quantizer)
+                and not ub_obj_dgrad.with_cublasmp()
+            ):
                 # UB does not support pipelined overlapping grad output
                 # all-gather with wgrad GEMM. Also, we can't
                 # convert row-scaled MXFP8 to column-scaled, so we
@@ -1671,7 +1688,7 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                 if ub_obj_wgrad.is_fp8_ubuf():
                     dgrad = reduce_scatter_out
                 else:
-                    dgrad = ub_obj_wgrad.get_buffer(local_chunk=True).clone()
+                    dgrad = ub_obj_wgrad.get_buffer(local_chunk=True, shape=dgrad_shape).clone()
 
         # --------------------------------------------------
         # Grad weight has been computed...
@@ -1709,6 +1726,9 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
                 wgrad = get_dummy_wgrad(
                     wgrad_shape,
                     origin_weight_python_object.dtype,
+                    zero_tensor=getattr(
+                        origin_weight_python_object, "zero_tensor_dummy_wgrad", False
+                    ),
                 )
         elif bwd_args.fuse_wgrad_accumulation:
             wgrad = None
@@ -1720,7 +1740,7 @@ def _linear_backward_impl(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None
         _fsdp_scatter_tensors(bwd_args.fsdp_group, weight_fp8)
     return (
         wgrad,
-        dgrad.view(bwd_args.inp_shape) if bwd_args.requires_dgrad else None,
+        dgrad if bwd_args.requires_dgrad else None,
         grad_bias,
     )
 
@@ -1758,7 +1778,11 @@ def _linear_backward_fake(
             None if (args.ub_overlap_rs_dgrad or args.ub_bulk_wgrad) else args.grad_input_quantizer
         )
         dgrad = TensorSpec(
-            shape=(dgrad_leading, *args.grad_output.shape[1:-1], in_features),
+            shape=(
+                (in_features,)
+                if len(args.grad_output.shape) == 1
+                else (dgrad_leading, *args.grad_output.shape[1:-1], in_features)
+            ),
             dtype=out_dtype,
             quantizer=dgrad_quantizer,
             device=args.grad_output.device,
@@ -1788,7 +1812,7 @@ def _linear_backward_fake(
 
 
 # Custom op used under ``torch.compile``.
-_linear_op = register_custom_op(
+_linear_op = register_custom_op_with_autograd(
     op_name="linear",
     input_tensors_for_grad=["weight", "inp", "bias"],
     fwd_arg_type=LinearFwdArgs,
@@ -1852,7 +1876,7 @@ class _Linear(torch.autograd.Function):
                 or fwd_args.weight_requires_grad
                 or fwd_args.bias_requires_grad
             ):
-                bwd_args.reduce_and_update_bwd_fp8_tensors = _check_fp8_reduce_and_update()
+                bwd_args.reduce_and_update_bwd_fp8_tensors = check_fp8_reduce_and_update()
             if fwd_args.backward_override is not None:
                 bwd_args.reduce_and_update_bwd_fp8_tensors = False
 
@@ -1901,7 +1925,13 @@ def _linear_eager(
 class Linear(TransformerEngineBaseModule):
     """Applies a linear transformation to the incoming data :math:`y = xA^T + b`
 
-    On NVIDIA GPUs it is a drop-in replacement for ``torch.nn.Linear``.
+    On NVIDIA GPUs, this module implements the same linear transformation as
+    ``torch.nn.Linear``.
+
+    .. note::
+
+       Its constructor signature differs from ``torch.nn.Linear``. Pass optional
+       arguments, including ``bias``, by keyword.
 
     Parameters
     ----------
@@ -1926,7 +1956,7 @@ class Linear(TransformerEngineBaseModule):
                       values as split sizes along dim 0. The resulting parameters will have
                       names that end in ``_weight`` or ``_bias``, so trailing underscores are
                       stripped from any provided names.
-    device : Union[torch.device, str], default = "cuda"
+    device : Union[torch.device, str], default=te_device_type()
           The device on which the parameters of the model will be allocated. It is the user's
           responsibility to ensure all parameters are moved to the GPU before running the
           forward pass.
@@ -2002,7 +2032,7 @@ class Linear(TransformerEngineBaseModule):
         params_dtype: Optional[torch.dtype] = None,
         parallel_mode: Optional[str] = None,
         parameters_split: Optional[Union[Tuple[str, ...], Dict[str, int]]] = None,
-        device: Union[torch.device, str] = "cuda",
+        device: Union[torch.device, str] = te_device_type(),
         ub_overlap_ag: bool = False,
         ub_overlap_rs: bool = False,
         ub_overlap_rs_dgrad: bool = False,
@@ -2313,7 +2343,7 @@ class Linear(TransformerEngineBaseModule):
         from torch._subclasses.fake_tensor import is_fake
 
         weight = getattr(self, self.weight_names[0], None)
-        if weight is None or weight.device.type != "cuda":
+        if weight is None or weight.device.type != te_device_type():
             return
         if is_fake(weight) or detect_fake_mode():
             return
@@ -2357,6 +2387,13 @@ class Linear(TransformerEngineBaseModule):
                              * it also allows skipping gradient accumulation during the
                                first microbatch (since it is the first gradient being
                                produced)
+
+                             Under ``torch.compile``, the FP8 weight cache is replaced on
+                             the first microbatch and reused on subsequent microbatches.
+                             ``fuse_wgrad_accumulation=True`` remains unsupported.
+                             With ``mode="reduce-overhead"``, call
+                             ``torch.compiler.cudagraph_mark_step_begin()`` once before
+                             each minibatch to keep the cache live across its microbatches.
         """
         is_grad_enabled = torch.is_grad_enabled()
 
@@ -2383,7 +2420,7 @@ class Linear(TransformerEngineBaseModule):
 
         if torch.compiler.is_compiling() and _linear_op is not None:
             reason = self._compile_eager_fallback_reason(
-                inp, is_first_microbatch, fp8_output, fp8_grad, is_grad_enabled, debug
+                inp, skip_fp8_weight_update, fp8_output, fp8_grad, is_grad_enabled, debug
             )
             if reason is not None:
                 # A break inside the try/finally below would skip the whole frame.
@@ -2428,9 +2465,10 @@ class Linear(TransformerEngineBaseModule):
                         set_quantizer_amax_reduction_group(quantizer, None)
 
             cache_name = None if (is_first_microbatch is None or self.is_fsdp2) else "weight"
-            weight_workspace = (
-                self._fp8_workspaces.get(cache_name) if cache_name is not None else None
-            )
+            # A compiled refresh must not pass the old cache into the functional op.
+            weight_workspace = None
+            if cache_name is not None and not (use_compiled_op and is_first_microbatch):
+                weight_workspace = self._fp8_workspaces.get(cache_name)
 
             dgrad_use_split_accumulator = _2X_ACC_DGRAD
             wgrad_use_split_accumulator = _2X_ACC_WGRAD
@@ -2627,7 +2665,7 @@ class Linear(TransformerEngineBaseModule):
     def _compile_eager_fallback_reason(
         self,
         inp: torch.Tensor,
-        is_first_microbatch: Optional[bool],
+        skip_fp8_weight_update: Optional[torch.Tensor],
         fp8_output: bool,
         fp8_grad: bool,
         is_grad_enabled: bool,
@@ -2666,8 +2704,8 @@ class Linear(TransformerEngineBaseModule):
             and not (self.ub_overlap_rs_dgrad or self.ub_bulk_wgrad)
         ):
             return "a quantized input grad (fp8_grad=True)"
-        if fp8 and is_first_microbatch is not None and not self.is_fsdp2:
-            return "FP8 weight caching (is_first_microbatch)"
+        if fp8 and skip_fp8_weight_update is not None:
+            return "GPU-controlled FP8 weight cache updates"
         return None
 
     @torch._dynamo.disable

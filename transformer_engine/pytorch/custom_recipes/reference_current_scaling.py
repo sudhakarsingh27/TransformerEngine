@@ -13,6 +13,7 @@ import torch
 from transformer_engine.pytorch.custom_recipes import gemm
 from transformer_engine.pytorch.custom_recipes import reference_utils
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensorStorage, Quantizer
+from transformer_engine.pytorch.device import te_device_type
 
 
 def current_scaling_ref_factory(role):
@@ -344,10 +345,11 @@ class CurrentScalingQuantizerRef(Quantizer):
             tensor.dtype in reference_utils.HIGH_PRECISION_FLOAT_DTYPES
         ), "Unsupported input dtype."
 
-        # Make it work with 3D tensors
+        # GEMM implementations consume matrix operands; preserve the logical
+        # shape separately so the custom GEMM adapter can restore its output.
         original_shape = tensor.shape
-        if tensor.ndim > 2:
-            tensor = tensor.view(-1, tensor.shape[-1])
+        if tensor.ndim != 2:
+            tensor = tensor.reshape(-1, tensor.shape[-1])
 
         qx, sx, qx_t, sx_t = self._quantize(tensor)
 
@@ -501,7 +503,7 @@ class CurrentScalingQuantizerRef(Quantizer):
 
         # Canonicalize tensor attributes
         if device is None:
-            device = torch.device("cuda")
+            device = torch.device(te_device_type())
 
         # Allocate quantized data
         qx = torch.empty(shape, dtype=self.dtype, device=device)

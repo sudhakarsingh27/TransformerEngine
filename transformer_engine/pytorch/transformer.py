@@ -14,6 +14,8 @@ from transformer_engine.pytorch.torch_version import torch_version
 from transformer_engine.pytorch.module import LayerNormMLP, LayerNorm, RMSNorm
 from transformer_engine.pytorch.attention.multi_head_attention import MultiheadAttention
 from transformer_engine.pytorch.attention.inference import InferenceParams
+
+from transformer_engine.pytorch.device import te_device_type
 from transformer_engine.pytorch.jit import (
     set_jit_fusion_options,
     warmup_jit_bias_dropout_add_all_dtypes,
@@ -25,6 +27,7 @@ from transformer_engine.pytorch.utils import (
     cast_if_needed,
     get_default_init_method,
     torch_get_autocast_gpu_dtype,
+    torch_is_autocast_gpu_enabled,
 )
 from transformer_engine.pytorch.constants import (
     AttnMaskTypes,
@@ -154,6 +157,12 @@ class TransformerLayer(torch.nn.Module):
                         or bottom right (`True`) corner of the softmax matrix in the encoder.
                         If `None`, it will be set to `False` for `self_attn_mask_type` =
                         {`causal`, `padding_causal`} and `True` for other mask types.
+    softcap : float, default = 0.0
+            tanh logit softcapping value applied to the attention scores as
+            ``softcap * tanh(scores / softcap)``. A value of ``0.0`` disables softcapping.
+            Applied to both self-attention and, in decoder layers, cross-attention.
+            Similar to :attr:`window_size`, ``softcap`` can be overridden by
+            :attr:`softcap` in :meth:`forward` as well.
     enc_dec_attn_mask_type : {'no_mask', 'causal', 'padding', 'padding_causal', 'arbitrary'},
                            default = "no_mask"
                            type of attention mask passed into softmax operation for decoder.
@@ -193,7 +202,7 @@ class TransformerLayer(torch.nn.Module):
                         supports ``'limit'``, ``'alpha'``, and ``'glu_linear_offset'`` parameters.
                         You can set these as
                         ``activation_params={'limit': 7.0, 'alpha': 1.702, 'glu_linear_offset': 1.0}``.
-    device : Union[torch.device, str], default = "cuda"
+    device : Union[torch.device, str], default=te_device_type()
           The device on which the parameters of the model will be allocated. It is the user's
           responsibility to ensure all parameters are moved to the GPU before running the
           forward pass.
@@ -314,6 +323,7 @@ class TransformerLayer(torch.nn.Module):
         self_attn_mask_type: str = "causal",
         window_size: Optional[Tuple[int, int]] = None,
         bottom_right_diagonal: Optional[bool] = None,
+        softcap: float = 0.0,
         enc_dec_attn_mask_type: str = "no_mask",
         enc_dec_bottom_right_diagonal: Optional[bool] = None,
         enc_dec_window_size: Optional[Tuple[int, int]] = None,
@@ -345,7 +355,7 @@ class TransformerLayer(torch.nn.Module):
         activation: str = "gelu",
         activation_params: Optional[dict] = None,
         normalization: str = "LayerNorm",
-        device: Union[torch.device, str] = "cuda",
+        device: Union[torch.device, str] = te_device_type(),
         attn_input_format: str = "sbhd",
         name: str = None,
         qk_norm_type: Optional[str] = None,
@@ -358,6 +368,7 @@ class TransformerLayer(torch.nn.Module):
         self.self_attn_mask_type = self_attn_mask_type
         self.window_size = window_size
         self.bottom_right_diagonal = bottom_right_diagonal
+        self.softcap = softcap
         self.enc_dec_attn_mask_type = enc_dec_attn_mask_type
         self.enc_dec_window_size = enc_dec_window_size
         self.enc_dec_bottom_right_diagonal = enc_dec_bottom_right_diagonal
@@ -677,6 +688,7 @@ class TransformerLayer(torch.nn.Module):
         pad_between_seqs: Optional[bool] = None,
         thd_attention_policies: Optional[List[Dict[str, Any]]] = None,
         thd_attention_policy_dispatch: str = "auto",
+        softcap: Optional[float] = None,
     ) -> torch.Tensor:
         r"""
         Transformer Layer: attention block and a feedforward network (MLP)
@@ -711,6 +723,10 @@ class TransformerLayer(torch.nn.Module):
             or bottom right (`True`) corner of the softmax matrix in the encoder.
             If `None`, it will be set to `False` for `self_attn_mask_type` =
             {`causal`, `padding_causal`} and `True` for other mask types.
+        softcap: Optional[float], default = None
+            tanh logit softcapping value applied to the attention scores as
+            ``softcap * tanh(scores / softcap)``. A value of ``0.0`` disables softcapping.
+            When `None`, the value passed to the constructor is used.
         thd_attention_policies: Optional[List[Dict[str, Any]]], default = None
             Per-sequence policies for packed THD self-attention. Passed through to
             :class:`MultiheadAttention`; do not also pass :attr:`self_attn_mask_type`
@@ -818,6 +834,10 @@ class TransformerLayer(torch.nn.Module):
             }:
                 bottom_right_diagonal = True
 
+        # softcap is not mask-specific, so resolve it outside the policy branch above.
+        if softcap is None:
+            softcap = self.softcap
+
         if enc_dec_attn_mask_type is None:
             enc_dec_attn_mask_type = self.enc_dec_attn_mask_type
         if enc_dec_window_size is None:
@@ -890,7 +910,7 @@ class TransformerLayer(torch.nn.Module):
                 )
 
         # For AMP
-        if torch.is_autocast_enabled():
+        if torch_is_autocast_gpu_enabled():
             hidden_states = cast_if_needed(hidden_states, torch_get_autocast_gpu_dtype())
 
         # Self attention.
@@ -900,6 +920,7 @@ class TransformerLayer(torch.nn.Module):
             attn_mask_type=self_attn_mask_type,
             window_size=window_size,
             bottom_right_diagonal=bottom_right_diagonal,
+            softcap=softcap,
             thd_attention_policies=thd_attention_policies,
             thd_attention_policy_dispatch=thd_attention_policy_dispatch,
             inference_params=inference_params,
@@ -938,6 +959,7 @@ class TransformerLayer(torch.nn.Module):
                 attn_mask_type=enc_dec_attn_mask_type,
                 window_size=enc_dec_window_size,
                 bottom_right_diagonal=enc_dec_bottom_right_diagonal,
+                softcap=softcap,
                 encoder_output=encoder_output,
                 inference_params=inference_params,
                 is_first_microbatch=is_first_microbatch,
