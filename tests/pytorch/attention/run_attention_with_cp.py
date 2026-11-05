@@ -236,8 +236,16 @@ def run_dpa_with_cp(
     load_balancing_strategy="DUAL_CHUNK_SWAP",
     softcap="0.0",
     log_level=logging.WARNING,
+    case_mode=None,
+    case_output_dir=None,
 ):
     """Test DotProductAttention module with context parallelism"""
+    if case_mode is not None or case_output_dir is not None:
+        # Integration TODO: share the operation helper with one legacy caller
+        # before extending this opt-in Case route to the rest of the matrix.
+        from cp_pool_case import run_pool_case
+
+        return run_pool_case(case_output_dir, case_mode, locals().copy())
     logging.root.setLevel(log_level)
     load_balancing_strategy = CPLoadBalancingStrategy[load_balancing_strategy]
     # When is_training is False, gradient outputs are None.
