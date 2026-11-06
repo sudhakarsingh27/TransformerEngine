@@ -7,11 +7,14 @@ import os
 import sys
 import logging
 from contextlib import nullcontext
+from unittest.mock import patch
 import torch
+import pytest
 import torch.distributed as dist
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
     get_cu_seqlens_on_cp_rank,
     get_thd_partitioned_indices,
+    flash_attn_a2a_communicate,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     combine_and_quantize,
@@ -26,6 +29,7 @@ from transformer_engine.pytorch import (
     autocast,
     CPLoadBalancingStrategy,
     DotProductAttention,
+    MultiheadAttention,
     Float8Quantizer,
     Float8CurrentScalingQuantizer,
     MXFP8Quantizer,
@@ -57,6 +61,7 @@ def generate_input_shapes(
     kernel_backend: str,
     fa_pad_between_seqs: str = "False",
     load_balancing_strategy=CPLoadBalancingStrategy.DUAL_CHUNK_SWAP,
+    no_load_balance_case="",
 ):
     if qkv_format == "bshd":
         q_input_shape = (
@@ -115,7 +120,19 @@ def generate_input_shapes(
         cu_seqlens_q_padded = None
         cu_seqlens_kv_padded = None
     elif qkv_format == "thd":
-        if load_balancing_strategy is CPLoadBalancingStrategy.NO_LOAD_BALANCE:
+        if no_load_balance_case:
+            # Odd local slabs exercise the absence of dual-chunk divisibility.
+            total = 5 * world_size
+            if no_load_balance_case == "crossing":
+                seqlens_q = torch.tensor([3, total - 7, 4], dtype=torch.int32)
+                seqlens_q_padded = seqlens_q
+            else:
+                assert no_load_balance_case == "padding_only"
+                assert kernel_backend == "FusedAttention"
+                seqlens_q = torch.tensor([3, 2, 1], dtype=torch.int32)
+                # With CP=4, ranks 2 and 3 own only physical padding.
+                seqlens_q_padded = torch.tensor([5, 4, total - 9], dtype=torch.int32)
+        elif load_balancing_strategy is CPLoadBalancingStrategy.NO_LOAD_BALANCE:
             assert config.batch_size == 2
             if kernel_backend == "FlashAttention" and fa_pad_between_seqs == "False":
                 seqlens_q = torch.tensor(
@@ -307,6 +324,173 @@ def assert_matches_independent_reference(out, q, k, v, config, qkv_format, dtype
     )
 
 
+def assert_no_load_balance_a2a_exchange(group, cu_seqlens_padded):
+    """Check token and head placement independently in each exchange direction."""
+    size, rank = dist.get_world_size(group), dist.get_rank(group)
+    total = int(cu_seqlens_padded[-1])
+    local = total // size
+    stream = torch.cuda.Stream()
+    for names, before in (
+        (["q", "k", "v"], True),
+        (["dout"], True),
+        (["out"], False),
+        (["dq", "dk", "dv"], False),
+    ):
+        inputs, expected = [], []
+        for index, name in enumerate(names):
+            heads = 2 * size if name in ("q", "dq", "out", "dout") else size
+            full = torch.arange(total * heads * 2, device="cuda").view(total, heads, 2)
+            full = full + index * 10000
+            slab = full[rank * local : (rank + 1) * local].contiguous()
+            shard = full[:, rank * (heads // size) : (rank + 1) * (heads // size)].contiguous()
+            inputs.append(slab if before else shard)
+            expected.append(shard if before else slab)
+        actual = flash_attn_a2a_communicate(
+            inputs,
+            None,
+            0,
+            size,
+            group,
+            stream,
+            before,
+            qkv_format="thd",
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            a2a_input_names=names,
+            load_balancing_strategy=CPLoadBalancingStrategy.NO_LOAD_BALANCE,
+        )
+        if len(names) == 1:
+            actual = [actual]
+        for output, reference in zip(actual, expected):
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+
+def assert_no_load_balance_mha(group, cu_seqlens, cu_seqlens_padded, dtype):
+    """Compare MHA outputs, input/weight gradients and independent document positions."""
+    size, rank = dist.get_world_size(group), dist.get_rank(group)
+    total, hidden = int(cu_seqlens_padded[-1]), 512
+    use_rope = torch.equal(cu_seqlens, cu_seqlens_padded)
+    local = total // size
+    torch.manual_seed(4321)
+    reference = MultiheadAttention(
+        hidden,
+        8,
+        kv_channels=64,
+        num_gqa_groups=4,
+        attention_dropout=0.0,
+        qkv_format="thd",
+        attn_mask_type="padding_causal",
+        params_dtype=dtypes[dtype],
+        bias=False,
+        fuse_qkv_params=True,
+    ).cuda()
+    parallel = copy.deepcopy(reference)
+    parallel.set_context_parallel_group(
+        group,
+        list(range(size)),
+        torch.cuda.Stream(),
+        "a2a",
+        CPLoadBalancingStrategy.NO_LOAD_BALANCE,
+    )
+    x = torch.randn(total, hidden, device="cuda", dtype=dtypes[dtype], requires_grad=True)
+    grad = torch.randn_like(x)
+    valid = ~get_thd_padding_mask(total, cu_seqlens, cu_seqlens_padded)
+    grad[~valid] = 0
+    x_local = x.detach()[rank * local : (rank + 1) * local].clone().requires_grad_()
+    freqs = torch.randn(total, 1, 1, 32, device="cuda", dtype=torch.float32)
+    freqs = torch.cat((freqs, freqs), dim=-1)
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    positions = torch.tensor([p for length in lengths for p in range(length)], device="cuda")
+
+    def document_rope(tensor, table, *_args, **_kwargs):
+        # Explicit global positions avoid sharing the fragment/offset logic under test.
+        angles = table[positions, 0]
+        value = tensor.float()
+        rotated = torch.cat((-value[..., 32:], value[..., :32]), dim=-1)
+        return (value * angles.cos() + rotated * angles.sin()).to(tensor.dtype)
+
+    kwargs = dict(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=total,
+        max_seqlen_kv=total,
+        rotary_pos_emb=freqs if use_rope else None,
+        pad_between_seqs=not use_rope,
+    )
+    if not use_rope:
+        with pytest.raises(AssertionError, match="inter-sequence padding"):
+            parallel(x_local, **dict(kwargs, rotary_pos_emb=freqs))
+    with patch(
+        "transformer_engine.pytorch.attention.multi_head_attention.apply_rotary_pos_emb",
+        document_rope,
+    ):
+        out = reference(x, **kwargs)
+    out.backward(grad)
+    out_local = parallel(x_local, **kwargs)
+    out_local.backward(grad[rank * local : (rank + 1) * local].contiguous())
+    atol = rtol = 3.5e-2 if dtype == "bf16" else 5e-3
+    local_valid = valid[rank * local : (rank + 1) * local]
+    torch.testing.assert_close(
+        x_local.grad[~local_valid], torch.zeros_like(x_local.grad[~local_valid])
+    )
+    for actual, expected, name in (
+        (out_local[local_valid], out[rank * local : (rank + 1) * local][local_valid], "MHA output"),
+        (x_local.grad, x.grad[rank * local : (rank + 1) * local], "MHA input gradient"),
+    ):
+        if actual.numel():
+            if torch.count_nonzero(expected) == 0:
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            else:
+                compare_and_assert(expected, actual, "reference", name, atol, rtol, 0.01, False)
+    for (name, param), (ref_name, ref_param) in zip(
+        parallel.named_parameters(), reference.named_parameters()
+    ):
+        assert name == ref_name and param.grad is not None and ref_param.grad is not None
+        # CP owns tokens, so callers sum each replicated weight gradient exactly once.
+        dist.all_reduce(param.grad, group=group)
+        compare_and_assert(ref_param.grad, param.grad, "reference", name, atol, rtol, 0.01, False)
+
+
+def assert_packed_attention_reference(out, q, k, v, dout, cu, padded_cu, config, dtype):
+    """Anchor the small no-load-balance cases to explicit per-document attention."""
+    q_ref, k_ref, v_ref = [x.detach().double().requires_grad_() for x in (q, k, v)]
+    actual, physical = cu.tolist(), padded_cu.tolist()
+    outputs, valid = [], []
+    repeats = q.shape[1] // k.shape[1]
+    for index, start in enumerate(physical[:-1]):
+        length = actual[index + 1] - actual[index]
+        end = start + length
+        qs = q_ref[start:end].transpose(0, 1)
+        ks = k_ref[start:end].repeat_interleave(repeats, dim=1).transpose(0, 1)
+        vs = v_ref[start:end].repeat_interleave(repeats, dim=1).transpose(0, 1)
+        scores = qs @ ks.transpose(-1, -2) / q.shape[-1] ** 0.5
+        mask = torch.ones(length, length, device=q.device, dtype=torch.bool).triu(1)
+        result = (scores.masked_fill(mask, -torch.inf).softmax(-1) @ vs).transpose(0, 1)
+        outputs.append(result.reshape(length, -1))
+        valid.extend(range(start, end))
+    expected = torch.cat(outputs)
+    expected.backward(dout[valid].double())
+    atol, rtol, rmse = get_tols(config, dtype)
+    for name, actual_tensor, expected_tensor in (
+        ("output", out[valid], expected),
+        ("dq", q.grad[valid], q_ref.grad[valid]),
+        ("dk", k.grad[valid], k_ref.grad[valid]),
+        ("dv", v.grad[valid], v_ref.grad[valid]),
+    ):
+        compare_and_assert(
+            expected_tensor.to(actual_tensor.dtype),
+            actual_tensor,
+            "float64 reference",
+            name,
+            atol,
+            rtol,
+            rmse,
+            False,
+        )
+
+
 def run_dpa_with_cp(
     dtype="bf16",
     model=None,
@@ -322,6 +506,7 @@ def run_dpa_with_cp(
     fa_pad_between_seqs="False",
     deterministic="False",
     load_balancing_strategy="DUAL_CHUNK_SWAP",
+    no_load_balance_case="",
     softcap="0.0",
     log_level=logging.WARNING,
 ):
@@ -371,6 +556,11 @@ def run_dpa_with_cp(
         else:
             config.attn_mask_type = "padding"
     config.softcap = float(softcap)
+    if no_load_balance_case:
+        assert load_balancing_strategy is CPLoadBalancingStrategy.NO_LOAD_BALANCE
+        assert cp_comm_type == "a2a" and qkv_format == "thd" and is_training
+        config.batch_size = 3
+        pad_between_seqs = no_load_balance_case == "padding_only"
 
     # set up distributed group
     rank = int(os.getenv("RANK", "0"))
@@ -458,7 +648,12 @@ def run_dpa_with_cp(
         kernel_backend,
         fa_pad_between_seqs,
         load_balancing_strategy,
+        no_load_balance_case,
     )
+    if no_load_balance_case:
+        assert_no_load_balance_a2a_exchange(cp_comm_group, cu_seqlens_q_padded)
+        if kernel_backend == "FusedAttention":
+            assert_no_load_balance_mha(cp_comm_group, cu_seqlens_q, cu_seqlens_q_padded, dtype)
     q_orig = torch.clamp(torch.randn(q_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     k_orig = torch.clamp(torch.randn(k_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
     v_orig = torch.clamp(torch.randn(v_input_shape, dtype=dtypes[dtype]), min=-1, max=1).cuda()
@@ -574,6 +769,11 @@ def run_dpa_with_cp(
         dq, dk, dv, dbias = None, None, None, None
         d_softmax_offset = None
 
+    if no_load_balance_case:
+        assert_packed_attention_reference(
+            out, q, k, v, dout, cu_seqlens_q, cu_seqlens_q_padded, config, dtype
+        )
+
     ############ run with CP ############
     logging.info(f"[Rank {rank}] Run with context parallelism")
 
@@ -600,22 +800,28 @@ def run_dpa_with_cp(
             x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :]) for x in [q_, k_, v_, dout_]
         ]
     elif qkv_format == "thd":
-        seq_idx_q = get_thd_partitioned_indices(
-            cu_seqlens_q_padded,
-            q_.shape[0],
-            world_size,
-            rank,
-            device=q_.device,
-            load_balancing_strategy=load_balancing_strategy,
-        )
-        seq_idx_kv = get_thd_partitioned_indices(
-            cu_seqlens_kv_padded,
-            k_.shape[0],
-            world_size,
-            rank,
-            device=k_.device,
-            load_balancing_strategy=load_balancing_strategy,
-        )
+        if load_balancing_strategy is CPLoadBalancingStrategy.NO_LOAD_BALANCE:
+            # Independent oracle: physical slabs do not depend on document lengths.
+            q_tokens, kv_tokens = q_.shape[0] // world_size, k_.shape[0] // world_size
+            seq_idx_q = torch.arange(rank * q_tokens, (rank + 1) * q_tokens, device=q_.device)
+            seq_idx_kv = torch.arange(rank * kv_tokens, (rank + 1) * kv_tokens, device=k_.device)
+        else:
+            seq_idx_q = get_thd_partitioned_indices(
+                cu_seqlens_q_padded,
+                q_.shape[0],
+                world_size,
+                rank,
+                device=q_.device,
+                load_balancing_strategy=load_balancing_strategy,
+            )
+            seq_idx_kv = get_thd_partitioned_indices(
+                cu_seqlens_kv_padded,
+                k_.shape[0],
+                world_size,
+                rank,
+                device=k_.device,
+                load_balancing_strategy=load_balancing_strategy,
+            )
         q_, dout_ = [x.index_select(0, seq_idx_q) for x in [q_, dout_]]
         k_, v_ = [x.index_select(0, seq_idx_kv) for x in [k_, v_]]
     else:
@@ -688,6 +894,9 @@ def run_dpa_with_cp(
         )
         if config.return_max_logit:
             out_, max_logit_ = out_
+        if no_load_balance_case:
+            # Backward must retain forward's distribution even after reconfiguration.
+            core_attn.load_balancing_strategy = CPLoadBalancingStrategy.DUAL_CHUNK_SWAP
         if is_training:
             if fp8_bwd and fp8_mha:
                 dout_fp8_ = dout_quantizer(dout_)
@@ -779,65 +988,67 @@ def run_dpa_with_cp(
         if is_training:
             dq, out = [x.index_select(0, seq_idx_q).contiguous() for x in [dq, out]]
             dk, dv = [x.index_select(0, seq_idx_kv).contiguous() for x in [dk, dv]]
-            cu_seqlens_q_padded = cu_seqlens_q_padded // world_size
-            cu_seqlens_q = get_cu_seqlens_on_cp_rank(
-                cu_seqlens_q, cu_seqlens_q_padded, world_size, rank, True, True
-            )
-            cu_pads_q = cu_seqlens_q_padded - cu_seqlens_q
-            num_pads_q = cu_pads_q[1:] - cu_pads_q[:-1]
-            cu_seqlens_kv_padded = cu_seqlens_kv_padded // world_size
-            cu_seqlens_kv = get_cu_seqlens_on_cp_rank(
-                cu_seqlens_kv, cu_seqlens_kv_padded, world_size, rank, True, True
-            )
-            num_pads_kv = (cu_seqlens_kv_padded - cu_seqlens_kv)[1:] - (
-                cu_seqlens_kv_padded - cu_seqlens_kv
-            )[:-1]
-            # FA3/FA4 kernels may leave physically padded rows unwritten. The CP
-            # implementation must clean them after partial-output/gradient merges.
-            if fa_pad_between_seqs == "True":
-                out_padding_mask = get_thd_padding_mask(
-                    out_.shape[0], cu_seqlens_q, cu_seqlens_q_padded
+            if load_balancing_strategy is CPLoadBalancingStrategy.DUAL_CHUNK_SWAP:
+                cu_seqlens_q_padded = cu_seqlens_q_padded // world_size
+                cu_seqlens_q = get_cu_seqlens_on_cp_rank(
+                    cu_seqlens_q, cu_seqlens_q_padded, world_size, rank, True, True
                 )
-                nnz = torch.count_nonzero(out_[out_padding_mask]).item()
-                assert nnz == 0, (
-                    f"out_ has {nnz} nonzero values in THD padding — "
-                    "context_parallel.py should zero padding positions"
+                cu_pads_q = cu_seqlens_q_padded - cu_seqlens_q
+                num_pads_q = cu_pads_q[1:] - cu_pads_q[:-1]
+                cu_seqlens_kv_padded = cu_seqlens_kv_padded // world_size
+                cu_seqlens_kv = get_cu_seqlens_on_cp_rank(
+                    cu_seqlens_kv, cu_seqlens_kv_padded, world_size, rank, True, True
                 )
-
-                # out_ is a view inside the CP custom autograd Function, so in-place
-                # zeroing is blocked by PyTorch. Clone to break the view relationship.
-                out_ = out_.clone()
-                for x in [out, out_, dq]:
-                    for b in range(config.batch_size):
-                        x[
-                            cu_seqlens_q_padded[b + 1] - num_pads_q[b] : cu_seqlens_q_padded[b + 1]
-                        ] = 0.0
-                    x[cu_seqlens_q_padded[-1] :] = 0.0
-                for x in [dk, dv]:
-                    for b in range(config.batch_size):
-                        x[
-                            cu_seqlens_kv_padded[b + 1]
-                            - num_pads_kv[b] : cu_seqlens_kv_padded[b + 1]
-                        ] = 0.0
-                    x[cu_seqlens_kv_padded[-1] :] = 0.0
-                # Verify CP backward tensors have clean padding (pre-zeroed in context_parallel.py).
-                for xname, x, cu, np_ in [
-                    ("dq_", dq_, cu_seqlens_q_padded, num_pads_q),
-                    ("dk_", dk_, cu_seqlens_kv_padded, num_pads_kv),
-                    ("dv_", dv_, cu_seqlens_kv_padded, num_pads_kv),
-                ]:
-                    nnz = torch.count_nonzero(x[cu[-1] :]).item()
+                num_pads_kv = (cu_seqlens_kv_padded - cu_seqlens_kv)[1:] - (
+                    cu_seqlens_kv_padded - cu_seqlens_kv
+                )[:-1]
+                # FA3/FA4 kernels may leave physically padded rows unwritten. The CP
+                # implementation must clean them after partial-output/gradient merges.
+                if fa_pad_between_seqs == "True":
+                    out_padding_mask = get_thd_padding_mask(
+                        out_.shape[0], cu_seqlens_q, cu_seqlens_q_padded
+                    )
+                    nnz = torch.count_nonzero(out_[out_padding_mask]).item()
                     assert nnz == 0, (
-                        f"{xname} has {nnz} nonzero values in tail padding — "
+                        f"out_ has {nnz} nonzero values in THD padding — "
                         "context_parallel.py should zero padding positions"
                     )
-                    for b in range(config.batch_size):
-                        if np_[b] > 0:
-                            nnz = torch.count_nonzero(x[cu[b + 1] - np_[b] : cu[b + 1]]).item()
-                            assert nnz == 0, (
-                                f"{xname} has {nnz} nonzero values in batch {b} padding — "
-                                "context_parallel.py should zero padding positions"
-                            )
+
+                    # out_ is a view inside the CP custom autograd Function, so in-place
+                    # zeroing is blocked by PyTorch. Clone to break the view relationship.
+                    out_ = out_.clone()
+                    for x in [out, out_, dq]:
+                        for b in range(config.batch_size):
+                            x[
+                                cu_seqlens_q_padded[b + 1]
+                                - num_pads_q[b] : cu_seqlens_q_padded[b + 1]
+                            ] = 0.0
+                        x[cu_seqlens_q_padded[-1] :] = 0.0
+                    for x in [dk, dv]:
+                        for b in range(config.batch_size):
+                            x[
+                                cu_seqlens_kv_padded[b + 1]
+                                - num_pads_kv[b] : cu_seqlens_kv_padded[b + 1]
+                            ] = 0.0
+                        x[cu_seqlens_kv_padded[-1] :] = 0.0
+                    # Verify CP backward tensors have clean padding (pre-zeroed in context_parallel.py).
+                    for xname, x, cu, np_ in [
+                        ("dq_", dq_, cu_seqlens_q_padded, num_pads_q),
+                        ("dk_", dk_, cu_seqlens_kv_padded, num_pads_kv),
+                        ("dv_", dv_, cu_seqlens_kv_padded, num_pads_kv),
+                    ]:
+                        nnz = torch.count_nonzero(x[cu[-1] :]).item()
+                        assert nnz == 0, (
+                            f"{xname} has {nnz} nonzero values in tail padding — "
+                            "context_parallel.py should zero padding positions"
+                        )
+                        for b in range(config.batch_size):
+                            if np_[b] > 0:
+                                nnz = torch.count_nonzero(x[cu[b + 1] - np_[b] : cu[b + 1]]).item()
+                                assert nnz == 0, (
+                                    f"{xname} has {nnz} nonzero values in batch {b} padding — "
+                                    "context_parallel.py should zero padding positions"
+                                )
         else:
             out = out.index_select(0, seq_idx_q).contiguous()
             out_ = out_
@@ -961,16 +1172,21 @@ def run_dpa_with_cp(
                             is_fp8,
                         )
                 elif qkv_format == "thd":
-                    compare_and_assert(
-                        t,
-                        tensors_cp[i],
-                        names_no_cp[i],
-                        names_cp[i],
-                        atol,
-                        rtol,
-                        rmse_tol,
-                        is_fp8,
-                    )
+                    if no_load_balance_case and torch.count_nonzero(t) == 0:
+                        # A padding-only rank has zero reference range, so RMSE
+                        # normalized by the tensor range is undefined.
+                        torch.testing.assert_close(tensors_cp[i], t, rtol=0, atol=0)
+                    else:
+                        compare_and_assert(
+                            t,
+                            tensors_cp[i],
+                            names_no_cp[i],
+                            names_cp[i],
+                            atol,
+                            rtol,
+                            rmse_tol,
+                            is_fp8,
+                        )
             else:
                 compare_and_assert(
                     t, tensors_cp[i], names_no_cp[i], names_cp[i], atol, rtol, rmse_tol, is_fp8

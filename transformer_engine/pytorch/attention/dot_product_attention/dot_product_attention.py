@@ -1115,6 +1115,9 @@ class DotProductAttention(TransformerEngineBaseModule):
                         p2p between sub-groups (e.g., via IBLink).
         load_balancing_strategy : CPLoadBalancingStrategy
                                   token partition strategy for context-parallel attention.
+                                  Experimental NO_LOAD_BALANCE assigns contiguous physical-buffer
+                                  slabs with THD all-gather or all-to-all causal self-attention.
+                                  Total physical tokens must divide evenly across CP ranks.
         """
         assert isinstance(load_balancing_strategy, CPLoadBalancingStrategy), (
             f"Expected {CPLoadBalancingStrategy.__name__}, "

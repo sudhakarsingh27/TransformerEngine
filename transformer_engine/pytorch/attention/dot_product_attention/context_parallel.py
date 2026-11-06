@@ -527,6 +527,7 @@ def flash_attn_a2a_communicate(
     cu_seqlens_q_padded: torch.Tensor = None,
     cu_seqlens_kv_padded: torch.Tensor = None,
     a2a_input_names: List[str] = None,
+    load_balancing_strategy=CPLoadBalancingStrategy.DUAL_CHUNK_SWAP,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     """A2A communication for context parallelism."""
     assert a2a_input_names in [
@@ -581,8 +582,8 @@ def flash_attn_a2a_communicate(
                         # [cp, t, h//cp, d] -> [cp*t, h//cp, d]
                         x = x.view(-1, *x.shape[2:])
                         # reorder the sequence chunks
-                        a2a_outputs[i - 2] = thd_cp_rank_order_to_sequence_order(
-                            x, cu_seqlens_padded, cp_size
+                        a2a_outputs[i - 2] = restore_thd_gathered_kv(
+                            x, cu_seqlens_padded, cp_size, load_balancing_strategy
                         )
 
             if i < len(a2a_inputs):
@@ -627,7 +628,9 @@ def flash_attn_a2a_communicate(
                         else cu_seqlens_kv_padded
                     )
                     # reorder the sequence chunks
-                    x = thd_sequence_order_to_cp_rank_order(x, cu_seqlens_padded, cp_size)
+                    x = unrestore_thd_gathered_kv(
+                        x, cu_seqlens_padded, cp_size, load_balancing_strategy
+                    )
                     # [cp*t, h//cp, d] -> [cp, t, h//cp, d]
                     a2a_inputs[i] = x.view(cp_size, -1, *x.shape[-2:])
             if i > 1:
@@ -4608,6 +4611,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         softmax_type,
         softmax_offset,
         fp8_output,
+        load_balancing_strategy,
     ):
         # pylint: disable=missing-function-docstring
         nvtx_range_push("transformer_engine.AttnFuncWithCPAndQKVOA2A.forward")
@@ -4643,10 +4647,11 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             f" Found {use_fused_attention=}, {use_flash_attn_3=}, {use_flash_attn_4=}, "
             f"and {fa_utils.v2_3_plus=}."
         )
-        assert q.shape[seq_dim_qkv] % 2 == 0 and k.shape[seq_dim_qkv] % 2 == 0, (
-            "cp_comm_type='a2a' requires seq_len % 2 == 0 for Q, K, V. Found seq_len_q ="
-            f" {q.shape[seq_dim_qkv]}, seq_len_kv = {k.shape[seq_dim_qkv]}, cp_size = {cp_size}."
-        )
+        if load_balancing_strategy is CPLoadBalancingStrategy.DUAL_CHUNK_SWAP:
+            assert q.shape[seq_dim_qkv] % 2 == 0 and k.shape[seq_dim_qkv] % 2 == 0, (
+                "cp_comm_type='a2a' requires seq_len % 2 == 0 for Q, K, V. Found seq_len_q ="
+                f" {q.shape[seq_dim_qkv]}, seq_len_kv = {k.shape[seq_dim_qkv]}, cp_size = {cp_size}."
+            )
         assert q.shape[-2] % cp_size == 0 and k.shape[-2] % cp_size == 0, (
             "cp_comm_type='a2a' requires num_heads % cp_size == 0 for Q, K, V. Found num_heads_q ="
             f" {q.shape[-2]}, num_heads_kv = {k.shape[-2]}, cp_size = {cp_size}."
@@ -4761,6 +4766,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
             a2a_input_names=["q", "k", "v"],
+            load_balancing_strategy=load_balancing_strategy,
         )
 
         # softmax_offset: split h
@@ -4934,6 +4940,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             qkv_format=o_format,
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             a2a_input_names=["out"],
+            load_balancing_strategy=load_balancing_strategy,
         )
         # [b*s//cp, h, d] -> [b, s//cp, h, d]
         # [s//cp*b, h, d] -> [s//cp, b, h, d]
@@ -5017,6 +5024,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         ctx.save_for_backward(*tensors_to_save)
         ctx.tensor_objects = tensor_objects
 
+        ctx.load_balancing_strategy = load_balancing_strategy
         ctx.cp_group = cp_group
         ctx.cp_stream = cp_stream
         ctx.dropout_p = dropout_p
@@ -5128,6 +5136,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             qkv_format=ctx.o_format,
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             a2a_input_names=["dout"],
+            load_balancing_strategy=ctx.load_balancing_strategy,
         )
 
         flash_attn_bwd = None
@@ -5339,6 +5348,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
             a2a_input_names=["dq", "dk", "dv"],
+            load_balancing_strategy=ctx.load_balancing_strategy,
         )
         dq, dk, dv = [
             x.view(y)
@@ -5412,6 +5422,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             None,
             None,
             d_softmax_offset,
+            None,
             None,
         )
 
@@ -5578,7 +5589,7 @@ def attn_forward_func_with_cp(
     Experimental strategy ``CPLoadBalancingStrategy.NO_LOAD_BALANCE`` instead
     assigns one contiguous physical-buffer chunk to each rank and uses one attention
     step per rank. Logical sequences remain isolated by ``cu_seqlens``. This strategy
-    requires THD, all-gather, causal self-attention without a sliding window, and
+    requires THD, all-gather or all-to-all, causal self-attention without a sliding window, and
     FusedAttention, or FlashAttention with ``pad_between_seqs=False``. Input producers
     must use the same strategy when partitioning inputs with
     :func:`get_batch_on_this_cp_rank` or :func:`get_thd_partitioned_indices`.
@@ -5664,9 +5675,10 @@ def attn_forward_func_with_cp(
     ), f"Expected {CPLoadBalancingStrategy.__name__}, got {type(load_balancing_strategy).__name__}."
     if load_balancing_strategy is CPLoadBalancingStrategy.NO_LOAD_BALANCE:
         assert qkv_format == "thd", "No-load-balance CP partitioning requires qkv_format='thd'."
-        assert (
-            cp_comm_type == "all_gather"
-        ), "No-load-balance THD partitioning requires cp_comm_type='all_gather'."
+        assert cp_comm_type in (
+            "all_gather",
+            "a2a",
+        ), "No-load-balance THD partitioning requires all_gather or a2a communication."
         # Backend selection is handled by the caller. FlashAttention does not yet
         # support inter-sequence padding with this partitioning strategy.
         assert (
@@ -5699,6 +5711,17 @@ def attn_forward_func_with_cp(
     assert qkv_format != "thd" or (
         cu_seqlens_q_padded is not None and cu_seqlens_kv_padded is not None
     ), "cu_seqlens_padded can not be None for context parallelism and qkv_format = 'thd'!"
+
+    if load_balancing_strategy is CPLoadBalancingStrategy.NO_LOAD_BALANCE and cp_comm_type == "a2a":
+        assert q.shape[0] > 0, "No-load-balance A2A requires nonempty physical slabs."
+        # A2A reconstructs the complete physical buffer before attention, so
+        # every rank must hold an equal slab of the same global metadata.
+        validate_no_load_balance_thd_metadata(
+            cu_seqlens_q,
+            cu_seqlens_q_padded,
+            q.shape[0] * get_distributed_world_size(cp_group),
+            get_distributed_world_size(cp_group),
+        )
 
     sliding_window_attn = (
         window_size is not None and window_size != (-1, 0) and window_size != (-1, -1)
@@ -5787,6 +5810,7 @@ def attn_forward_func_with_cp(
             softmax_type,
             softmax_offset,
             fp8_output,
+            load_balancing_strategy,
         ]
         out = AttnFuncWithCPAndQKVOA2A.apply(*args)
     else:

@@ -17,6 +17,7 @@ from transformer_engine.pytorch.attention.dot_product_attention.context_parallel
     unrestore_thd_gathered_kv,
     pad_thd_sequences_for_cp,
     generate_positional_ids_for_cp,
+    validate_no_load_balance_thd_metadata,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.utils import get_thd_padding_mask
 
@@ -27,6 +28,23 @@ except ImportError:
 
 
 class TestTHDPartitioning(unittest.TestCase):
+    def test_no_load_balance_rejects_invalid_physical_metadata(self):
+        for logical, physical, total, size in (
+            ([0, 5], [0, 5], 5, 2),  # Unequal slabs.
+            ([0, 4], [0, 4], 6, 2),  # Wrong global physical total.
+            ([0, 3, 2], [0, 3, 6], 6, 2),  # Descending logical boundaries.
+            ([0, 1, 2], [0, 7, 6], 6, 2),  # Descending physical boundaries.
+            ([0, 4, 6], [0, 3, 6], 6, 2),  # Logical length exceeds its storage.
+        ):
+            with self.subTest(logical=logical, physical=physical, total=total, size=size):
+                with self.assertRaises(AssertionError):
+                    validate_no_load_balance_thd_metadata(
+                        torch.tensor(logical, dtype=torch.int32),
+                        torch.tensor(physical, dtype=torch.int32),
+                        total,
+                        size,
+                    )
+
     def test_default_partition_rejects_cpu_metadata(self):
         with self.assertRaisesRegex(AssertionError, "requires cuda cu_seqlens"):
             get_thd_partitioned_indices(torch.tensor([0, 8]), 8, 2, 0)

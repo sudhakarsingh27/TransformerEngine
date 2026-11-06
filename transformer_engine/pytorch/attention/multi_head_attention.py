@@ -32,6 +32,9 @@ from transformer_engine.pytorch.distributed import (
 )
 
 from transformer_engine.pytorch.attention.dot_product_attention import DotProductAttention
+from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+    validate_no_load_balance_thd_metadata,
+)
 from transformer_engine.pytorch.attention.inference import InferenceParams
 from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 from transformer_engine.pytorch.attention.dot_product_attention import utils as dpa_utils
@@ -700,6 +703,9 @@ class MultiheadAttention(torch.nn.Module):
                         p2p between sub-groups (e.g., via IBLink).
         load_balancing_strategy : CPLoadBalancingStrategy
                                   token partition strategy for context-parallel attention.
+                                  Experimental NO_LOAD_BALANCE uses contiguous physical-buffer
+                                  slabs with THD all-gather or all-to-all causal self-attention.
+                                  With all-to-all, RoPE supports sequences without padding gaps.
         """
         if isinstance(cp_group, dist_group_type):
             self.cp_size = get_distributed_world_size(cp_group)
@@ -1207,14 +1213,57 @@ class MultiheadAttention(torch.nn.Module):
                 rotary_pos_cu_seq_lens_q = cu_seqlens_q
                 rotary_pos_cu_seq_lens_kv = cu_seqlens_kv
 
+            rotary_cp_size = self.cp_size
+            rotary_cp_rank = self.cp_rank
+            if (
+                self.cp_size > 1
+                and self.core_attention.cp_comm_type in ("a2a", "a2a+p2p")
+                and self.core_attention.load_balancing_strategy
+                is CPLoadBalancingStrategy.NO_LOAD_BALANCE
+            ):
+                assert (
+                    self.core_attention.cp_comm_type == "a2a"
+                ), "No-load-balance RoPE requires a single all-to-all process group."
+                assert (
+                    not torch.cuda.is_current_stream_capturing()
+                ), "No-load-balance A2A RoPE does not support CUDA graph capture yet."
+                assert (
+                    self.qkv_format == "thd" and inference_params is None
+                ), "No-load-balance A2A RoPE requires THD without an inference cache."
+                assert cu_seqlens_q is cu_seqlens_kv and (
+                    cu_seqlens_q_padded is cu_seqlens_kv_padded
+                ), "No-load-balance A2A RoPE requires shared self-attention metadata."
+                assert cu_seqlens_q_padded is not None and torch.equal(
+                    cu_seqlens_q, cu_seqlens_q_padded
+                ), "No-load-balance A2A RoPE does not support inter-sequence padding yet."
+                local_tokens = query_layer.shape[0]
+                validate_no_load_balance_thd_metadata(
+                    cu_seqlens_q, cu_seqlens_q_padded, local_tokens * self.cp_size, self.cp_size
+                )
+                lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+                assert torch.all(
+                    lengths <= min(q_pos_emb.shape[0], k_pos_emb.shape[0])
+                ), "RoPE frequency tables must cover each complete sequence."
+                start = self.cp_rank * local_tokens
+                end = start + local_tokens
+                # Each slab may begin inside a document. Use local fragment
+                # boundaries and offsets so the existing kernel rotates the
+                # original document positions without dual-chunk remapping.
+                sequence_start_positions = torch.minimum(
+                    torch.clamp(start - cu_seqlens_q[:-1], min=0), lengths
+                )
+                rotary_pos_cu_seq_lens_q = cu_seqlens_q.clamp(start, end) - start
+                rotary_pos_cu_seq_lens_kv = rotary_pos_cu_seq_lens_q
+                rotary_cp_size, rotary_cp_rank = 1, 0
+
             query_layer = apply_rotary_pos_emb(
                 query_layer,
                 q_pos_emb,
                 self.qkv_format,
                 fused=True,
                 cu_seqlens=rotary_pos_cu_seq_lens_q,
-                cp_size=self.cp_size,
-                cp_rank=self.cp_rank,
+                cp_size=rotary_cp_size,
+                cp_rank=rotary_cp_rank,
                 start_positions=sequence_start_positions,
                 interleaved=self.rotary_pos_interleaved,
             )
@@ -1224,8 +1273,8 @@ class MultiheadAttention(torch.nn.Module):
                 self.qkv_format,
                 fused=True,
                 cu_seqlens=rotary_pos_cu_seq_lens_kv,
-                cp_size=self.cp_size,
-                cp_rank=self.cp_rank,
+                cp_size=rotary_cp_size,
+                cp_rank=rotary_cp_rank,
                 start_positions=sequence_start_positions,
                 interleaved=self.rotary_pos_interleaved,
             )

@@ -762,11 +762,12 @@ def test_cp_with_fused_attention(
 @pytest.mark.skipif(
     get_device_compute_capability() < (9, 0), reason="FusedAttention THD requires sm90+."
 )
-def test_cp_with_fused_attention_no_load_balance(cp_pool):
+@pytest.mark.parametrize("cp_comm_type", ("all_gather", "a2a"))
+def test_cp_with_fused_attention_no_load_balance(cp_pool, cp_comm_type):
     """Check experimental single-chunk forward/backward."""
     config = copy.deepcopy(model_configs_fused_attn["cp_2_0"])
     config.context_parallel = True
-    config.cp_comm_type = "all_gather"
+    config.cp_comm_type = cp_comm_type
     config.attn_mask_type = "padding_causal"
     available_backends, _, _ = get_available_attention_backends(
         config,
@@ -784,7 +785,7 @@ def test_cp_with_fused_attention_no_load_balance(cp_pool):
         model="cp_2_0",
         qkv_format="thd",
         kernel_backend="FusedAttention",
-        cp_comm_type="all_gather",
+        cp_comm_type=cp_comm_type,
         load_balancing_strategy="NO_LOAD_BALANCE",
         deterministic=_deterministic,
         log_level=pytest_logging_level,
@@ -829,6 +830,54 @@ def test_cp_with_flash_attention_no_load_balance(cp_pool, model):
         cp_comm_type="all_gather",
         fa_pad_between_seqs=False,
         load_balancing_strategy="NO_LOAD_BALANCE",
+        deterministic=_deterministic,
+        log_level=pytest_logging_level,
+    )
+
+
+@pytest.mark.parametrize("num_gpus", (2, 4))
+@pytest.mark.parametrize("dtype", ("bf16", "fp16"))
+@pytest.mark.parametrize(
+    "kernel_backend,packing",
+    (
+        ("FusedAttention", "crossing"),
+        ("FusedAttention", "padding_only"),
+        ("FlashAttention", "crossing"),
+    ),
+)
+def test_cp_a2a_no_load_balance_physical_slabs(cp_pool, num_gpus, dtype, kernel_backend, packing):
+    """Check odd physical slabs, independent token IDs, attention gradients and MHA RoPE."""
+    if kernel_backend == "FusedAttention" and get_device_compute_capability() < (9, 0):
+        pytest.skip("FusedAttention THD requires sm90+.")
+    configs = (
+        model_configs_fused_attn if kernel_backend == "FusedAttention" else model_configs_flash_attn
+    )
+    config = copy.deepcopy(configs["cp_2_0"])
+    config.batch_size = 3
+    config.max_seqlen_q = config.max_seqlen_kv = 5 * num_gpus
+    config.context_parallel = True
+    config.cp_comm_type = "a2a"
+    config.attn_mask_type = "padding_causal"
+    available, _, _ = get_available_attention_backends(
+        config,
+        qkv_dtype=torch.bfloat16 if dtype == "bf16" else torch.float16,
+        qkv_layout="thd_thd_thd",
+        pad_between_seqs=packing == "padding_only",
+        is_training=True,
+        deterministic=_deterministic,
+        cp_size=num_gpus,
+    )
+    if not available[1 if kernel_backend == "FusedAttention" else 0]:
+        pytest.skip(f"{kernel_backend} is unavailable for this THD configuration.")
+    _submit(
+        cp_pool(num_gpus),
+        dtype=dtype,
+        model="cp_2_0",
+        qkv_format="thd",
+        kernel_backend=kernel_backend,
+        cp_comm_type="a2a",
+        load_balancing_strategy="NO_LOAD_BALANCE",
+        no_load_balance_case=packing,
         deterministic=_deterministic,
         log_level=pytest_logging_level,
     )
