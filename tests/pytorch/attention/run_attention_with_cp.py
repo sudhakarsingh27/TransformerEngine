@@ -1211,7 +1211,10 @@ def run_mha_with_megaup():
         cp_calls[0] += 1
         assert dist.get_world_size(call["cp_group"]) == len(ranks)
         assert call["q"].shape[-2] == 16 // len(ranks)
-        assert call["max_seqlen_q"] == call["max_seqlen_kv"] == maximum
+        # Trusted-state tests deliberately change maximum lengths between calls.
+        selected = _attention_backends["attention_params"]
+        assert call["max_seqlen_q"] == selected.max_seqlen_q
+        assert call["max_seqlen_kv"] == selected.max_seqlen_kv
         # The real CP autograd Function must execute, with no inner payload exchange.
         with patch.object(
             cp_ops, "flash_attn_a2a_communicate", side_effect=AssertionError("duplicate A2A")
