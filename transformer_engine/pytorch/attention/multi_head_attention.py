@@ -1293,8 +1293,7 @@ class MultiheadAttention(torch.nn.Module):
         # ===========================
         if is_cpu_offload_enabled():
             start_offload(query_layer, key_layer, value_layer, offload_base_tensor=True)
-        attention = cp_plan.local_dpa if cp_plan is not None else self.core_attention
-        context_layer = attention(
+        context_layer = self.core_attention(
             query_layer,
             key_layer,
             value_layer,
@@ -1323,13 +1322,16 @@ class MultiheadAttention(torch.nn.Module):
             qkv_layer=packed_qkv_layer,
             kv_layer=packed_kv_layer,
             qkv_interleave_dim=packed_interleave_dim,
+            cp_external_exchange=(
+                (cp_plan.to_sequence, cp_plan.to_rank) if cp_plan is not None else None
+            ),
         )
 
         # ===================
         # Output. [sq, b, h]
         # ===================
         projection_output = self.proj(
-            cp_plan.rank_order(context_layer) if cp_plan is not None else context_layer,
+            context_layer,
             is_first_microbatch=is_first_microbatch,
             fp8_grad=proj_fp8_grad,
             _cp_projection=cp_plan.pull if cp_plan is not None else None,

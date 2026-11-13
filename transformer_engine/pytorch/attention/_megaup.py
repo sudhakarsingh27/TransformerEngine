@@ -18,7 +18,6 @@ from transformer_engine.pytorch.quantized_tensor import QuantizedTensorStorage
 from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled
 from transformer_engine.pytorch.constants import CPLoadBalancingStrategy
 from transformer_engine.debug.pytorch.debug_state import TEDebugState
-from .dot_product_attention import DotProductAttention
 from .dot_product_attention.context_parallel import (
     get_seq_chunk_ids_for_reordering_before_attn,
     thd_cp_rank_order_to_sequence_order,
@@ -220,7 +219,7 @@ class _CPProjection:
 class _CPAttention:
     """Layout adapters around the existing MHA forward, with no model parameters."""
 
-    def __init__(self, mha, x, runtimes, cu, batch, sequence, validate, contract, local):
+    def __init__(self, mha, x, runtimes, cu, batch, sequence, validate, contract):
         self.format, self.cu = mha.qkv_format, cu
         self.batch, self.sequence, self.cp = batch, sequence, runtimes[0].up
         self.heads, self.d = mha.num_attention_heads, mha.hidden_size_per_attention_head
@@ -233,10 +232,9 @@ class _CPAttention:
             contract,
         )
         self.pull = _CPProjection(runtimes[1], False, self.d, validate_group=validate)
-        self.local_dpa = local
         self.to_sequence = self.to_rank = None
         if self.format != "thd":
-            key = (self.cp, batch, sequence, x.device)
+            key = (self.cp, batch, sequence, self.format, x.device)
             cached = getattr(mha, "_megaup_dense_rows", None)
             if cached is None or cached[0] != key:
                 rows = torch.arange(self.cp * batch * sequence, device=x.device).view(
@@ -244,7 +242,10 @@ class _CPAttention:
                 )
                 rows = rows.permute(1, 0, 2, 3).reshape(batch, 2 * self.cp, sequence // 2)
                 before = get_seq_chunk_ids_for_reordering_before_attn(self.cp, x.device)
-                forward = rows.index_select(1, before).flatten()
+                forward = rows.index_select(1, before).reshape(batch, self.cp * sequence)
+                if self.format == "sbhd":
+                    forward = forward.transpose(0, 1)
+                forward = forward.flatten()
                 cached = (key, forward, torch.argsort(forward))
                 object.__setattr__(mha, "_megaup_dense_rows", cached)
             self.to_sequence, self.to_rank = cached[1:]
@@ -260,18 +261,10 @@ class _CPAttention:
             return _THDReorder.apply(
                 raw.view(-1, width // self.d, self.d), self.cu, self.cp, True
             ).view(-1, width)
-        out = raw.index_select(0, self.to_sequence).view(self.batch, self.cp * self.sequence, width)
-        return out.transpose(0, 1) if self.format == "sbhd" else out
-
-    def rank_order(self, x):
-        width = self.heads * self.d // self.cp
-        if self.format == "thd":
-            return _THDReorder.apply(
-                x.view(-1, width // self.d, self.d), self.cu, self.cp, False
-            ).view(-1, width)
+        shape = (self.batch, self.cp * self.sequence)
         if self.format == "sbhd":
-            x = x.transpose(0, 1)
-        return x.reshape(-1, width).index_select(0, self.to_rank)
+            shape = shape[::-1]
+        return raw.index_select(0, self.to_sequence).view(*shape, width)
 
     def restore_output(self, x):
         if self.format == "thd":
@@ -371,7 +364,7 @@ def prepare_megaup(
     max_seqlen_q=None,
     max_seqlen_kv=None,
 ):
-    """Prepare projection hooks and local attention, or choose rank-uniform fallback."""
+    """Prepare projection hooks and external CP exchanges, or choose rank-uniform fallback."""
     trusted = os.getenv("NVTE_MHA_MEGAUP_TRUSTED", "0") == "1"
     contract = getattr(mha, "_megaup_validated_contract", None) if trusted else None
     group = mha.core_attention.cp_group
@@ -464,9 +457,7 @@ def prepare_megaup(
         )
     )
     runtimes = _RUNTIMES.get(group)
-    local = getattr(mha, "_megaup_local_attention", None)
     valid = valid and sequence > 0 and (thd or sequence % 2 == 0) and batch > 0
-    valid = valid and (local is None or local.num_attention_heads == heads // cp)
     if runtimes is not None:
         valid = valid and all(
             runtime.hidden == channels
@@ -525,30 +516,6 @@ def prepare_megaup(
                 "ready": False,
             }
             object.__setattr__(mha, "_megaup_validated_contract", contract)
-    if local is None:
-        local = DotProductAttention(
-            heads // cp,
-            head_dim,
-            num_gqa_groups=heads // cp,
-            attention_dropout=0.0,
-            qkv_format="bshd",
-            tp_size=1,
-            layer_number=mha.layer_number,
-            softmax_scale=mha.core_attention.softmax_scale,
-        )
-        # This BF16-only, parameterless execution cache is not model state.
-        # Registering it as a child would add DPA's FP8 _extra_state keys to
-        # existing checkpoints. Propagate train/eval explicitly below.
-        object.__setattr__(mha, "_megaup_local_attention", local)
-    local.cp_group = None
-    local.train(mha.training)
-    # Lazy construction must preserve the original module's policy even if
-    # global deterministic settings changed after MHA was constructed.
-    local.deterministic = mha.core_attention.deterministic
-    local.flash_attention.deterministic = mha.core_attention.flash_attention.deterministic
-    local.fused_attention.deterministic = mha.core_attention.fused_attention.deterministic
-    plan = _CPAttention(
-        mha, x, runtimes, cu_seqlens, batch, sequence, validate_group, contract, local
-    )
+    plan = _CPAttention(mha, x, runtimes, cu_seqlens, batch, sequence, validate_group, contract)
     plan.maxima = maxima
     return plan

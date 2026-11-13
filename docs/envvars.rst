@@ -189,7 +189,7 @@ Attention Backend Selection
                  optional external ``mega_up`` package with rectangular
                  projection support. Set the same value on every
                  context-parallel rank. This prototype composes one packed QKV
-                 peer-write projection, local TE attention, and an output pull
+                 peer-write projection, existing TE CP attention, and an output pull
                  projection. Backward uses
                  the complementary kernels and ordinary weight-gradient GEMMs;
                  parameter-gradient reduction remains the caller's responsibility.
@@ -226,8 +226,14 @@ Attention Backend Selection
 
    This opt-in prototype replaces the forward and input-gradient GEMM calls
    inside TE Linear with projection/exchange hooks, while reusing Linear autograd
-   and weight-gradient GEMMs. MHA keeps its normal split, RoPE, local attention,
-   and output-projection flow with explicit CP layout adapters. The private hook
+   and weight-gradient GEMMs. MHA keeps its split, global-position RoPE, and
+   existing CP attention/autograd flow. A private external-exchange mode accepts
+   global-sequence tensors with local heads and returns rank-major context to the
+   output projection. CP attention keeps its attention kernels, saved tensors,
+   and output/inverse-gradient reorders while the Linear hooks perform all four
+   exchanges. Dense row maps account for the differing batch/chunk order;
+   THD uses the existing CP permutations. No separate local DPA is constructed.
+   The private hook
    is eager-only; normal Linear calls and unsupported MHA calls remain unchanged.
    This frontend calls external Python APIs, not a common-layer kernel integration. Non-interleaved QKV weights are
    packed into head-major Q/K/V triplets before projection. Weight packing,

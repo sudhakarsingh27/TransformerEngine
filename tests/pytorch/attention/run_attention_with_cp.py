@@ -1163,6 +1163,7 @@ def _check_megaup_trusted_state(candidate, reference, x, dy, rope, metadata, com
 def run_mha_with_megaup():
     """Check packed rectangular MHA against native CP, including retained graphs."""
     from datetime import timedelta
+    from inspect import signature
     from itertools import accumulate
     from unittest.mock import patch
 
@@ -1176,6 +1177,12 @@ def run_mha_with_megaup():
 
     from transformer_engine.pytorch import MultiheadAttention
     from transformer_engine.pytorch.attention import RotaryPositionEmbedding
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        context_parallel as cp_ops,
+    )
+    from transformer_engine.pytorch.attention.dot_product_attention.dot_product_attention import (
+        _attention_backends,
+    )
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(minutes=10))
@@ -1183,7 +1190,7 @@ def run_mha_with_megaup():
     rank = dist.get_rank()
     assert world_size in (2, 4, 8)
     cases = [(list(range(world_size)), 2, 34, "sbhd", True)]
-    cases.append((list(range(world_size)), 1, 64, "bshd", False))
+    cases.append((list(range(world_size)), 2, 64, "bshd", False))
     # Fresh groups isolate each fixed-capacity arena, including unequal THD samples.
     cases.extend(
         (list(range(world_size)), len(lengths), lengths, "thd", rope)
@@ -1193,6 +1200,33 @@ def run_mha_with_megaup():
     # during validation; the mechanism remains unproven.
     if world_size == 4:
         cases.append(([1, 3], 2, 34, "bshd", True))
+    cp_calls = [0, 0]
+    cp_function = cp_ops.AttnFuncWithCPAndQKVOA2A
+    original_cp_forward, original_cp_backward = cp_function.forward, cp_function.backward
+
+    def cp_forward(*args, **kwargs):
+        call = signature(original_cp_forward).bind(*args, **kwargs).arguments
+        if call["cp_external_exchange"] is None:
+            return original_cp_forward(*args, **kwargs)
+        cp_calls[0] += 1
+        assert dist.get_world_size(call["cp_group"]) == len(ranks)
+        assert call["q"].shape[-2] == 16 // len(ranks)
+        assert call["max_seqlen_q"] == call["max_seqlen_kv"] == maximum
+        # The real CP autograd Function must execute, with no inner payload exchange.
+        with patch.object(
+            cp_ops, "flash_attn_a2a_communicate", side_effect=AssertionError("duplicate A2A")
+        ):
+            return original_cp_forward(*args, **kwargs)
+
+    def cp_backward(ctx, *args):
+        if not ctx.cp_exchanges_external:
+            return original_cp_backward(ctx, *args)
+        cp_calls[1] += 1
+        with patch.object(
+            cp_ops, "flash_attn_a2a_communicate", side_effect=AssertionError("duplicate A2A")
+        ):
+            return original_cp_backward(ctx, *args)
+
     peer_calls = 0
     pull_calls = 0
     original_peer = PreparedPeerWriteGemm.__call__
@@ -1235,6 +1269,10 @@ def run_mha_with_megaup():
         PreparedHeadShardPullGemm, "__call__", pull
     ), patch.object(PreparedPeerWriteGemmTHD, "__call__", peer_thd), patch.object(
         PreparedHeadShardPullGemmTHD, "__call__", pull_thd
+    ), patch.object(
+        cp_function, "forward", cp_forward
+    ), patch.object(
+        cp_function, "backward", cp_backward
     ):
         for ranks, batch, sequence, qkv_format, use_rope in cases:
             group = dist.new_group(ranks)
@@ -1329,6 +1367,7 @@ def run_mha_with_megaup():
                     reference.zero_grad(set_to_none=True)
                     candidate.zero_grad(set_to_none=True)
                     before = (peer_calls, pull_calls)
+                    cp_before = tuple(cp_calls)
                     graphs = []
                     for microbatch in range(2):
                         torch.manual_seed(1000 + rank * 100 + step * 10 + microbatch)
@@ -1340,18 +1379,61 @@ def run_mha_with_megaup():
                             yr = reference(xr, rotary_pos_emb=rope, **metadata)
                         with patch.dict(os.environ, NVTE_MHA_MEGAUP="1"):
                             yc = candidate(xc, rotary_pos_emb=rope, **metadata)
+                        assert not hasattr(candidate, "_megaup_local_attention")
+                        assert candidate.core_attention.num_attention_heads == 16
+                        selected = _attention_backends["attention_params"]
+                        assert selected.context_parallel and selected.cp_size == 1
+                        assert selected.num_heads == 16 // len(ranks)
+                        assert selected.max_seqlen_q == selected.max_seqlen_kv == maximum
+                        if not thd and step == 0 and microbatch == 0:
+                            # Independent source-rank/early-or-late token oracle, B>1.
+                            p, half = len(ranks), sequence // 2
+                            coordinates = (
+                                ((b, token) for b in range(batch) for token in range(p * sequence))
+                                if qkv_format == "bshd"
+                                else (
+                                    (b, token)
+                                    for token in range(p * sequence)
+                                    for b in range(batch)
+                                )
+                            )
+                            expected = []
+                            for b, token in coordinates:
+                                chunk, offset = divmod(token, half)
+                                source = chunk if chunk < p else 2 * p - 1 - chunk
+                                expected.append(
+                                    (source * batch + b) * sequence
+                                    + offset
+                                    + (half if chunk >= p else 0)
+                                )
+                            expected = torch.tensor(expected, device="cuda")
+                            to_sequence, to_rank = candidate._megaup_dense_rows[1:]
+                            torch.testing.assert_close(to_sequence, expected, atol=0, rtol=0)
+                            torch.testing.assert_close(to_rank, expected.argsort(), atol=0, rtol=0)
                         if microbatch == 0:
                             residual = torch.randn_like(yc)
                             yr.add_(residual)
                             yc.add_(residual)
                         graphs.append((xr, xc, yr, yc, dy))
                     # Compare after both forwards: this also detects overwritten outputs.
-                    for xr, xc, yr, yc, dy in reversed(graphs):
+                    for graph_index, (xr, xc, yr, yc, dy) in enumerate(reversed(graphs)):
                         compare(yc, yr, "output")
                         yr.backward(dy)
+                        if graph_index == 0:
+                            yc.backward(dy, retain_graph=True)
+                            compare(xc.grad, xr.grad, "retained dInput")
+                            for name, parameter in candidate.named_parameters():
+                                compare(
+                                    parameter.grad,
+                                    dict(reference.named_parameters())[name].grad,
+                                    f"retained {name}",
+                                )
+                            candidate.zero_grad(set_to_none=True)
+                            xc.grad = None
                         yc.backward(dy)
                         compare(xc.grad, xr.grad, "dInput")
-                    assert (peer_calls - before[0], pull_calls - before[1]) == (4, 4)
+                    assert (peer_calls - before[0], pull_calls - before[1]) == (5, 5)
+                    assert tuple(x - y for x, y in zip(cp_calls, cp_before)) == (2, 3)
                     ref_parameters = dict(reference.named_parameters())
                     for name, parameter in candidate.named_parameters():
                         other = ref_parameters[name]
