@@ -1001,10 +1001,486 @@ def run_dpa_with_cp(
             pass
 
 
+def _check_megaup_trusted_state(candidate, reference, x, dy, rope, metadata, compare, group):
+    """Trusted fixed contracts reject changes locally; coordinated resets revalidate."""
+    from unittest.mock import patch
+    import mega_up.ops as ops
+    from transformer_engine.pytorch.attention import _megaup as implementation
+
+    cp = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    cu = metadata["cu_seqlens_q"].clone()
+    maximum = metadata["max_seqlen_q"]
+    object.__setattr__(candidate, "_megaup_thd_metadata_cache", None)
+    object.__setattr__(candidate, "_megaup_validated_contract", None)
+
+    def arguments(bounds, max_length=maximum):
+        return dict(
+            cu_seqlens_q=bounds,
+            cu_seqlens_kv=bounds,
+            cu_seqlens_q_padded=bounds,
+            cu_seqlens_kv_padded=bounds,
+            max_seqlen_q=max_length,
+            max_seqlen_kv=max_length,
+        )
+
+    def step(bounds, expected, max_length=maximum, rows=None):
+        source = x if rows is None else x[:rows]
+        gradient = dy if rows is None else dy[:rows]
+        xr, xc = (source.detach().clone().requires_grad_() for _ in range(2))
+        reference.zero_grad(set_to_none=True)
+        candidate.zero_grad(set_to_none=True)
+        kwargs = arguments(bounds, max_length)
+        with patch.dict(os.environ, NVTE_MHA_MEGAUP="0"):
+            yr = reference(xr, rotary_pos_emb=rope, **kwargs)
+            yr.backward(gradient)
+        with patch.dict(os.environ, NVTE_MHA_MEGAUP="1", NVTE_MHA_MEGAUP_TRUSTED="1"), patch.object(
+            dist, "all_gather_object", wraps=dist.all_gather_object
+        ) as gathers, patch.object(
+            ops, "_collective_validate", wraps=ops._collective_validate
+        ) as validates, patch.object(
+            implementation, "_thd_values", wraps=implementation._thd_values
+        ) as reads:
+            yc = candidate(xc, rotary_pos_emb=rope, **kwargs)
+            yc.backward(gradient)
+            counts = (gathers.call_count, validates.call_count, reads.call_count)
+        assert counts == expected, (rank, counts, expected)
+        compare(yc, yr, "trusted dynamic output")
+        compare(xc.grad, xr.grad, "trusted dynamic dInput")
+        for (name, actual), (_, wanted) in zip(
+            candidate.named_parameters(), reference.named_parameters()
+        ):
+            compare(actual.grad, wanted.grad, f"trusted dynamic gradient {name}")
+        assert candidate._megaup_validated_contract["ready"]
+
+    def reset():
+        # Tests call this on every rank, never while peers are in a payload.
+        object.__setattr__(candidate, "_megaup_validated_contract", None)
+
+    def reject(bounds, max_length=maximum, rows=None):
+        with patch.object(dist, "all_gather_object", wraps=dist.all_gather_object) as gathers:
+            try:
+                implementation.forward_megaup(
+                    candidate,
+                    x if rows is None else x[:rows],
+                    eligible_call=True,
+                    rotary_pos_emb=rope,
+                    attn_mask_type="padding_causal",
+                    **arguments(bounds, max_length),
+                )
+            except RuntimeError as error:
+                assert "Trusted MegaUP" in str(error)
+            else:
+                raise AssertionError("Initialized trusted contract accepted a changed input")
+            assert gathers.call_count == 0
+
+    step(cu, (16, 14, 1))
+    step(cu, (0, 0, 0))
+    cu = cu.clone()
+    step(cu, (0, 0, 1))  # Equivalent new identity rereads without changing the contract.
+    cu.add_(0)
+    step(cu, (0, 0, 1))  # Version-tracked edit with identical values also stays valid.
+    cu[1] += 2 * cp
+    reject(cu)
+    reset()
+    step(cu, (16, 14, 0))  # Rejected call already refreshed the metadata cache.
+    step(cu, (0, 0, 0))
+    one_rank_copy = cu.clone() if rank == 0 else cu
+    step(one_rank_copy, (0, 0, int(rank == 0)))
+    reject(one_rank_copy, max_length=maximum + 2 * cp)
+    reset()
+    step(one_rank_copy, (16, 14, 0), max_length=maximum + 2 * cp)
+    # Deliberate rank-local errors are tested without sending other ranks into payloads.
+    dist.barrier(group=group)
+    if rank == 0:
+        reject(one_rank_copy.to(torch.int64), max_length=maximum + 2 * cp)
+        original_group = candidate.core_attention.cp_group
+        candidate.core_attention.cp_group = None
+        try:
+            reject(one_rank_copy, max_length=maximum + 2 * cp)
+        finally:
+            candidate.core_attention.cp_group = original_group
+    dist.barrier(group=group)
+
+    # Invalid maxima cannot compare equal to an int inside a warmed cache key.
+    with patch.object(implementation, "_thd_values", wraps=implementation._thd_values) as reads:
+        try:
+            implementation._cached_thd_metadata(
+                candidate,
+                x,
+                cp,
+                (one_rank_copy,) * 4,
+                (torch.tensor(maximum + 2 * cp, device="cuda"), maximum + 2 * cp),
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Tensor maximum bypassed validation via a cache hit")
+        assert reads.call_count == 1
+    with torch.inference_mode():
+        inference_cu = cu.clone()
+    with patch.object(implementation, "_thd_values", wraps=implementation._thd_values) as reads:
+        for _ in range(2):
+            implementation._cached_thd_metadata(
+                candidate, x, cp, (inference_cu,) * 4, (maximum, maximum)
+            )
+        assert reads.call_count == 2
+    short = torch.tensor([0, 32 * cp, 64 * cp], device="cuda", dtype=torch.int32)
+    reject(short, rows=64)
+    reset()
+    step(short, (16, 14, 0), rows=64)
+
+    # Same-contract retained forwards share readiness, but a graph from a reset
+    # state cannot certify a new state. Only this test deliberately resets while
+    # old graphs exist; real callers reset between completed steps.
+    a = torch.tensor([0, 32 * cp, 80 * cp], device="cuda", dtype=torch.int32)
+    reset()
+    candidate.zero_grad(set_to_none=True)
+    with patch.dict(os.environ, NVTE_MHA_MEGAUP="1", NVTE_MHA_MEGAUP_TRUSTED="1"):
+        ya = candidate(x.clone().requires_grad_(), rotary_pos_emb=rope, **arguments(a))
+        state_a = candidate._megaup_validated_contract
+        with patch.object(dist, "all_gather_object", wraps=dist.all_gather_object) as gathers:
+            yb = candidate(x.clone().requires_grad_(), rotary_pos_emb=rope, **arguments(a))
+            assert gathers.call_count == 7  # Nested forward checks only, no TE checks.
+        assert candidate._megaup_validated_contract is state_a and not state_a["ready"]
+        reset()
+        yc = candidate(x.clone().requires_grad_(), rotary_pos_emb=rope, **arguments(a))
+        state_c = candidate._megaup_validated_contract
+    with patch.dict(os.environ, NVTE_MHA_MEGAUP_TRUSTED="0"):
+        yb.backward(dy)
+    assert state_a["ready"] and not state_c["ready"]
+    ya.backward(dy)
+    assert not state_c["ready"]
+    yc.backward(dy)
+    assert state_c["ready"]
+    print(
+        f"Trusted state passed: rank={rank}, CP={cp}; cold16/14, warm0/0/0, fresh0/0/1"
+        " (gathers/library/metadata reads)",
+        flush=True,
+    )
+
+
+def run_mha_with_megaup():
+    """Check packed rectangular MHA against native CP, including retained graphs."""
+    from datetime import timedelta
+    from itertools import accumulate
+    from unittest.mock import patch
+
+    import mega_up.ops as ops
+    from mega_up.ops import (
+        PreparedHeadShardPullGemm,
+        PreparedHeadShardPullGemmTHD,
+        PreparedPeerWriteGemm,
+        PreparedPeerWriteGemmTHD,
+    )
+
+    from transformer_engine.pytorch import MultiheadAttention
+    from transformer_engine.pytorch.attention import RotaryPositionEmbedding
+
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("nccl", timeout=timedelta(minutes=10))
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    assert world_size in (2, 4, 8)
+    cases = [(list(range(world_size)), 2, 34, "sbhd", True)]
+    cases.append((list(range(world_size)), 1, 64, "bshd", False))
+    # Fresh groups isolate each fixed-capacity arena, including unequal THD samples.
+    cases.extend(
+        (list(range(world_size)), len(lengths), lengths, "thd", rope)
+        for lengths, rope in [((34, 34), True), ((32, 48), True), ((64,), False)]
+    )
+    # Preserve subgroup-last ordering: the subgroup-to-world transition stalled
+    # during validation; the mechanism remains unproven.
+    if world_size == 4:
+        cases.append(([1, 3], 2, 34, "bshd", True))
+    peer_calls = 0
+    pull_calls = 0
+    original_peer = PreparedPeerWriteGemm.__call__
+    original_pull = PreparedHeadShardPullGemm.__call__
+    original_peer_thd = PreparedPeerWriteGemmTHD.__call__
+    original_pull_thd = PreparedHeadShardPullGemmTHD.__call__
+
+    def peer(*args, **kwargs):
+        nonlocal peer_calls
+        peer_calls += 1
+        return original_peer(*args, **kwargs)
+
+    def pull(prepared, *args, **kwargs):
+        nonlocal pull_calls
+        pull_calls += 1
+        return original_pull(prepared, *args, **kwargs)
+
+    def peer_thd(*args, **kwargs):
+        nonlocal peer_calls
+        peer_calls += 1
+        return original_peer_thd(*args, **kwargs)
+
+    def pull_thd(prepared, *args, **kwargs):
+        nonlocal pull_calls
+        pull_calls += 1
+        return original_pull_thd(prepared, *args, **kwargs)
+
+    def compare(actual, expected, name):
+        # Match the established BF16 CP tolerance, with a relative-norm guard
+        # so small tensors cannot pass solely on the absolute tolerance.
+        torch.testing.assert_close(
+            actual, expected, atol=2.5e-2, rtol=2.5e-2, msg=lambda detail: f"{name}: {detail}"
+        )
+        relative = (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(
+            1e-12
+        )
+        assert relative < 2.5e-2, f"{name}: relative L2={relative.item()}"
+
+    with patch.object(PreparedPeerWriteGemm, "__call__", peer), patch.object(
+        PreparedHeadShardPullGemm, "__call__", pull
+    ), patch.object(PreparedPeerWriteGemmTHD, "__call__", peer_thd), patch.object(
+        PreparedHeadShardPullGemmTHD, "__call__", pull_thd
+    ):
+        for ranks, batch, sequence, qkv_format, use_rope in cases:
+            group = dist.new_group(ranks)
+            if rank in ranks:
+                torch.manual_seed(1234)
+                thd = qkv_format == "thd"
+                lengths = sequence if thd else (sequence,) * batch
+                maximum = max(lengths) * len(ranks)
+                metadata = {}
+                if thd:
+                    cu = torch.tensor(
+                        [0] + list(accumulate(length * len(ranks) for length in lengths)),
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                    metadata = dict(
+                        cu_seqlens_q=cu,
+                        cu_seqlens_kv=cu,
+                        cu_seqlens_q_padded=cu,
+                        cu_seqlens_kv_padded=cu,
+                        max_seqlen_q=maximum,
+                        max_seqlen_kv=maximum,
+                    )
+                    # Independent token IDs prove both native permutations, including
+                    # each sample's second (reverse-rank) half in the CP partition.
+                    from transformer_engine.pytorch.attention.dot_product_attention import (
+                        context_parallel as cp_ops,
+                    )
+
+                    bounds = cu.tolist()
+                    rank_ids = torch.cat(
+                        [
+                            torch.arange(
+                                a + chunk * ((z - a) // (2 * len(ranks))),
+                                a + (chunk + 1) * ((z - a) // (2 * len(ranks))),
+                                device="cuda",
+                            )
+                            for r in range(len(ranks))
+                            for a, z in zip(bounds, bounds[1:])
+                            for chunk in (r, 2 * len(ranks) - 1 - r)
+                        ]
+                    )
+                    ids = (
+                        torch.arange(bounds[-1], device="cuda", dtype=torch.float32)
+                        .view(-1, 1, 1)
+                        .repeat(1, 1, 4)
+                    )
+                    ordered = cp_ops.thd_sequence_order_to_cp_rank_order(ids, cu, len(ranks))
+                    torch.testing.assert_close(ordered, ids[rank_ids], atol=0, rtol=0)
+                    torch.testing.assert_close(
+                        cp_ops.thd_cp_rank_order_to_sequence_order(ids, cu, len(ranks)),
+                        ids[torch.argsort(rank_ids)],
+                        atol=0,
+                        rtol=0,
+                    )
+                arguments = dict(
+                    hidden_size=2048,
+                    num_attention_heads=16,
+                    kv_channels=128,
+                    attention_dropout=0.0,
+                    attn_mask_type=(
+                        ("padding_causal" if use_rope else "padding")
+                        if thd
+                        else ("causal" if use_rope else "no_mask")
+                    ),
+                    params_dtype=torch.bfloat16,
+                    bias=False,
+                    input_layernorm=False,
+                    fuse_qkv_params=True,
+                    qkv_weight_interleaved=use_rope,
+                    qkv_format=qkv_format,
+                )
+                reference = MultiheadAttention(**arguments).cuda()
+                candidate = MultiheadAttention(**arguments).cuda()
+                candidate.load_state_dict(reference.state_dict())
+                original_keys = set(candidate.state_dict())
+                original_parameters = {
+                    name: id(value) for name, value in candidate.named_parameters()
+                }
+                for module in (reference, candidate):
+                    module.set_context_parallel_group(group, ranks, torch.cuda.Stream(), "a2a")
+                rope = RotaryPositionEmbedding(128)(maximum).cuda() if use_rope else None
+                shape = (
+                    (sum(lengths), 2048)
+                    if thd
+                    else (
+                        (batch, sequence, 2048) if qkv_format == "bshd" else (sequence, batch, 2048)
+                    )
+                )
+                # The second step must consume updated weights, not a cached transpose.
+                for step in range(2):
+                    reference.zero_grad(set_to_none=True)
+                    candidate.zero_grad(set_to_none=True)
+                    before = (peer_calls, pull_calls)
+                    graphs = []
+                    for microbatch in range(2):
+                        torch.manual_seed(1000 + rank * 100 + step * 10 + microbatch)
+                        x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+                        xr = x.clone().requires_grad_()
+                        xc = x.clone().requires_grad_()
+                        dy = torch.randn_like(x) * 0.1
+                        with patch.dict(os.environ, NVTE_MHA_MEGAUP="0"):
+                            yr = reference(xr, rotary_pos_emb=rope, **metadata)
+                        with patch.dict(os.environ, NVTE_MHA_MEGAUP="1"):
+                            yc = candidate(xc, rotary_pos_emb=rope, **metadata)
+                        if microbatch == 0:
+                            residual = torch.randn_like(yc)
+                            yr.add_(residual)
+                            yc.add_(residual)
+                        graphs.append((xr, xc, yr, yc, dy))
+                    # Compare after both forwards: this also detects overwritten outputs.
+                    for xr, xc, yr, yc, dy in reversed(graphs):
+                        compare(yc, yr, "output")
+                        yr.backward(dy)
+                        yc.backward(dy)
+                        compare(xc.grad, xr.grad, "dInput")
+                    assert (peer_calls - before[0], pull_calls - before[1]) == (4, 4)
+                    ref_parameters = dict(reference.named_parameters())
+                    for name, parameter in candidate.named_parameters():
+                        other = ref_parameters[name]
+                        assert parameter.grad is not None and other.grad is not None
+                        compare(parameter.grad, other.grad, f"local gradient {name}")
+                        # CP parameter reduction belongs to the training wrapper, not
+                        # either projection function. Apply it once to each reference.
+                        dist.all_reduce(parameter.grad, group=group)
+                        dist.all_reduce(other.grad, group=group)
+                        compare(parameter.grad, other.grad, f"reduced gradient {name}")
+                        with torch.no_grad():
+                            parameter.add_(parameter.grad, alpha=-0.01)
+                            other.add_(other.grad, alpha=-0.01)
+                        compare(parameter, other, f"updated parameter {name}")
+                    assert set(candidate.state_dict()) == original_keys
+                    assert {
+                        name: id(value) for name, value in candidate.named_parameters()
+                    } == original_parameters
+                if thd and len(set(lengths)) == 1:
+                    # Same local dual-chunk rows, weights and dy: format alone changes.
+                    dense = MultiheadAttention(
+                        **{
+                            **arguments,
+                            "qkv_format": "bshd",
+                            "attn_mask_type": "causal" if use_rope else "no_mask",
+                        }
+                    ).cuda()
+                    dense.load_state_dict(candidate.state_dict())
+                    dense.set_context_parallel_group(group, ranks, torch.cuda.Stream(), "a2a")
+                    for enabled in ("0", "1"):
+                        results = []
+                        for module, value, kwargs in (
+                            (candidate, x, metadata),
+                            (dense, x.view(batch, lengths[0], 2048), {}),
+                        ):
+                            module.zero_grad(set_to_none=True)
+                            leaf = value.detach().clone().requires_grad_()
+                            with patch.dict(os.environ, NVTE_MHA_MEGAUP=enabled):
+                                result = module(leaf, rotary_pos_emb=rope, **kwargs)
+                            result.backward(dy.view_as(leaf))
+                            results.append(
+                                [result.detach().reshape(-1, 2048), leaf.grad.reshape(-1, 2048)]
+                                + [p.grad for p in module.parameters()]
+                            )
+                        for thd_value, dense_value in zip(*results):
+                            compare(thd_value, dense_value, f"THD/BSHD enabled={enabled}")
+                    del dense, results
+                if (
+                    thd
+                    and len(set(lengths)) > 1
+                    and os.getenv("NVTE_MHA_MEGAUP_TRUSTED", "0") == "1"
+                ):
+                    _check_megaup_trusted_state(
+                        candidate, reference, x, dy, rope, metadata, compare, group
+                    )
+                if thd:
+                    from transformer_engine.pytorch.attention._megaup import forward_megaup
+
+                    # These exercise uninitialized coordinated fallback, not a fixed contract.
+                    object.__setattr__(candidate, "_megaup_validated_contract", None)
+                    # Malformed metadata must return uniformly before kernel barriers;
+                    # do not send invalid inputs down native attention afterwards.
+                    before_guard = (peer_calls, pull_calls)
+                    bad_dtype = {**metadata, "cu_seqlens_q": cu.to(torch.int64)}
+                    mismatch = cu.clone()
+                    if rank == ranks[0]:
+                        mismatch[1] += 2 * len(ranks)
+                    bad_rank = {
+                        **metadata,
+                        "cu_seqlens_q": mismatch,
+                        "cu_seqlens_kv": mismatch,
+                        "cu_seqlens_q_padded": mismatch,
+                        "cu_seqlens_kv_padded": mismatch,
+                        "max_seqlen_q": maximum + 2 * len(ranks),
+                        "max_seqlen_kv": maximum + 2 * len(ranks),
+                    }
+                    for bad in (bad_dtype, bad_rank, {**metadata, "max_seqlen_q": 1}):
+                        assert (
+                            forward_megaup(
+                                candidate,
+                                x,
+                                eligible_call=True,
+                                rotary_pos_emb=rope,
+                                attn_mask_type=arguments["attn_mask_type"],
+                                **bad,
+                            )
+                            is None
+                        )
+                    assert (peer_calls, pull_calls) == before_guard
+                    # A real padding-gap input is valid native THD but outside fusion.
+                    logical = cu.clone()
+                    logical[1:] -= torch.arange(1, batch + 1, device="cuda", dtype=torch.int32) * (
+                        2 * len(ranks)
+                    )
+                    padded = {**metadata, "cu_seqlens_q": logical, "cu_seqlens_kv": logical}
+                    with torch.no_grad(), patch.dict(os.environ, NVTE_MHA_MEGAUP="0"):
+                        expected = candidate(
+                            x, rotary_pos_emb=rope, pad_between_seqs=True, **padded
+                        )
+                    with torch.no_grad(), patch.dict(os.environ, NVTE_MHA_MEGAUP="1"):
+                        actual = candidate(x, rotary_pos_emb=rope, pad_between_seqs=True, **padded)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    assert (peer_calls, pull_calls) == before_guard
+                # Bias is outside the prototype: opting in must retain native behavior.
+                fallback = MultiheadAttention(**{**arguments, "bias": True}).cuda()
+                fallback.set_context_parallel_group(group, ranks, torch.cuda.Stream(), "a2a")
+                before = (peer_calls, pull_calls)
+                with torch.no_grad(), patch.dict(os.environ, NVTE_MHA_MEGAUP="0"):
+                    expected = fallback(x, rotary_pos_emb=rope, **metadata)
+                with torch.no_grad(), patch.dict(os.environ, NVTE_MHA_MEGAUP="1"):
+                    actual = fallback(x, rotary_pos_emb=rope, **metadata)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                assert (peer_calls, pull_calls) == before
+                print(
+                    f"MegaUP passed: rank={rank}, CP={len(ranks)}, B={batch}, S={sequence},"
+                    f" {qkv_format}, RoPE={use_rope}",
+                    flush=True,
+                )
+            dist.barrier()
+    dist.destroy_process_group()
+
+
 def main(**kwargs):
     run_dpa_with_cp(**kwargs)
 
 
 if __name__ == "__main__":
-    kwargs = dict(arg.split("=") for arg in sys.argv[2:])
-    main(**kwargs)
+    if sys.argv[1:2] == ["megaup"]:
+        run_mha_with_megaup()
+    else:
+        kwargs = dict(arg.split("=") for arg in sys.argv[2:])
+        main(**kwargs)
