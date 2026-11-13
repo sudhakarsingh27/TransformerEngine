@@ -321,6 +321,278 @@ def _test_reduce_scatter(
     torch.testing.assert_close(dx_test, dx_ref, rtol=0, atol=0)
 
 
+def _test_context_parallel_all_to_all(
+    *,
+    local_tokens: int = 5,
+    local_features: int = 7,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device = "cuda",
+) -> None:
+    """Check both CP-A2A directions and their inverse gradients."""
+    process_group = world_group()
+    rank = torch.distributed.get_rank(process_group)
+    world_size = torch.distributed.get_world_size(process_group)
+    full_features = world_size * local_features
+
+    # Replicate the global reference on each rank so expected peer slices can
+    # be computed without using the implementation under test.
+    x_global = torch.arange(
+        world_size * local_tokens * full_features,
+        dtype=dtype,
+        device=device,
+    ).reshape(world_size, local_tokens, full_features)
+    grad_head_global = torch.arange(
+        world_size * world_size * local_tokens * local_features,
+        dtype=dtype,
+        device=device,
+    ).reshape(world_size, world_size * local_tokens, local_features)
+
+    x = x_global[rank].clone().requires_grad_()
+    expected_head = torch.cat(
+        [
+            x_global[src, :, rank * local_features : (rank + 1) * local_features]
+            for src in range(world_size)
+        ],
+        dim=0,
+    )
+    expected_dx = torch.cat(
+        [
+            grad_head_global[dst].reshape(world_size, local_tokens, local_features)[rank]
+            for dst in range(world_size)
+        ],
+        dim=-1,
+    )
+
+    to_head = te_ops.ContextParallelAllToAll(
+        process_group=process_group,
+        direction="sequence_to_head",
+    )
+    head = to_head(x)
+    head.backward(grad_head_global[rank])
+    torch.testing.assert_close(head, expected_head, rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, expected_dx, rtol=0, atol=0)
+
+    grad_sequence_global = torch.arange(
+        world_size * local_tokens * full_features,
+        dtype=dtype,
+        device=device,
+    ).reshape(world_size, local_tokens, full_features)
+    expected_dhead = torch.cat(
+        [
+            grad_sequence_global[src][:, rank * local_features : (rank + 1) * local_features]
+            for src in range(world_size)
+        ],
+        dim=0,
+    )
+
+    head_input = expected_head.clone().requires_grad_()
+    to_sequence = te_ops.ContextParallelAllToAll(
+        process_group=process_group,
+        direction="head_to_sequence",
+    )
+    sequence = to_sequence(head_input)
+    sequence.backward(grad_sequence_global[rank])
+    torch.testing.assert_close(sequence, x_global[rank], rtol=0, atol=0)
+    torch.testing.assert_close(head_input.grad, expected_dhead, rtol=0, atol=0)
+
+
+def _test_cp_projection_pairs(process_group=None, *, use_megaup=False) -> None:
+    """Independent forward/dX/dW oracles for the two complete CP projection pairs."""
+    if process_group is None:
+        world_group()
+        process_group = torch.distributed.group.WORLD
+    cp, rank = (
+        torch.distributed.get_world_size(process_group),
+        torch.distributed.get_rank(process_group),
+    )
+    m, k = 128, 1024
+
+    def compare(actual, expected):
+        passed = torch.isclose(actual, expected, atol=0.03, rtol=0.03).all().int()
+        torch.distributed.all_reduce(passed, op=torch.distributed.ReduceOp.MIN, group=process_group)
+        assert passed.item(), "CP projection output or gradient differs from independent matmul"
+
+    for direction, interleave in (
+        ("sequence_to_head", False),
+        ("sequence_to_head", True),
+        ("head_to_sequence", False),
+    ):
+        n = 3072 if direction == "sequence_to_head" else 1024
+        reset_rng()
+        owner = torch.nn.Module()
+        owner.weight = torch.nn.Parameter(
+            torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
+        )
+        linear = te_ops.BasicLinear(k, n, device="meta", dtype=torch.bfloat16)
+        linear.weight = owner.weight  # Bind the original Parameter without initializing/copying it.
+        runtime = None
+        if use_megaup:
+            from mega_up import initialize_runtime
+
+            runtime = initialize_runtime(
+                process_group,
+                hidden=n if direction == "sequence_to_head" else k,
+                max_rows=m,
+                device=owner.weight.device,
+            )
+        exchange = te_ops.ContextParallelAllToAll(
+            process_group, direction=direction, megaup_runtime=runtime
+        )
+        modules = [linear]
+        if interleave:
+            modules.append(te_ops.InterleaveQKV(k // 128, 128))
+        modules = modules + [exchange] if direction == "sequence_to_head" else [exchange, linear]
+        sequence = te_ops.Sequential(*modules)
+        object.__setattr__(owner, "_projection", sequence)
+        if use_megaup:
+            local_width = k if direction == "sequence_to_head" else k // cp
+            with pytest.raises(ValueError, match="input width"):
+                sequence(torch.empty(m, local_width * 2, device="cuda", dtype=torch.bfloat16))
+            if direction == "head_to_sequence":
+                with pytest.raises(ValueError, match="input rows"):
+                    sequence(
+                        torch.empty(m * cp + 1, local_width, device="cuda", dtype=torch.bfloat16)
+                    )
+        assert set(owner.state_dict()) == {"weight"}
+        assert next(owner.parameters()) is linear.weight
+
+        for step in range(2):
+            graphs = []
+            for microbatch in range(2):
+                reset_rng(1700 + 10 * step + microbatch)
+                if direction == "sequence_to_head":
+                    all_x = torch.randn(cp, m, k, device="cuda", dtype=torch.bfloat16) * 0.1
+                    all_dy = (
+                        torch.randn(cp, cp * m, n // cp, device="cuda", dtype=torch.bfloat16) * 0.1
+                    )
+                    x = all_x[rank].clone().requires_grad_()
+                    # Source and destination slices are derived independently of the A2A op.
+                    all_y = all_x @ owner.weight.detach().t()
+                    if interleave:
+                        all_y = (
+                            all_y.view(cp, m, 3, k // 128, 128).transpose(2, 3).reshape(cp, m, n)
+                        )
+                    expected_y = all_y[:, :, rank * (n // cp) : (rank + 1) * (n // cp)].reshape(
+                        cp * m, n // cp
+                    )
+                    dense_dy = all_dy[:, rank * m : (rank + 1) * m].movedim(0, 1).reshape(m, n)
+                    if interleave:
+                        dense_dy = dense_dy.view(m, k // 128, 3, 128).transpose(1, 2).reshape(m, n)
+                    expected_dx = dense_dy @ owner.weight.detach()
+                    expected_dw = dense_dy.t() @ all_x[rank]
+                else:
+                    all_x = (
+                        torch.randn(cp, cp * m, k // cp, device="cuda", dtype=torch.bfloat16) * 0.1
+                    )
+                    all_dy = torch.randn(cp, m, n, device="cuda", dtype=torch.bfloat16) * 0.1
+                    x = all_x[rank].clone().requires_grad_()
+                    materialized = all_x[:, rank * m : (rank + 1) * m].movedim(0, 1).reshape(m, k)
+                    expected_y = materialized @ owner.weight.detach().t()
+                    all_dx = all_dy @ owner.weight.detach()
+                    expected_dx = all_dx[:, :, rank * (k // cp) : (rank + 1) * (k // cp)].reshape(
+                        cp * m, k // cp
+                    )
+                    expected_dw = all_dy[rank].t() @ materialized
+                y = sequence(x)
+                if microbatch == 0:
+                    y.add_(0.125)
+                    expected_y = expected_y + 0.125
+                from transformer_engine.pytorch.ops.fused.megaup_linear import MegaUPLinear
+
+                forward_ops = sequence._module_groups[0]._forward_ops
+                assert any(isinstance(op, MegaUPLinear) for op, _ in forward_ops) == use_megaup
+                graphs.append((x, y, all_dy[rank], expected_y, expected_dx, expected_dw))
+            # Both outputs and saved materializations must survive another forward.
+            for x, y, dy, expected_y, expected_dx, expected_dw in reversed(graphs):
+                owner.weight.grad = None
+                compare(y, expected_y)
+                repeat = step == 0 and y is graphs[-1][1]
+                saved_activation = None
+                if repeat and direction == "head_to_sequence":
+                    import weakref
+
+                    # Keep the output/grad_fn alive while checking saved activation release.
+                    saved_activation = weakref.ref(y.grad_fn.saved_tensors[0])
+                y.backward(dy, retain_graph=repeat)
+                compare(x.grad, expected_dx)
+                compare(owner.weight.grad, expected_dw)
+                if repeat:
+                    if saved_activation is not None:
+                        assert saved_activation() is not None
+                    x.grad = owner.weight.grad = None
+                    y.backward(dy)
+                    compare(x.grad, expected_dx)
+                    compare(owner.weight.grad, expected_dw)
+                    if saved_activation is not None:
+                        assert saved_activation() is None
+            with torch.no_grad():
+                # Identical update on each CP replica; bindings must see live storage.
+                owner.weight.add_(0.001)
+            assert linear.weight is owner.weight and set(owner.state_dict()) == {"weight"}
+
+        # Frozen weights still require the inverse communication for input gradients.
+        owner.weight.requires_grad_(False)
+        owner.weight.grad = None
+        x = x.detach().clone().requires_grad_()
+        y = sequence(x)
+        y.backward(torch.ones_like(y))
+        if direction == "sequence_to_head":
+            expected_dx = torch.ones(m, n, device="cuda", dtype=x.dtype) @ owner.weight
+        else:
+            dense_dx = torch.ones(cp * m, n, device="cuda", dtype=x.dtype) @ owner.weight
+            expected_dx = dense_dx[:, rank * (k // cp) : (rank + 1) * (k // cp)]
+        compare(x.grad, expected_dx)
+        assert owner.weight.grad is None
+    if rank == 0:
+        print(
+            f"CP projection pairs passed: CP={cp}, MegaUP={use_megaup}, retained graphs, dX/dW,"
+            " live weights",
+            flush=True,
+        )
+
+
+def run_cp_a2a_tests(*, use_megaup=False) -> None:
+    """Run focused CP semantics/pairs on the world group and disjoint subgroups."""
+    group = world_group()
+    with pytest.raises(ValueError):
+        te_ops.InterleaveQKV(0, 128)
+    packing = te_ops.InterleaveQKV(8, 128)
+    with pytest.raises(ValueError):
+        packing.op_forward(None, torch.empty(2, 1536, device="cuda"), None, None)
+    _test_context_parallel_all_to_all()
+    cp = torch.distributed.get_world_size(group)
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    with ExitStack() as stack:
+        if use_megaup:
+            import mega_up
+
+            peer = stack.enter_context(
+                patch.object(mega_up, "peer_write_gemm_thd", wraps=mega_up.peer_write_gemm_thd)
+            )
+            pull = stack.enter_context(
+                patch.object(
+                    mega_up,
+                    "prepare_headshard_pull_gemm_thd",
+                    wraps=mega_up.prepare_headshard_pull_gemm_thd,
+                )
+            )
+        _test_cp_projection_pairs(group, use_megaup=use_megaup)
+        if cp >= 4:
+            # Every world rank creates groups in the same order and participates in one.
+            for members in (list(range(0, cp, 2)), list(range(1, cp, 2))):
+                subgroup = torch.distributed.new_group(members)
+                if torch.distributed.get_rank(group) in members:
+                    _test_cp_projection_pairs(subgroup, use_megaup=use_megaup)
+        if use_megaup:
+            # Five forward/backwards per layout plus a repeated backward: the two
+            # Peer layouts add two Pull calls; the Pull layout adds one Peer call.
+            groups = 2 if cp >= 4 else 1
+            assert (peer.call_count, pull.call_count) == (16 * groups, 17 * groups)
+    torch.distributed.barrier(group)
+
+
 def _test_basic_linear(
     *,
     local_weight_shape: tuple[int, int] = (32, 32),
@@ -987,6 +1259,8 @@ def _test_fp8_scale_update(
 def run_parallel_tests() -> None:
     """Run parallel tests"""
 
+    run_cp_a2a_tests()
+
     # Distributed process group
     process_group = world_group()
     rank = torch.distributed.get_rank(process_group)
@@ -1120,12 +1394,20 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--parallel", action="store_true", help="Run parallel tests")
     parser.add_argument("--compile", action="store_true", help="Use the compiled TP test suite")
+    parser.add_argument(
+        "--cp-a2a", action="store_true", help="Run only CP A2A and projection pairs"
+    )
+    parser.add_argument(
+        "--megaup", action="store_true", help="Enable MegaUP joint CP projection fusion"
+    )
     args = parser.parse_args()
     if args.compile and not args.parallel:
         parser.error("--compile requires --parallel")
     if args.parallel:
         try:
-            if args.compile:
+            if args.cp_a2a:
+                run_cp_a2a_tests(use_megaup=args.megaup)
+            elif args.compile:
                 run_compile_parallel_tests()
             else:
                 run_parallel_tests()

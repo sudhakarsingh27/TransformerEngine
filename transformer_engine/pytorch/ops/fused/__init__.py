@@ -4,17 +4,25 @@
 
 """Compound tensor operation supported by the operation fuser."""
 
-from ..fuser import register_backward_fusion, register_forward_fusion
+from ..fuser import (
+    register_backward_fusion,
+    register_forward_fusion,
+    register_forward_backward_fusion,
+)
 from .backward_activation_bias import BackwardActivationBias
 from .backward_add_rmsnorm import BackwardAddRMSNorm
 from .backward_linear_add import BackwardLinearAdd
 from .backward_linear_scale import BackwardLinearScale
+from .megaup_linear import MegaUPLinear
 from .forward_linear_bias_activation import ForwardLinearBiasActivation
 from .forward_linear_bias_add import ForwardLinearBiasAdd
 from .forward_linear_scale_add import ForwardLinearScaleAdd
 from .userbuffers_backward_linear import UserbuffersBackwardLinear
 from .userbuffers_forward_linear import UserbuffersForwardLinear
 
+
+# A paired registration preserves MegaUP's materialized inputs for its own backward.
+register_forward_backward_fusion(MegaUPLinear.fuse_ops)
 
 # Register forward fusions
 register_forward_fusion(UserbuffersForwardLinear.fuse_forward_ops)

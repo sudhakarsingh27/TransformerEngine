@@ -241,6 +241,9 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
             tensors_to_save, tensor_objects = prepare_for_saving(*to_save)
             func_ctx.save_for_backward(*tensors_to_save)
             func_ctx.tensor_objects = tensor_objects
+            # Plain tensors need no restoration metadata. Autograd owns their lifetime,
+            # including repeated backward when the caller retains the graph.
+            func_ctx.plain_saved_tensors = all(obj is None for obj in tensor_objects)
 
             # Whether to perform recipe update in backward pass. Skipped under
             # compile: this reads and flips global FP8 state, and delayed
@@ -299,7 +302,11 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
         basic_op_ctxs = func_ctx.basic_op_ctxs
 
         # Restore saved tensors
-        saved_tensors = restore_from_func_ctx(func_ctx)
+        saved_tensors = (
+            func_ctx.saved_tensors
+            if func_ctx.plain_saved_tensors
+            else restore_from_func_ctx(func_ctx)
+        )
 
         # Unflatten list of saved tensors. Under compile the contexts were
         # created in the forward, which is a different subgraph, so writing to
@@ -309,7 +316,8 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
             basic_op_ctxs = [copy.copy(ctx) for ctx in basic_op_ctxs]
         for ctx in basic_op_ctxs:
             ctx.saved_tensors = saved_tensors[slice(*ctx._saved_tensors_range)]
-            ctx._saved_tensors_range = None
+            if not func_ctx.plain_saved_tensors:
+                ctx._saved_tensors_range = None
 
         # Channel wiring saved from forward
         basic_op_extra_output_channels = func_ctx.basic_op_extra_output_channels

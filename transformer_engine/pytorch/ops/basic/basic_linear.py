@@ -1225,9 +1225,14 @@ class BasicLinear(BasicOperation):
         if ctx.weight_requires_grad and self._accumulate_into_main_grad:
             grad_weight = get_main_grad_from_param(self.weight, op_label="BasicLinear").detach()
             accumulate_into_grad_weight = get_accumulate_flag_in_param(self.weight)
+        saved_input = ctx.saved_tensors[0]
+        if type(saved_input) in (torch.Tensor, torch.nn.Parameter):
+            # backward_compute clears its input object. A metadata-only alias keeps
+            # autograd's saved tensor intact for a repeated retained-graph backward.
+            saved_input = saved_input.detach()
         return BasicLinearBwdArgs(
             grad_output=grad_output,
-            input_=ctx.saved_tensors[0],
+            input_=saved_input,
             weight=ctx.saved_tensors[1],
             dtype=ctx.dtype,
             input_requires_grad=ctx.input_requires_grad,

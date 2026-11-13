@@ -902,6 +902,46 @@ class MultiheadAttention(torch.nn.Module):
             core_attention_bias_type in AttnBiasTypes
         ), f"core_attention_bias_type {core_attention_bias_type} is not supported!"
 
+        if os.getenv("NVTE_MHA_MEGAUP", "0") == "1":
+            from ._megaup import forward_megaup
+
+            # The external prototype owns both projection/exchange boundaries.
+            # Keep the original modules and forward path for unsupported calls.
+            result = forward_megaup(
+                self,
+                hidden_states,
+                eligible_call=(
+                    not checkpoint_core_attention
+                    and not pad_between_seqs
+                    and softcap == 0.0
+                    and core_attention_bias_type == "no_bias"
+                    # The local DPA uses the mask's default window. A different
+                    # explicit window must retain the native attention path.
+                    and window_size in (None, (-1, 0) if "causal" in attn_mask_type else (-1, -1))
+                    and all(
+                        value is None
+                        for value in (
+                            attention_mask,
+                            encoder_output,
+                            inference_params,
+                            core_attention_bias,
+                            alibi_slopes,
+                            thd_attention_policies,
+                        )
+                    )
+                ),
+                rotary_pos_emb=rotary_pos_emb,
+                attn_mask_type=attn_mask_type,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                cu_seqlens_q_padded=cu_seqlens_q_padded,
+                cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+            )
+            if result is not None:
+                return result
+
         # =================================================
         # Pre-allocate memory for key-value cache for inference
         # =================================================
