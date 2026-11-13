@@ -1507,11 +1507,28 @@ def run_mha_with_megaup(gqa_only=False):
                         other = ref_parameters[name]
                         assert parameter.grad is not None and other.grad is not None
                         compare(parameter.grad, other.grad, f"local gradient {name}")
-                        # CP parameter reduction belongs to the training wrapper, not
-                        # either projection function. Apply it once to each reference.
-                        dist.all_reduce(parameter.grad, group=group)
-                        dist.all_reduce(other.grad, group=group)
-                        compare(parameter.grad, other.grad, f"reduced gradient {name}")
+                        # Reduction belongs to the training wrapper. Sum the checked
+                        # local BF16 gradients in FP32: cancellation can invalidate a
+                        # fresh relative tolerance against the small global result.
+                        reduced, wanted = parameter.grad.float(), other.grad.float()
+                        abs_partials = wanted.abs()
+                        for value in (reduced, wanted, abs_partials):
+                            dist.all_reduce(value, group=group)
+                        error = (reduced - wanted).abs()
+                        bound = len(ranks) * 2.5e-2 + 2.5e-2 * abs_partials
+                        strict = int((error > (2.5e-2 + 2.5e-2 * wanted.abs())).sum().item())
+                        adjusted = int((error > bound).sum().item())
+                        relative = (reduced - wanted).norm() / wanted.norm().clamp_min(1e-12)
+                        print(
+                            f"MegaUP reduced gradient {name}: reduction=FP32,"
+                            f" strict_mismatches={strict}, bound_mismatches={adjusted},"
+                            f" relative_L2={relative.item():.6g}, max_abs={error.max().item():.6g}",
+                            flush=True,
+                        )
+                        uniform(adjusted == 0 and relative.item() < 2.5e-2, f"reduced {name}")
+                        parameter.grad.copy_(reduced)
+                        other.grad.copy_(wanted)
+                        del reduced, wanted, abs_partials, error, bound
                         with torch.no_grad():
                             parameter.add_(parameter.grad, alpha=-0.01)
                             other.add_(other.grad, alpha=-0.01)
