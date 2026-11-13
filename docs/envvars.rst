@@ -196,8 +196,11 @@ Attention Backend Selection
 
    Supports BF16 BSHD/SBHD and packed THD self-attention on peer-accessible SM100 GPUs,
    CP=2/4/8 with ``cp_comm_type="a2a"`` and dual-chunk load balancing, TP=1,
-   equal Q/K/V widths, packed
-   ``fuse_qkv_params=True`` weights, zero dropout, and causal or no-mask attention.
+   packed ``fuse_qkv_params=True`` weights, zero dropout, and causal or no-mask
+   attention. Interleaved GQA requires the KV-head count to be divisible by CP;
+   model hidden width may differ from query-head count times head dimension.
+   Non-interleaved QKV weights are supported only for equal Q/K/V head counts;
+   non-interleaved GQA uses the original path.
    Input LayerNorm, QK normalization, bias, FP8 (including calibration), debug
    instrumentation, KV caching, checkpointing, CPU offload, fused
    weight-gradient accumulation, and dense-format sequence metadata

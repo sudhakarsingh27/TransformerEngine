@@ -223,6 +223,8 @@ class _CPAttention:
         self.format, self.cu = mha.qkv_format, cu
         self.batch, self.sequence, self.cp = batch, sequence, runtimes[0].up
         self.heads, self.d = mha.num_attention_heads, mha.hidden_size_per_attention_head
+        self.hidden = mha.proj.out_features
+        self.qkv_width = mha.hidden_size_q + 2 * mha.hidden_size_kv
         self.peer = _CPProjection(
             runtimes[0],
             True,
@@ -253,10 +255,10 @@ class _CPAttention:
     def local_rows(self, x):
         if self.format == "sbhd":
             x = x.transpose(0, 1)
-        return x.contiguous().view(-1, self.heads * self.d)
+        return x.contiguous().view(-1, self.hidden)
 
     def global_order(self, raw):
-        width = 3 * self.heads * self.d // self.cp
+        width = self.qkv_width // self.cp
         if self.format == "thd":
             return _THDReorder.apply(
                 raw.view(-1, width // self.d, self.d), self.cu, self.cp, True
@@ -269,7 +271,7 @@ class _CPAttention:
     def restore_output(self, x):
         if self.format == "thd":
             return x
-        out = x.view(self.batch, self.sequence, self.heads * self.d)
+        out = x.view(self.batch, self.sequence, self.hidden)
         return out.transpose(0, 1).contiguous() if self.format == "sbhd" else out
 
 
@@ -377,7 +379,10 @@ def prepare_megaup(
 
     cp = dist.get_world_size(group)
     heads, head_dim = mha.num_attention_heads, mha.hidden_size_per_attention_head
+    # Model width, query attention width and packed KV-group width can differ.
+    hidden, groups = mha.proj.out_features, mha.num_gqa_groups
     width = heads * head_dim
+    qkv_width = (heads + 2 * groups) * head_dim
     thd = mha.qkv_format == "thd"
     cu_seqlens, bounds, maxima = None, None, (None, None)
     metadata_valid = True
@@ -406,7 +411,9 @@ def prepare_megaup(
         and not mha.input_layernorm
         and mha.tp_size == 1
         and not mha.sequence_parallel
-        and mha.num_gqa_groups == heads
+        # Interleaved GQA stores each group's queries, K and V contiguously,
+        # so one rank shard contains whole groups without repeating KV.
+        and (groups == heads or mha.qkv_weight_interleaved)
         and mha.q_norm is None
         and mha.k_norm is None
         and mha.softmax_type == "vanilla"
@@ -430,21 +437,25 @@ def prepare_megaup(
         and x.is_cuda
         and x.dtype == torch.bfloat16
         and x.ndim == (2 if thd else 3)
-        and x.shape[-1] == width
+        and x.shape[-1] == hidden
         and cp in (2, 4, 8)
         and heads % cp == 0
+        and groups % cp == 0
+        and hidden % 256 == 0
         and width % 256 == 0
+        and qkv_width % 256 == 0
         and (width // cp) % 128 == 0
+        and (qkv_width // cp) % 128 == 0
         and torch.cuda.get_device_capability(x.device)[0] == 10
         and isinstance(weight, torch.Tensor)
         and not isinstance(weight, QuantizedTensorStorage)
         and weight.dtype == torch.bfloat16
-        and tuple(weight.shape) == (3 * width, width)
+        and tuple(weight.shape) == (qkv_width, hidden)
         and weight.device == x.device
         and isinstance(out_weight, torch.Tensor)
         and not isinstance(out_weight, QuantizedTensorStorage)
         and out_weight.dtype == torch.bfloat16
-        and tuple(out_weight.shape) == (width, width)
+        and tuple(out_weight.shape) == (hidden, width)
         and out_weight.device == x.device
         and out_weight.is_contiguous()
     )
@@ -463,7 +474,7 @@ def prepare_megaup(
             runtime.hidden == channels
             and batch * sequence <= runtime.max_rows
             and runtime.device == x.device
-            for runtime, channels in zip(runtimes, (3 * width, width))
+            for runtime, channels in zip(runtimes, (qkv_width, width))
         )
 
     # A local unsupported input must not leave peers entering symmetric barriers.
@@ -471,6 +482,8 @@ def prepare_megaup(
         bool(valid),
         shape,
         heads,
+        groups,
+        hidden,
         head_dim,
         mha.qkv_format,
         mha.qkv_weight_interleaved,
@@ -505,7 +518,7 @@ def prepare_megaup(
                 initialize_runtime(
                     group, hidden=channels, max_rows=batch * sequence, device=x.device
                 )
-                for channels in (3 * width, width)
+                for channels in (qkv_width, width)
             )
             _RUNTIMES[group] = runtimes
         if trusted:

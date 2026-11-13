@@ -1160,7 +1160,7 @@ def _check_megaup_trusted_state(candidate, reference, x, dy, rope, metadata, com
     )
 
 
-def run_mha_with_megaup():
+def run_mha_with_megaup(gqa_only=False):
     """Check packed rectangular MHA against native CP, including retained graphs."""
     from datetime import timedelta
     from inspect import signature
@@ -1200,6 +1200,19 @@ def run_mha_with_megaup():
     # during validation; the mechanism remains unproven.
     if world_size == 4:
         cases.append(([1, 3], 2, 34, "bshd", True))
+    cases = [(*case, 2048, 16, 16) for case in cases]
+    if gqa_only:
+        # Model width greater/smaller than Q width, then packed THD groups.
+        cases = [
+            (list(range(world_size)), 2, 32, "sbhd", True, 5120, 32, 8),
+            (list(range(world_size)), 2, 32, "bshd", False, 5120, 64, 8),
+            (list(range(world_size)), 2, (32, 48), "thd", True, 5120, 64, 8),
+        ]
+        if world_size == 2:
+            cases.extend(
+                (list(range(world_size)), 2, (32, 48), "thd", True, width, heads, 2)
+                for width, heads in ((4096, 32), (8192, 64))
+            )
     cp_calls = [0, 0]
     cp_function = cp_ops.AttnFuncWithCPAndQKVOA2A
     original_cp_forward, original_cp_backward = cp_function.forward, cp_function.backward
@@ -1210,7 +1223,8 @@ def run_mha_with_megaup():
             return original_cp_forward(*args, **kwargs)
         cp_calls[0] += 1
         assert dist.get_world_size(call["cp_group"]) == len(ranks)
-        assert call["q"].shape[-2] == 16 // len(ranks)
+        assert call["q"].shape[-2] == heads // len(ranks)
+        assert call["k"].shape[-2] == call["v"].shape[-2] == groups // len(ranks)
         # Trusted-state tests deliberately change maximum lengths between calls.
         selected = _attention_backends["attention_params"]
         assert call["max_seqlen_q"] == selected.max_seqlen_q
@@ -1257,6 +1271,11 @@ def run_mha_with_megaup():
         pull_calls += 1
         return original_pull_thd(prepared, *args, **kwargs)
 
+    def uniform(condition, name):
+        flag = torch.tensor(int(condition), device="cuda", dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+        assert flag.item(), name
+
     def compare(actual, expected, name):
         # Match the established BF16 CP tolerance, with a relative-norm guard
         # so small tensors cannot pass solely on the absolute tolerance.
@@ -1277,7 +1296,7 @@ def run_mha_with_megaup():
     ), patch.object(
         cp_function, "backward", cp_backward
     ):
-        for ranks, batch, sequence, qkv_format, use_rope in cases:
+        for ranks, batch, sequence, qkv_format, use_rope, width, heads, groups in cases:
             group = dist.new_group(ranks)
             if rank in ranks:
                 torch.manual_seed(1234)
@@ -1332,8 +1351,9 @@ def run_mha_with_megaup():
                         rtol=0,
                     )
                 arguments = dict(
-                    hidden_size=2048,
-                    num_attention_heads=16,
+                    hidden_size=width,
+                    num_attention_heads=heads,
+                    num_gqa_groups=groups,
                     kv_channels=128,
                     attention_dropout=0.0,
                     attn_mask_type=(
@@ -1345,7 +1365,7 @@ def run_mha_with_megaup():
                     bias=False,
                     input_layernorm=False,
                     fuse_qkv_params=True,
-                    qkv_weight_interleaved=use_rope,
+                    qkv_weight_interleaved=(groups != heads or use_rope),
                     qkv_format=qkv_format,
                 )
                 reference = MultiheadAttention(**arguments).cuda()
@@ -1359,12 +1379,56 @@ def run_mha_with_megaup():
                     module.set_context_parallel_group(group, ranks, torch.cuda.Stream(), "a2a")
                 rope = RotaryPositionEmbedding(128)(maximum).cuda() if use_rope else None
                 shape = (
-                    (sum(lengths), 2048)
+                    (sum(lengths), width)
                     if thd
                     else (
-                        (batch, sequence, 2048) if qkv_format == "bshd" else (sequence, batch, 2048)
+                        (batch, sequence, width)
+                        if qkv_format == "bshd"
+                        else (sequence, batch, width)
                     )
                 )
+                if groups != heads:
+                    from transformer_engine.pytorch.attention._megaup import prepare_megaup
+
+                    # Independent head IDs expose actual packed group ownership:
+                    # rank r must receive its complete (queries,K,V) groups.
+                    probe = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+                    probe[..., 0] = dist.get_rank(group) + 1
+                    plan = prepare_megaup(
+                        candidate,
+                        probe,
+                        eligible_call=True,
+                        rotary_pos_emb=rope,
+                        attn_mask_type=arguments["attn_mask_type"],
+                        **metadata,
+                    )
+                    assert plan is not None
+                    parameter = candidate.qkv.weight
+                    original = parameter.detach().clone()
+                    head_ids = torch.arange(1, heads + 2 * groups + 1, device="cuda")
+                    with torch.no_grad():
+                        parameter.zero_()
+                        parameter[:, 0].copy_(head_ids.repeat_interleave(128))
+                        actual = candidate.qkv(plan.local_rows(probe), _cp_projection=plan.peer)
+                        parameter.copy_(original)
+                    del original
+                    shard = head_ids.chunk(len(ranks))[dist.get_rank(group)].repeat_interleave(128)
+                    factors = torch.arange(1, len(ranks) + 1, device="cuda").repeat_interleave(
+                        plan.local_rows(probe).shape[0]
+                    )
+                    expected = (factors[:, None] * shard).to(torch.bfloat16)
+                    uniform(torch.equal(actual, expected), "GQA head-group routing")
+                    # Rectangular packed weights retain original Parameter version checks.
+                    result = candidate.qkv(plan.local_rows(probe), _cp_projection=plan.peer)
+                    with torch.no_grad():
+                        parameter.add_(0)
+                    version_rejected = False
+                    try:
+                        result.sum().backward()
+                    except RuntimeError as error:
+                        version_rejected = "modified by an inplace operation" in str(error)
+                    uniform(version_rejected, "GQA projection ignored original weight mutation")
+                    del result, actual, expected, probe, plan
                 # The second step must consume updated weights, not a cached transpose.
                 for step in range(2):
                     reference.zero_grad(set_to_none=True)
@@ -1383,10 +1447,11 @@ def run_mha_with_megaup():
                         with patch.dict(os.environ, NVTE_MHA_MEGAUP="1"):
                             yc = candidate(xc, rotary_pos_emb=rope, **metadata)
                         assert not hasattr(candidate, "_megaup_local_attention")
-                        assert candidate.core_attention.num_attention_heads == 16
+                        assert candidate.core_attention.num_attention_heads == heads
                         selected = _attention_backends["attention_params"]
                         assert selected.context_parallel and selected.cp_size == 1
-                        assert selected.num_heads == 16 // len(ranks)
+                        assert selected.num_heads == heads // len(ranks)
+                        assert selected.num_gqa_groups == groups // len(ranks)
                         assert selected.max_seqlen_q == selected.max_seqlen_kv == maximum
                         if not thd and step == 0 and microbatch == 0:
                             # Independent source-rank/early-or-late token oracle, B>1.
@@ -1470,7 +1535,7 @@ def run_mha_with_megaup():
                         results = []
                         for module, value, kwargs in (
                             (candidate, x, metadata),
-                            (dense, x.view(batch, lengths[0], 2048), {}),
+                            (dense, x.view(batch, lengths[0], width), {}),
                         ):
                             module.zero_grad(set_to_none=True)
                             leaf = value.detach().clone().requires_grad_()
@@ -1478,7 +1543,7 @@ def run_mha_with_megaup():
                                 result = module(leaf, rotary_pos_emb=rope, **kwargs)
                             result.backward(dy.view_as(leaf))
                             results.append(
-                                [result.detach().reshape(-1, 2048), leaf.grad.reshape(-1, 2048)]
+                                [result.detach().reshape(-1, width), leaf.grad.reshape(-1, width)]
                                 + [p.grad for p in module.parameters()]
                             )
                         for thd_value, dense_value in zip(*results):
@@ -1540,19 +1605,23 @@ def run_mha_with_megaup():
                         actual = candidate(x, rotary_pos_emb=rope, pad_between_seqs=True, **padded)
                     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                     assert (peer_calls, pull_calls) == before_guard
-                # Bias is outside the prototype: opting in must retain native behavior.
-                fallback = MultiheadAttention(**{**arguments, "bias": True}).cuda()
-                fallback.set_context_parallel_group(group, ranks, torch.cuda.Stream(), "a2a")
-                before = (peer_calls, pull_calls)
-                with torch.no_grad(), patch.dict(os.environ, NVTE_MHA_MEGAUP="0"):
-                    expected = fallback(x, rotary_pos_emb=rope, **metadata)
-                with torch.no_grad(), patch.dict(os.environ, NVTE_MHA_MEGAUP="1"):
-                    actual = fallback(x, rotary_pos_emb=rope, **metadata)
-                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-                assert (peer_calls, pull_calls) == before
+                # Unsupported policies must take the rank-uniform native path.
+                fallback_options = [{"bias": True}]
+                if groups != heads:
+                    fallback_options.append({"qkv_weight_interleaved": False})
+                for options in fallback_options:
+                    fallback = MultiheadAttention(**{**arguments, **options}).cuda()
+                    fallback.set_context_parallel_group(group, ranks, torch.cuda.Stream(), "a2a")
+                    before = (peer_calls, pull_calls)
+                    with torch.no_grad(), patch.dict(os.environ, NVTE_MHA_MEGAUP="0"):
+                        expected = fallback(x, rotary_pos_emb=rope, **metadata)
+                    with torch.no_grad(), patch.dict(os.environ, NVTE_MHA_MEGAUP="1"):
+                        actual = fallback(x, rotary_pos_emb=rope, **metadata)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    assert (peer_calls, pull_calls) == before
                 print(
                     f"MegaUP passed: rank={rank}, CP={len(ranks)}, B={batch}, S={sequence},"
-                    f" {qkv_format}, RoPE={use_rope}",
+                    f" {qkv_format}, RoPE={use_rope}, W={width}, Hq={heads}, Hkv={groups}",
                     flush=True,
                 )
             dist.barrier()
@@ -1685,6 +1754,8 @@ def main(**kwargs):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["megaup"]:
         run_mha_with_megaup()
+    elif sys.argv[1:2] == ["megaup-gqa"]:
+        run_mha_with_megaup(gqa_only=True)
     elif sys.argv[1:2] == ["megaup-linear"]:
         run_megaup_linear_hooks()
     else:

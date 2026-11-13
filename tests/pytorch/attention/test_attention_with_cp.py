@@ -47,9 +47,11 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 
 
-@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize(
+    "world_size,gqa", [(2, False), (4, False), (8, False), (2, True), (8, True)]
+)
 @pytest.mark.parametrize("trusted", [False, True])
-def test_mha_with_megaup(world_size, trusted):
+def test_mha_with_megaup(world_size, trusted, gqa):
     """Validate packed rectangular projection fusion with the real optional kernels."""
     if importlib.util.find_spec("mega_up") is None:
         pytest.skip("Optional mega_up package is not installed")
@@ -62,7 +64,7 @@ def test_mha_with_megaup(world_size, trusted):
         "--standalone",
         f"--nproc-per-node={world_size}",
         str(_current_file.with_name("run_attention_with_cp.py")),
-        "megaup",
+        "megaup-gqa" if gqa else "megaup",
     ]
     result = subprocess.run(
         command,

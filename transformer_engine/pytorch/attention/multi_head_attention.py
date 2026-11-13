@@ -916,7 +916,7 @@ class MultiheadAttention(torch.nn.Module):
                     and not pad_between_seqs
                     and softcap == 0.0
                     and core_attention_bias_type == "no_bias"
-                    # The local DPA uses the mask's default window. A different
+                    # The fused path uses the mask's default window. A different
                     # explicit window must retain the native attention path.
                     and window_size in (None, (-1, 0) if "causal" in attn_mask_type else (-1, -1))
                     and all(
@@ -1054,7 +1054,7 @@ class MultiheadAttention(torch.nn.Module):
                 if cp_plan is not None:
                     mixed_x_layer = cp_plan.global_order(mixed_x_layer)
 
-            # MegaUP emits complete head-major Q/K/V triplets for this rank.
+            # MegaUP emits complete KV groups (queries, K, V) for this rank.
             local_gqa_groups = self.num_gqa_groups_per_partition // (
                 cp_plan.cp if cp_plan is not None else 1
             )
