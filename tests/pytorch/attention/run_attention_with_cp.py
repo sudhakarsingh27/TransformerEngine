@@ -1519,6 +1519,18 @@ def run_mha_with_megaup(gqa_only=False):
                         del actual, expected
                     assert (peer_calls - before[0], pull_calls - before[1]) == (5, 5)
                     assert tuple(x - y for x, y in zip(cp_calls, cp_before)) == (2, 3)
+                    # Metadata checks use initialized weights: unnormalized SGD can
+                    # amplify cancellation-sensitive GEMM accumulation differences.
+                    # Saved FP32 contributions below restore the main SGD gradients.
+                    if (
+                        step == 0
+                        and thd
+                        and len(set(lengths)) > 1
+                        and os.getenv("NVTE_MHA_MEGAUP_TRUSTED", "0") == "1"
+                    ):
+                        _check_megaup_trusted_state(
+                            candidate, reference, x, dy, rope, metadata, compare, group
+                        )
                     for name, parameter in candidate.named_parameters():
                         other = ref_parameters[name]
                         # Both microbatch accumulation and rank reduction are FP32
@@ -1588,14 +1600,6 @@ def run_mha_with_megaup(gqa_only=False):
                         for thd_value, dense_value in zip(*results):
                             compare(thd_value, dense_value, f"THD/BSHD enabled={enabled}")
                     del dense, results
-                if (
-                    thd
-                    and len(set(lengths)) > 1
-                    and os.getenv("NVTE_MHA_MEGAUP_TRUSTED", "0") == "1"
-                ):
-                    _check_megaup_trusted_state(
-                        candidate, reference, x, dy, rope, metadata, compare, group
-                    )
                 if thd:
                     from transformer_engine.pytorch.attention._megaup import prepare_megaup
 
