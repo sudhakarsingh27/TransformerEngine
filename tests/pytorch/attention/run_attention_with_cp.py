@@ -1446,6 +1446,8 @@ def run_mha_with_megaup(gqa_only=False):
                         graphs.append((xr, xc, yr, yc, dy))
                     # Keep both graphs outstanding, but validate each gradient before
                     # accumulation: two valid contributions may nearly cancel.
+                    # Native local FusedAttn consumes its backward metadata, so this
+                    # tests outstanding graphs, not repeated backward on one graph.
                     ref_parameters = dict(reference.named_parameters())
                     gradient_sums = {}
                     for graph_index, (xr, xc, yr, yc, dy) in enumerate(reversed(graphs)):
@@ -1453,17 +1455,6 @@ def run_mha_with_megaup(gqa_only=False):
                         candidate.zero_grad(set_to_none=True)
                         compare(yc, yr, "output")
                         yr.backward(dy)
-                        if graph_index == 0:
-                            yc.backward(dy, retain_graph=True)
-                            compare(xc.grad, xr.grad, "retained dInput")
-                            for name, parameter in candidate.named_parameters():
-                                compare(
-                                    parameter.grad,
-                                    ref_parameters[name].grad,
-                                    f"retained {name}",
-                                )
-                            candidate.zero_grad(set_to_none=True)
-                            xc.grad = None
                         yc.backward(dy)
                         compare(xc.grad, xr.grad, "dInput")
                         for name, parameter in candidate.named_parameters():
@@ -1478,7 +1469,7 @@ def run_mha_with_megaup(gqa_only=False):
                                 ):
                                     total.add_(value)
                         del actual, expected
-                    assert (peer_calls - before[0], pull_calls - before[1]) == (5, 5)
+                    assert (peer_calls - before[0], pull_calls - before[1]) == (4, 4)
                     # Metadata checks use initialized weights: unnormalized SGD can
                     # amplify cancellation-sensitive GEMM accumulation differences.
                     # Saved FP32 contributions below restore the main SGD gradients.
