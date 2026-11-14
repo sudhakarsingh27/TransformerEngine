@@ -28,7 +28,7 @@ from .dot_product_attention.context_parallel import (
 from .rope import apply_rotary_pos_emb
 
 
-# Packed QKV communicates 3F channels; the output projection communicates F.
+# Packed QKV and attention output use separate fixed-width communication arenas.
 # Remember both fixed-capacity arenas so incompatible calls can fall back.
 _RUNTIMES = {}
 
@@ -243,6 +243,8 @@ def forward_megaup(
     cp = dist.get_world_size(group)
     heads, head_dim = mha.num_attention_heads, mha.hidden_size_per_attention_head
     width = heads * head_dim
+    hidden, groups = mha.proj.out_features, mha.num_gqa_groups
+    qkv_width = (heads + 2 * groups) * head_dim
     thd = mha.qkv_format == "thd"
     cu_seqlens, bounds, maxima = None, None, (None, None)
     metadata_valid = True
@@ -271,7 +273,7 @@ def forward_megaup(
         and not mha.input_layernorm
         and mha.tp_size == 1
         and not mha.sequence_parallel
-        and mha.num_gqa_groups == heads
+        and (mha.qkv_weight_interleaved or groups == heads)
         and mha.q_norm is None
         and mha.k_norm is None
         and mha.softmax_type == "vanilla"
@@ -293,21 +295,26 @@ def forward_megaup(
         and x.is_cuda
         and x.dtype == torch.bfloat16
         and x.ndim == (2 if thd else 3)
-        and x.shape[-1] == width
+        and x.shape[-1] == hidden
         and cp in (2, 4, 8)
         and heads % cp == 0
+        and groups % cp == 0
+        and hidden % head_dim == 0
+        and hidden % 256 == 0
         and width % 256 == 0
+        and qkv_width % 256 == 0
+        and (qkv_width // cp) % 128 == 0
         and (width // cp) % 128 == 0
         and torch.cuda.get_device_capability(x.device)[0] == 10
         and isinstance(weight, torch.Tensor)
         and not isinstance(weight, QuantizedTensorStorage)
         and weight.dtype == torch.bfloat16
-        and tuple(weight.shape) == (3 * width, width)
+        and tuple(weight.shape) == (qkv_width, hidden)
         and weight.device == x.device
         and isinstance(out_weight, torch.Tensor)
         and not isinstance(out_weight, QuantizedTensorStorage)
         and out_weight.dtype == torch.bfloat16
-        and tuple(out_weight.shape) == (width, width)
+        and tuple(out_weight.shape) == (hidden, width)
         and out_weight.device == x.device
         and out_weight.is_contiguous()
     )
@@ -322,13 +329,16 @@ def forward_megaup(
     runtimes = _RUNTIMES.get(group)
     local = getattr(mha, "_megaup_local_attention", None)
     valid = valid and sequence > 0 and (thd or sequence % 2 == 0) and batch > 0
-    valid = valid and (local is None or local.num_attention_heads == heads // cp)
+    valid = valid and (
+        local is None
+        or (local.num_attention_heads == heads // cp and local.num_gqa_groups == groups // cp)
+    )
     if runtimes is not None:
         valid = valid and all(
             runtime.hidden == channels
             and batch * sequence <= runtime.max_rows
             and runtime.device == x.device
-            for runtime, channels in zip(runtimes, (3 * width, width))
+            for runtime, channels in zip(runtimes, (qkv_width, width))
         )
 
     # A local unsupported input must not leave peers entering symmetric barriers.
@@ -336,6 +346,8 @@ def forward_megaup(
         bool(valid),
         shape,
         heads,
+        groups,
+        hidden,
         head_dim,
         mha.qkv_format,
         mha.qkv_weight_interleaved,
@@ -370,7 +382,7 @@ def forward_megaup(
                 initialize_runtime(
                     group, hidden=channels, max_rows=batch * sequence, device=x.device
                 )
-                for channels in (3 * width, width)
+                for channels in (qkv_width, width)
             )
             _RUNTIMES[group] = runtimes
         if trusted:
@@ -383,35 +395,37 @@ def forward_megaup(
             object.__setattr__(mha, "_megaup_validated_contract", contract)
     qkv_runtime, output_runtime = runtimes
 
-    # Each peer must receive complete Q/K/V triplets for its heads. Reordering
+    # Each peer receives complete KV groups and their associated query heads. Reordering
     # non-interleaved weights stays in autograd and preserves parameter ownership.
     packed_weight = weight
     if not mha.qkv_weight_interleaved:
-        packed_weight = weight.view(3, heads, head_dim, width).permute(1, 0, 2, 3)
-    packed_weight = packed_weight.reshape(3 * width, width).contiguous()
+        packed_weight = weight.view(3, heads, head_dim, hidden).permute(1, 0, 2, 3)
+    packed_weight = packed_weight.reshape(qkv_width, hidden).contiguous()
     if thd:
         raw = _PeerProjection.apply(
-            x.contiguous().view(sequence, heads, head_dim),
+            x.contiguous().view(sequence, hidden // head_dim, head_dim),
             packed_weight,
             qkv_runtime,
             cu_seqlens,
             validate_group,
             contract,
         )
-        routed = raw.view(cp * sequence, heads // cp, 3, head_dim)
+        routed = raw.view(cp * sequence, groups // cp, heads // groups + 2, head_dim)
     else:
         x_bshd = (x if mha.qkv_format == "bshd" else x.transpose(0, 1)).contiguous()
-        x_bshd = x_bshd.view(batch, sequence, heads, head_dim)
+        x_bshd = x_bshd.view(batch, sequence, hidden // head_dim, head_dim)
         before = get_seq_chunk_ids_for_reordering_before_attn(cp, x.device)
         after = get_seq_chunk_ids_for_reordering_after_attn(cp, x.device)
         raw = _PeerProjection.apply(
             x_bshd, packed_weight, qkv_runtime, None, validate_group, contract
         )
-        chunks = raw.view(batch, 2 * cp, sequence // 2, heads // cp, 3, head_dim)
+        chunks = raw.view(batch, 2 * cp, sequence // 2, groups // cp, heads // groups + 2, head_dim)
         routed = chunks.index_select(1, before).reshape(
-            batch, cp * sequence, heads // cp, 3, head_dim
+            batch, cp * sequence, groups // cp, heads // groups + 2, head_dim
         )
-    query, key, value = routed.unbind(-2)
+    query, key, value = routed.split((heads // groups, 1, 1), dim=-2)
+    query = query.flatten(-3, -2)
+    key, value = key.squeeze(-2), value.squeeze(-2)
     local_format = "thd" if thd else "bshd"
     if rotary_pos_emb is not None:
         q_pos, k_pos = (
@@ -442,7 +456,7 @@ def forward_megaup(
         local = DotProductAttention(
             heads // cp,
             head_dim,
-            num_gqa_groups=heads // cp,
+            num_gqa_groups=groups // cp,
             attention_dropout=0.0,
             qkv_format="bshd",
             tp_size=1,
@@ -490,7 +504,7 @@ def forward_megaup(
             cu_seqlens,
             validate_group,
             contract,
-        ).reshape(sequence, width)
+        ).reshape(sequence, hidden)
     else:
         chunks = attention.view(batch, 2 * cp, sequence // 2, heads // cp, head_dim)
         rank_order = chunks.index_select(1, after).reshape(
@@ -498,7 +512,7 @@ def forward_megaup(
         )
         output = _PullProjection.apply(
             rank_order, out_weight, output_runtime, None, validate_group, contract
-        ).reshape(batch, sequence, width)
+        ).reshape(batch, sequence, hidden)
     if mha.qkv_format == "sbhd":
         output = output.transpose(0, 1).contiguous()
     # Bias-free TE Linear still returns its empty bias tensor when requested.

@@ -196,8 +196,11 @@ Attention Backend Selection
 
    Supports BF16 BSHD/SBHD and packed THD self-attention on peer-accessible SM100 GPUs,
    CP=2/4/8 with ``cp_comm_type="a2a"`` and dual-chunk load balancing, TP=1,
-   equal Q/K/V widths, packed
-   ``fuse_qkv_params=True`` weights, zero dropout, and causal or no-mask attention.
+   packed ``fuse_qkv_params=True`` weights, zero dropout, and causal or no-mask
+   attention. GQA supports interleaved whole KV groups with KV-head count divisible
+   by CP; model hidden width may differ from query-head width. Non-interleaved
+   weights remain supported for equal Q/K/V head counts; non-interleaved GQA
+   uses the original path.
    Input LayerNorm, QK normalization, bias, FP8 (including calibration), debug
    instrumentation, KV caching, checkpointing, CPU offload, fused
    weight-gradient accumulation, and dense-format sequence metadata
@@ -211,13 +214,13 @@ Attention Backend Selection
 
    The package must be installed separately; its shape and peer-access
    requirements still apply. The first supported call allocates arenas sized
-   to its local ``B*S`` per CP group, with widths ``3F`` for packed QKV and ``F``
-   for the output projection. Later calls requiring more capacity or a
+   to its local ``B*S`` per CP group, with widths ``(Hq+2*Hkv)*D`` for packed QKV
+   and ``Hq*D`` for the output projection. Later calls requiring more capacity or a
    different hidden width fall back collectively. CUDA graph capture is rejected.
    Missing dependencies and kernel failures are reported rather than hidden by
    fallback. No parameters are replaced, and the state-dict keys are unchanged.
 
-   This path was validated with upstream
+   The equal-head integration was validated with upstream
    `MegaUP 0.3.0 at 7de94fe <https://github.com/shuailiang1/MegaUP/tree/7de94fe11db3dc15f71fdf26cf9f3edbe300439d>`_,
    which supports rectangular projections; the earlier rectangular fork is not
    required. Validation used PyTorch container 26.10, CUTLASS DSL 4.8.1,
