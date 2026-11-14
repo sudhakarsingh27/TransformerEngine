@@ -1483,8 +1483,13 @@ def run_mha_with_megaup(gqa_only=False):
                             yr.add_(residual)
                             yc.add_(residual)
                         graphs.append((xr, xc, yr, yc, dy))
-                    # Compare after both forwards: this also detects overwritten outputs.
+                    # Keep both graphs outstanding, but validate each gradient before
+                    # accumulation: two valid contributions may nearly cancel.
+                    ref_parameters = dict(reference.named_parameters())
+                    gradient_sums = {}
                     for graph_index, (xr, xc, yr, yc, dy) in enumerate(reversed(graphs)):
+                        reference.zero_grad(set_to_none=True)
+                        candidate.zero_grad(set_to_none=True)
                         compare(yc, yr, "output")
                         yr.backward(dy)
                         if graph_index == 0:
@@ -1493,34 +1498,41 @@ def run_mha_with_megaup(gqa_only=False):
                             for name, parameter in candidate.named_parameters():
                                 compare(
                                     parameter.grad,
-                                    dict(reference.named_parameters())[name].grad,
+                                    ref_parameters[name].grad,
                                     f"retained {name}",
                                 )
                             candidate.zero_grad(set_to_none=True)
                             xc.grad = None
                         yc.backward(dy)
                         compare(xc.grad, xr.grad, "dInput")
+                        for name, parameter in candidate.named_parameters():
+                            other = ref_parameters[name]
+                            compare(parameter.grad, other.grad, f"graph {graph_index} local {name}")
+                            actual, expected = parameter.grad.float(), other.grad.float()
+                            if name not in gradient_sums:
+                                gradient_sums[name] = (actual, expected, expected.abs())
+                            else:
+                                for total, value in zip(
+                                    gradient_sums[name], (actual, expected, expected.abs())
+                                ):
+                                    total.add_(value)
+                        del actual, expected
                     assert (peer_calls - before[0], pull_calls - before[1]) == (5, 5)
                     assert tuple(x - y for x, y in zip(cp_calls, cp_before)) == (2, 3)
-                    ref_parameters = dict(reference.named_parameters())
                     for name, parameter in candidate.named_parameters():
                         other = ref_parameters[name]
-                        assert parameter.grad is not None and other.grad is not None
-                        compare(parameter.grad, other.grad, f"local gradient {name}")
-                        # Reduction belongs to the training wrapper. Sum the checked
-                        # local BF16 gradients in FP32: cancellation can invalidate a
-                        # fresh relative tolerance against the small global result.
-                        reduced, wanted = parameter.grad.float(), other.grad.float()
-                        abs_partials = wanted.abs()
+                        # Both microbatch accumulation and rank reduction are FP32
+                        # in this fixture; all individual BF16 gradients passed above.
+                        reduced, wanted, abs_partials = gradient_sums.pop(name)
                         for value in (reduced, wanted, abs_partials):
                             dist.all_reduce(value, group=group)
                         error = (reduced - wanted).abs()
-                        bound = len(ranks) * 2.5e-2 + 2.5e-2 * abs_partials
+                        bound = len(graphs) * len(ranks) * 2.5e-2 + 2.5e-2 * abs_partials
                         strict = int((error > (2.5e-2 + 2.5e-2 * wanted.abs())).sum().item())
                         adjusted = int((error > bound).sum().item())
                         relative = (reduced - wanted).norm() / wanted.norm().clamp_min(1e-12)
                         print(
-                            f"MegaUP reduced gradient {name}: reduction=FP32,"
+                            f"MegaUP reduced gradient {name}: accumulation/reduction=FP32,"
                             f" strict_mismatches={strict}, bound_mismatches={adjusted},"
                             f" relative_L2={relative.item():.6g}, max_abs={error.max().item():.6g}",
                             flush=True,
@@ -1533,6 +1545,16 @@ def run_mha_with_megaup(gqa_only=False):
                             parameter.add_(parameter.grad, alpha=-0.01)
                             other.add_(other.grad, alpha=-0.01)
                         compare(parameter, other, f"updated parameter {name}")
+                        print(
+                            f"MegaUP updated {name}: unequal_before_sync="
+                            f"{int((parameter != other).sum().item())}, max_abs_before_sync="
+                            f"{(parameter.float() - other.float()).abs().max().item():.6g}",
+                            flush=True,
+                        )
+                        # The next live-weight check must compare the same function,
+                        # not two trajectories with independently rounded updates.
+                        with torch.no_grad():
+                            parameter.copy_(other)
                     assert set(candidate.state_dict()) == original_keys
                     assert {
                         name: id(value) for name, value in candidate.named_parameters()
